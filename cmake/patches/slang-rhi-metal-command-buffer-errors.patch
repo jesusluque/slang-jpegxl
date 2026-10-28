@@ -1,0 +1,194 @@
+diff --git a/src/metal/metal-command.h b/src/metal/metal-command.h
+--- a/src/metal/metal-command.h
++++ b/src/metal/metal-command.h
+@@ -5,6 +5,8 @@
+ 
+ #include "core/ring-queue.h"
+ 
++#include <atomic>
++
+ namespace rhi::metal {
+ 
+ /// Metal backend synchronization model
+@@ -103,6 +105,21 @@
+     uint64_t m_lastFinishedID;
+     std::list<RefPtr<CommandBufferImpl>> m_commandBuffersInFlight;
+ 
++    /// A command buffer that ended in error -- the device out of memory, most
++    /// often -- recorded by its completion handler, which runs on a Metal
++    /// thread, and reported once by the next submit() or waitOnHost() as the
++    /// Result they return. Asserting there took the whole process down for
++    /// what a caller can recover from by freeing memory and trying again.
++    std::atomic<int32_t> m_deviceError{SLANG_OK};
++    /// Whether any command buffer has failed since the queue was made: kept
++    /// after the error is reported, for waitOnHost (see there).
++    std::atomic<bool> m_commandBufferFailed{false};
++
++    /// Records a failed command buffer's error (the first one wins).
++    void noteDeviceError(Result error);
++    /// The error recorded since the last call, or SLANG_OK, and clears it.
++    Result takeDeviceError();
++
+     // Deferred delete queue for GPU resources.
+     // Resources are held here until the GPU has finished using them.
+     struct DeferredDelete
+diff --git a/src/metal/metal-command.cpp b/src/metal/metal-command.cpp
+--- a/src/metal/metal-command.cpp
++++ b/src/metal/metal-command.cpp
+@@ -14,8 +14,10 @@
+ 
+ namespace rhi::metal {
+ 
+-static void addErrorHandler(MTL::CommandBuffer* commandBuffer)
++static void addErrorHandler(CommandQueueImpl* queue, MTL::CommandBuffer* commandBuffer)
+ {
++    // The queue outlives every command buffer it committed: shutdown() waits
++    // for them all before it goes.
+     commandBuffer->addCompletedHandler(^(MTL::CommandBuffer* cb) {
+       if (cb->status() == MTL::CommandBufferStatusError)
+       {
+@@ -25,7 +27,10 @@
+               "Metal command buffer error: %s\n",
+               error ? error->localizedDescription()->utf8String() : "unknown"
+           );
+-          SLANG_RHI_ASSERT_FAILURE("Metal command buffer error");
++          // MTLCommandBufferErrorOutOfMemory is 8; the IOKit reason behind it
++          // (kIOGPUCommandBufferCallbackErrorOutOfMemory) arrives as the same.
++          const bool outOfMemory = error && error->code() == 8;
++          queue->noteDeviceError(outOfMemory ? SLANG_E_OUT_OF_MEMORY : SLANG_FAIL);
+       }
+     });
+ }
+@@ -1227,10 +1232,35 @@
+     return SLANG_OK;
+ }
+ 
++void CommandQueueImpl::noteDeviceError(Result error)
++{
++    m_commandBufferFailed.store(true);
++    int32_t none = SLANG_OK;
++    m_deviceError.compare_exchange_strong(none, error);
++}
++
++Result CommandQueueImpl::takeDeviceError()
++{
++    return m_deviceError.exchange(SLANG_OK);
++}
++
+ Result CommandQueueImpl::waitOnHost()
+ {
+     AUTORELEASEPOOL
+ 
++    // Every command buffer in flight first: one that failed may never signal
++    // the tracking event it carries, and waiting on the event alone would
++    // then wait forever. Once they have all completed or failed nothing is
++    // left to signal it, so the host brings it to the last submission itself.
++    for (const auto& commandBuffer : m_commandBuffersInFlight)
++    {
++        commandBuffer->m_commandBuffer->waitUntilCompleted();
++    }
++    if (m_commandBufferFailed.load() && updateLastFinishedID() < m_lastSubmittedID)
++    {
++        m_trackingEvent->setSignaledValue(m_lastSubmittedID);
++    }
++
+     if (updateLastFinishedID() < m_lastSubmittedID)
+     {
+         // Create a semaphore to synchronize the notification
+@@ -1262,7 +1292,7 @@
+     SLANG_RHI_ASSERT(m_lastFinishedID == m_lastSubmittedID);
+     SLANG_RHI_ASSERT(m_commandBuffersInFlight.size() == 0);
+ 
+-    return SLANG_OK;
++    return takeDeviceError();
+ }
+ 
+ Result CommandQueueImpl::getNativeHandle(NativeHandle* outHandle)
+@@ -1290,7 +1320,7 @@
+             FenceImpl* fence = checked_cast<FenceImpl*>(desc.waitFences[i]);
+             commandBuffer->encodeWait(fence->m_event.get(), desc.waitFenceValues[i]);
+         }
+-        addErrorHandler(commandBuffer);
++        addErrorHandler(this, commandBuffer);
+         commandBuffer->commit();
+     }
+ 
+@@ -1332,7 +1362,7 @@
+             commandBuffer->m_commandBuffer->encodeSignalEvent(m_trackingEvent.get(), m_lastSubmittedID);
+         }
+ 
+-        addErrorHandler(commandBuffer->m_commandBuffer.get());
++        addErrorHandler(this, commandBuffer->m_commandBuffer.get());
+         commandBuffer->m_commandBuffer->commit();
+     }
+ 
+@@ -1350,14 +1380,17 @@
+             commandBuffer->encodeSignalEvent(fence->m_event.get(), desc.signalFenceValues[i]);
+         }
+         commandBuffer->encodeSignalEvent(m_trackingEvent.get(), m_lastSubmittedID);
+-        addErrorHandler(commandBuffer);
++        addErrorHandler(this, commandBuffer);
+         commandBuffer->commit();
+     }
+ 
+     // Retire command buffers that are finished
+     retireCommandBuffers();
+ 
+-    return SLANG_OK;
++    // What was committed here is committed; a failure reported now is an
++    // earlier command buffer's, which the caller learns of at the first call
++    // it makes after it.
++    return takeDeviceError();
+ }
+ 
+ // CommandEncoderImpl
+diff --git a/src/metal/metal-buffer.cpp b/src/metal/metal-buffer.cpp
+--- a/src/metal/metal-buffer.cpp
++++ b/src/metal/metal-buffer.cpp
+@@ -76,7 +76,7 @@
+     buffer->m_buffer = NS::TransferPtr(m_device->newBuffer(bufferSize, resourceOptions));
+     if (!buffer->m_buffer)
+     {
+-        return SLANG_FAIL;
++        return SLANG_E_OUT_OF_MEMORY;
+     }
+ 
+     // GPU virtual address is stable immediately after allocation on Apple Silicon.
+diff --git a/src/metal/metal-acceleration-structure.cpp b/src/metal/metal-acceleration-structure.cpp
+--- a/src/metal/metal-acceleration-structure.cpp
++++ b/src/metal/metal-acceleration-structure.cpp
+@@ -53,7 +53,7 @@
+     result->m_accelerationStructure = NS::TransferPtr(m_device->newAccelerationStructure(desc.size));
+     if (!result->m_accelerationStructure)
+     {
+-        return SLANG_FAIL;
++        return SLANG_E_OUT_OF_MEMORY;
+     }
+     result->m_globalIndex = registerAccelerationStructure(result->m_accelerationStructure.get());
+     registerResource(result->m_accelerationStructure.get());
+diff --git a/src/metal/metal-device.cpp b/src/metal/metal-device.cpp
+--- a/src/metal/metal-device.cpp
++++ b/src/metal/metal-device.cpp
+@@ -383,7 +383,7 @@
+     NS::SharedPtr<MTL::Buffer> stagingBuffer = NS::TransferPtr(m_device->newBuffer(size, stagingOpts));
+     if (!stagingBuffer)
+     {
+-        return SLANG_FAIL;
++        return SLANG_E_OUT_OF_MEMORY;
+     }
+ 
+     MTL::CommandBuffer* commandBuffer = m_commandQueue->commandBuffer();
+@@ -398,6 +398,13 @@
+     blitEncoder->endEncoding();
+     commandBuffer->commit();
+     commandBuffer->waitUntilCompleted();
++    // A copy that failed (the device out of memory) left the staging buffer
++    // as it was made, and handing that back would be handing back nothing.
++    if (commandBuffer->status() == MTL::CommandBufferStatusError)
++    {
++        NS::Error* error = commandBuffer->error();
++        return error && error->code() == 8 ? SLANG_E_OUT_OF_MEMORY : SLANG_FAIL;
++    }
+ 
+     std::memcpy(outData, stagingBuffer->contents(), size);
+ 

@@ -1,0 +1,59 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 3, "minor": 24, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "SLANG_ROOT": "$env{HOME}/tools/slang"
+      }
+    },
+    {
+      "name": "macos-arm64-debug",
+      "inherits": "base",
+      "displayName": "macOS arm64 Debug (Metal)",
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Darwin" },
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug", "CMAKE_OSX_ARCHITECTURES": "arm64" }
+    },
+    {
+      "name": "macos-arm64-release",
+      "inherits": "base",
+      "displayName": "macOS arm64 Release (Metal)",
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Darwin" },
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo", "CMAKE_OSX_ARCHITECTURES": "arm64" }
+    },
+    {
+      "name": "linux-x86_64-debug",
+      "inherits": "base",
+      "displayName": "Linux x86_64 Debug (CUDA/Vulkan)",
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Linux" },
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+    },
+    {
+      "name": "linux-x86_64-release",
+      "inherits": "base",
+      "displayName": "Linux x86_64 Release (CUDA/Vulkan)",
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Linux" },
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo" }
+    }
+  ],
+  "buildPresets": [
+    { "name": "macos-arm64-debug", "configurePreset": "macos-arm64-debug" },
+    { "name": "macos-arm64-release", "configurePreset": "macos-arm64-release" },
+    { "name": "linux-x86_64-debug", "configurePreset": "linux-x86_64-debug" },
+    { "name": "linux-x86_64-release", "configurePreset": "linux-x86_64-release" }
+  ],
+  "testPresets": [
+    { "name": "macos-arm64-debug", "configurePreset": "macos-arm64-debug",
+      "output": { "outputOnFailure": true }, "execution": { "jobs": 1 } },
+    { "name": "macos-arm64-release", "configurePreset": "macos-arm64-release",
+      "output": { "outputOnFailure": true }, "execution": { "jobs": 1 } },
+    { "name": "linux-x86_64-debug", "configurePreset": "linux-x86_64-debug",
+      "output": { "outputOnFailure": true }, "execution": { "jobs": 1 } },
+    { "name": "linux-x86_64-release", "configurePreset": "linux-x86_64-release",
+      "output": { "outputOnFailure": true }, "execution": { "jobs": 1 } }
+  ]
+}

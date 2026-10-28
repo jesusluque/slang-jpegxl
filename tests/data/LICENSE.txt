@@ -1,0 +1,5 @@
+Test images, downscaled or cropped from cujpegxl/data (https://github.com/m-pilia/cujpegxl), CC-BY-SA 4.0:
+sveti_stefan_320.png, sveti_crop_257x129.png, sveti_64.png: Marcin Konsek,
+  https://commons.wikimedia.org/wiki/File:Sveti_Stefan_(06).jpg
+berlin_200.png, berlin_7x5.png: Diego Delso,
+  https://commons.wikimedia.org/wiki/File:Estaci%C3%B3n_Central,_Berl%C3%ADn,_Alemania,_2016-04-21,_DD_43-45_HDR.JPG

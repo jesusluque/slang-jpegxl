@@ -1,0 +1,48 @@
+// Copyright (c) 2026 jesus luque.
+//
+// libjxl's hybrid-uint split with the default (4, 2, 0) configuration: values
+// below 16 are the token itself; above, the token carries the magnitude class
+// and two mantissa bits and the rest follow as raw bits. PackSigned maps
+// 0, -1, 1, -2, 2 ... to 0, 1, 2, 3, 4 ...
+#pragma once
+
+static const uint kHybridSplitExponent = 4;
+static const uint kHybridMsbInToken = 2;
+static const uint kHybridLsbInToken = 0;
+static const uint kHybridSplitToken = 1u << kHybridSplitExponent;
+
+uint packSigned(int value) {
+    return (uint(value) << 1) ^ uint(value >> 31);
+}
+
+/// token, nbits (raw bits that follow the token) and those bits' value.
+void hybridEncode(uint value, out uint token, out uint nbits, out uint bits) {
+    if (value < kHybridSplitToken) {
+        token = value;
+        nbits = 0;
+        bits = 0;
+        return;
+    }
+    const uint n = firstbithigh(value);
+    const uint m = value - (1u << n);
+    token = kHybridSplitToken + ((n - kHybridSplitExponent) << (kHybridMsbInToken + kHybridLsbInToken)) +
+            ((m >> (n - kHybridMsbInToken)) << kHybridLsbInToken) + (m & ((1u << kHybridLsbInToken) - 1));
+    nbits = n - kHybridMsbInToken - kHybridLsbInToken;
+    bits = (value >> kHybridLsbInToken) & ((1u << nbits) - 1);
+}
+
+/// libjxl ClampedGradient and the modular Gradient predictor's edge rules:
+/// left = W or N or 0, top = N or left, topleft = NW or left.
+int gradientPredict(bool hasLeft, bool hasTop, int w, int n, int nw) {
+    const int left = hasLeft ? w : (hasTop ? n : 0);
+    const int top = hasTop ? n : left;
+    const int topleft = (hasLeft && hasTop) ? nw : left;
+    const int lo = min(left, top);
+    const int hi = max(left, top);
+    const int grad = left + top - topleft;
+    return topleft < lo ? hi : (topleft > hi ? lo : grad);
+}
+
+/// A prefix code entry as the code tables store it: depth << 16 | code bits.
+uint codeDepth(uint entry) { return entry >> 16; }
+uint codeBits(uint entry) { return entry & 0xFFFFu; }

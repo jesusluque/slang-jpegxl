@@ -1,0 +1,92 @@
+// Copyright (c) 2026 jesus luque.
+//
+// Bit emission into a buffer of 32-bit words, LSB-first in libjxl's order: bit
+// p of the stream is bit (p & 31) of word (p >> 5), which is byte p >> 3 bit
+// p & 7 once the words are stored little-endian.
+//
+// Two writers: the atomic one, for many threads emitting into one zeroed body
+// at offsets a prefix sum gave them (words at item boundaries are shared, so
+// the OR is atomic); the serial one, for a single thread writing a blob into
+// its own zeroed region.
+#pragma once
+
+/// `n` <= 32 bits of `v` at bit `pos` of `body`, shared with other threads.
+void emitAtomic(RWStructuredBuffer<uint> body, uint pos, uint n, uint v) {
+    if (n == 0) {
+        return;
+    }
+    const uint w = pos >> 5;
+    const uint s = pos & 31;
+    if (n < 32) {
+        v &= (1u << n) - 1;
+    }
+    uint before;
+    InterlockedOr(body[w], v << s, before);
+    if (s + n > 32) {
+        InterlockedOr(body[w + 1], v >> (32 - s), before);
+    }
+}
+
+struct SerialWriter {
+    uint base;   ///< first word of the region
+    uint pos;    ///< bits written
+};
+
+/// `n` <= 32 bits of `v`, by the one thread that owns the region.
+void serialWrite(RWStructuredBuffer<uint> buf, inout SerialWriter w, uint n, uint v) {
+    if (n == 0) {
+        return;
+    }
+    const uint wi = w.base + (w.pos >> 5);
+    const uint s = w.pos & 31;
+    if (n < 32) {
+        v &= (1u << n) - 1;
+    }
+    buf[wi] |= v << s;
+    if (s + n > 32) {
+        buf[wi + 1] |= v >> (32 - s);
+    }
+    w.pos += n;
+}
+
+/// One of libjxl's four U32 distributions: direct value, or offset + extra bits.
+struct Distr {
+    uint direct;   // 1: value is `valueOrOffset`
+    uint valueOrOffset;
+    uint extraBits;
+};
+
+Distr distrVal(uint v) { Distr d; d.direct = 1; d.valueOrOffset = v; d.extraBits = 0; return d; }
+Distr distrBitsOffset(uint bits, uint offset) { Distr d; d.direct = 0; d.valueOrOffset = offset; d.extraBits = bits; return d; }
+
+/// libjxl U32 field: a 2-bit selector then the chosen distribution's bits.
+void serialWriteU32(RWStructuredBuffer<uint> buf, inout SerialWriter w, Distr d0, Distr d1, Distr d2, Distr d3, uint value) {
+    Distr d[4] = {d0, d1, d2, d3};
+    uint bestSelector = 0;
+    uint bestBits = 64;
+    for (uint s = 0; s < 4; ++s) {
+        if (d[s].direct != 0) {
+            if (d[s].valueOrOffset == value) {
+                bestSelector = s;
+                bestBits = 2;
+                break;
+            }
+            continue;
+        }
+        if (value < d[s].valueOrOffset) continue;
+        const uint rel = value - d[s].valueOrOffset;
+        if (d[s].extraBits < 32 && rel >= (1u << d[s].extraBits)) continue;
+        if (2 + d[s].extraBits < bestBits) {
+            bestSelector = s;
+            bestBits = 2 + d[s].extraBits;
+        }
+    }
+    serialWrite(buf, w, 2, bestSelector);
+    if (d[bestSelector].direct == 0) {
+        serialWrite(buf, w, d[bestSelector].extraBits, value - d[bestSelector].valueOrOffset);
+    }
+}
+
+uint ceilLog2Nonzero(uint x) {
+    return x <= 1 ? 0 : firstbithigh(x - 1) + 1;
+}

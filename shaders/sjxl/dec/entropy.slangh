@@ -1,0 +1,1051 @@
+// Copyright (c) 2026 jesus luque.
+//
+// The JPEG XL entropy decoder, for one thread walking one section: bit reader,
+// prefix codes (Brotli-style, two-level tables), ANS with alias tables, the
+// context map, hybrid uints and LZ77. A port of libjxl's dec_ans.*,
+// dec_huffman.*, huffman_table.cc, ans_common.cc and dec_context_map.cc.
+//
+// The including module declares, before this file:
+//   StructuredBuffer<uint>   cs;      // the codestream, little-endian words
+//   RWStructuredBuffer<uint> arena;   // scratch; this thread owns [base, base+cap)
+//
+// Everything decoded lives in the arena at offsets (uint indices), so tables of
+// dynamic size need no allocation but a bump pointer. A code set written by
+// decodeHistograms is read back by field offset (kCs*), so a code set decoded by
+// one thread (AcGlobal) can be used by others reading the same buffer.
+#pragma once
+
+#include "sjxl/common/bitio.slangh"
+
+static const uint kAnsLogTabSize = 12;
+static const uint kAnsTabSize = 1u << kAnsLogTabSize;
+static const uint kAnsSignature = 0x13;
+static const uint kPrefixMaxBits = 15;
+static const uint kHuffmanTableBits = 8;
+static const uint kLz77WindowSize = 1u << 20;
+static const uint kNumSpecialDistances = 120;
+
+// Error codes a decode thread reports (first one wins).
+static const uint kErrNone = 0;
+static const uint kErrCorrupt = 1;        // the codestream violates the specification
+static const uint kErrUnsupported = 2;    // a feature this decoder does not implement
+static const uint kErrArena = 3;          // scratch exhausted
+static const uint kErrLz77Window = 4;     // LZ77 used and this thread has no window
+
+struct BitReader {
+    uint pos;   // absolute bit position in cs
+    uint end;   // one past the last readable bit
+};
+
+/// n <= 32 bits at the reader, without consuming. Past the end reads zeros.
+uint brPeek(BitReader br, uint n) {
+    if (n == 0) return 0;
+    const uint w = br.pos >> 5;
+    const uint s = br.pos & 31;
+    uint v = cs[w] >> s;
+    if (s + n > 32) {
+        v |= cs[w + 1] << (32 - s);
+    }
+    return n < 32 ? (v & ((1u << n) - 1)) : v;
+}
+
+void brConsume(inout BitReader br, uint n) { br.pos += n; }
+
+uint brRead(inout BitReader br, uint n) {
+    const uint v = brPeek(br, n);
+    br.pos += n;
+    return v;
+}
+
+bool brWithinBounds(BitReader br) { return br.pos <= br.end; }
+
+void brJumpToByte(inout BitReader br) { br.pos = (br.pos + 7) & ~7u; }
+
+uint brU32(inout BitReader br, Distr d0, Distr d1, Distr d2, Distr d3) {
+    const uint sel = brRead(br, 2);
+    const Distr d = sel == 0 ? d0 : (sel == 1 ? d1 : (sel == 2 ? d2 : d3));
+    if (d.direct != 0) return d.valueOrOffset;
+    return brRead(br, d.extraBits) + d.valueOrOffset;
+}
+
+uint brU64Low(inout BitReader br) {
+    // libjxl U64Coder, truncated to 32 bits (what the headers here need).
+    const uint sel = brRead(br, 2);
+    if (sel == 0) return 0;
+    if (sel == 1) return 1 + brRead(br, 4);
+    if (sel == 2) return 17 + brRead(br, 8);
+    uint result = brRead(br, 12);
+    uint shift = 12;
+    while (brRead(br, 1) != 0) {
+        if (shift == 60) {
+            brRead(br, 4);
+            break;
+        }
+        const uint chunk = brRead(br, 8);
+        if (shift < 32) result |= chunk << shift;
+        shift += 8;
+    }
+    return result;
+}
+
+/// libjxl F16Coder::Read. Infinity/NaN are a corruption the caller reports.
+float brF16(inout BitReader br) {
+    const uint bits16 = brRead(br, 16);
+    const uint sign = bits16 >> 15;
+    const uint biasedExp = (bits16 >> 10) & 0x1F;
+    const uint mantissa = bits16 & 0x3FF;
+    float value;
+    if (biasedExp == 0) {
+        value = (1.0f / 16384.0f) * (float(mantissa) * (1.0f / 1024.0f));
+    } else {
+        value = asfloat((sign << 31) | ((biasedExp + 127 - 15) << 23) | (mantissa << 13));
+        return value;
+    }
+    return sign != 0 ? -value : value;
+}
+
+/// The decode thread's state: where it reads, where it may write, what went wrong.
+struct Dec {
+    BitReader br;
+    uint base;    // first arena word this thread owns
+    uint top;     // next free arena word
+    uint cap;     // one past the last
+    uint error;
+};
+
+void fail(inout Dec d, uint code) {
+    if (d.error == kErrNone) {
+        d.error = code;
+    }
+}
+
+/// `n` words of scratch; 0 and an error when the arena is full.
+uint alloc(inout Dec d, uint n) {
+    if (d.top + n > d.cap) {
+        fail(d, kErrArena);
+        return d.base;
+    }
+    const uint at = d.top;
+    d.top += n;
+    return at;
+}
+
+uint unpackSigned(uint v) {
+    return (v >> 1) ^ (0u - (v & 1));   // as int bits
+}
+int unpackSignedInt(uint v) { return int(unpackSigned(v)); }
+
+// --- hybrid uint ------------------------------------------------------------------
+
+/// A HybridUintConfig packed: split_exponent | msb << 8 | lsb << 16.
+uint packConfig(uint splitExp, uint msb, uint lsb) { return splitExp | (msb << 8) | (lsb << 16); }
+
+uint readHybridUintConfig(inout Dec d, uint config, uint token) {
+    const uint splitExp = config & 0xFF;
+    const uint msb = (config >> 8) & 0xFF;
+    const uint lsb = (config >> 16) & 0xFF;
+    const uint splitToken = 1u << splitExp;
+    if (token < splitToken) return token;
+    uint nbits = splitExp - (msb + lsb) + ((token - splitToken) >> (msb + lsb));
+    nbits &= 31u;
+    const uint low = token & ((1u << lsb) - 1);
+    token >>= lsb;
+    const uint bits = brRead(d.br, nbits);
+    return (((((1u << msb) | (token & ((1u << msb) - 1))) << nbits) | bits) << lsb) | low;
+}
+
+/// DecodeUintConfig: a packed config.
+uint decodeUintConfig(inout Dec d, uint logAlphaSize) {
+    const uint splitExp = brRead(d.br, ceilLog2Nonzero(logAlphaSize + 1));
+    uint msb = 0, lsb = 0;
+    if (splitExp != logAlphaSize) {
+        msb = brRead(d.br, ceilLog2Nonzero(splitExp + 1));
+        if (msb > splitExp) {
+            fail(d, kErrCorrupt);
+            return packConfig(4, 2, 0);
+        }
+        lsb = brRead(d.br, ceilLog2Nonzero(splitExp - msb + 1));
+    }
+    if (lsb + msb > splitExp) {
+        fail(d, kErrCorrupt);
+    }
+    return packConfig(splitExp, msb, lsb);
+}
+
+// --- prefix codes (dec_huffman.cc, huffman_table.cc) --------------------------------
+
+/// A table entry: bits << 16 | value.
+uint huffEntry(uint bits, uint value) { return (bits << 16) | value; }
+uint huffBits(uint e) { return e >> 16; }
+uint huffValue(uint e) { return e & 0xFFFF; }
+
+int getNextKey(int key, int len) {
+    int step = 1 << (len - 1);
+    while ((key & step) != 0) {
+        step >>= 1;
+    }
+    return (key & (step - 1)) + step;
+}
+
+void replicateValue(uint tableOff, int step, int end, uint code) {
+    do {
+        end -= step;
+        arena[tableOff + uint(end)] = code;
+    } while (end > 0);
+}
+
+/// `count` is a 16-entry histogram of code lengths at countOff (modified).
+uint nextTableBitSize(uint countOff, uint len, uint rootBits) {
+    uint left = 1u << (len - rootBits);
+    while (len < kPrefixMaxBits) {
+        if (left <= arena[countOff + len]) break;
+        left -= arena[countOff + len];
+        ++len;
+        left <<= 1;
+    }
+    return len - rootBits;
+}
+
+/// BuildHuffmanTable: code lengths at lengthsOff (one per symbol), the table at
+/// tableOff with room for alphabet + 376 entries; returns the table size (0 on
+/// failure). Uses scratch for `sorted` and `count`.
+uint buildHuffmanTable(inout Dec d, uint tableOff, uint rootBits, uint lengthsOff, uint alphabet) {
+    const uint countOff = alloc(d, 16);
+    const uint offsetOff = alloc(d, 16);
+    const uint sortedOff = alloc(d, alphabet);
+    if (d.error != kErrNone) return 0;
+    for (uint i = 0; i < 16; ++i) arena[countOff + i] = 0;
+    for (uint s = 0; s < alphabet; ++s) ++arena[countOff + arena[lengthsOff + s]];
+    uint maxLength = 1;
+    {
+        uint sum = 0;
+        for (uint len = 1; len <= kPrefixMaxBits; ++len) {
+            arena[offsetOff + len] = sum;
+            if (arena[countOff + len] != 0) {
+                sum += arena[countOff + len];
+                maxLength = len;
+            }
+        }
+    }
+    for (uint s = 0; s < alphabet; ++s) {
+        const uint l = arena[lengthsOff + s];
+        if (l != 0) {
+            arena[sortedOff + arena[offsetOff + l]] = s;
+            ++arena[offsetOff + l];
+        }
+    }
+    uint table = tableOff;
+    uint tableBits = rootBits;
+    int tableSize = 1 << tableBits;
+    int totalSize = tableSize;
+    if (arena[offsetOff + kPrefixMaxBits] == 1) {
+        const uint code = huffEntry(0, arena[sortedOff]);
+        for (int key = 0; key < totalSize; ++key) arena[tableOff + uint(key)] = code;
+        return uint(totalSize);
+    }
+    if (tableBits > maxLength) {
+        tableBits = maxLength;
+        tableSize = 1 << tableBits;
+    }
+    int key = 0;
+    uint symbol = 0;
+    uint bits = 1;
+    int step = 2;
+    do {
+        for (; arena[countOff + bits] != 0; --arena[countOff + bits]) {
+            replicateValue(table + uint(key), step, tableSize, huffEntry(bits, arena[sortedOff + symbol]));
+            ++symbol;
+            key = getNextKey(key, int(bits));
+        }
+        step <<= 1;
+    } while (++bits <= tableBits);
+    while (totalSize != tableSize) {
+        for (int i = 0; i < tableSize; ++i) arena[table + uint(tableSize + i)] = arena[table + uint(i)];
+        tableSize <<= 1;
+    }
+    const int mask = totalSize - 1;
+    int low = -1;
+    step = 2;
+    for (uint len = rootBits + 1; len <= maxLength; ++len, step <<= 1) {
+        for (; arena[countOff + len] != 0; --arena[countOff + len]) {
+            if ((key & mask) != low) {
+                table += uint(tableSize);
+                tableBits = nextTableBitSize(countOff, len, rootBits);
+                tableSize = 1 << tableBits;
+                totalSize += tableSize;
+                low = key & mask;
+                arena[tableOff + uint(low)] = huffEntry(tableBits + rootBits, (table - tableOff) - uint(low));
+            }
+            replicateValue(table + uint(key >> rootBits), step, tableSize, huffEntry(len - rootBits, arena[sortedOff + symbol]));
+            ++symbol;
+            key = getNextKey(key, int(len));
+        }
+    }
+    return uint(totalSize);
+}
+
+/// ReadHuffmanCodeLengths: the code-length code's lengths (18) at clcOff, the
+/// symbol lengths written to lengthsOff.
+bool readHuffmanCodeLengths(inout Dec d, uint clcOff, uint numSymbols, uint lengthsOff) {
+    const uint tableOff = alloc(d, 32 + 16);
+    if (d.error != kErrNone) return false;
+    // A 5-bit table for the 18 code-length codes.
+    {
+        const uint countOff = tableOff + 32;
+        for (uint i = 0; i < 16; ++i) arena[countOff + i] = 0;
+        for (uint i = 0; i < 18; ++i) ++arena[countOff + arena[clcOff + i]];
+        // Reuse the general builder: it needs its own scratch, taken after.
+        if (buildHuffmanTable(d, tableOff, 5, clcOff, 18) == 0) return false;
+    }
+    uint symbol = 0;
+    uint prevCodeLen = 8;
+    int repeat = 0;
+    uint repeatCodeLen = 0;
+    int space = 32768;
+    while (symbol < numSymbols && space > 0) {
+        const uint e = arena[tableOff + brPeek(d.br, 5)];
+        brConsume(d.br, huffBits(e));
+        const uint codeLen = huffValue(e);
+        if (codeLen < 16) {
+            repeat = 0;
+            arena[lengthsOff + symbol] = codeLen;
+            ++symbol;
+            if (codeLen != 0) {
+                prevCodeLen = codeLen;
+                space -= int(32768u >> codeLen);
+            }
+        } else {
+            const uint extraBits = codeLen - 14;
+            uint newLen = 0;
+            if (codeLen == 16) newLen = prevCodeLen;
+            if (repeatCodeLen != newLen) {
+                repeat = 0;
+                repeatCodeLen = newLen;
+            }
+            const int oldRepeat = repeat;
+            if (repeat > 0) {
+                repeat -= 2;
+                repeat <<= extraBits;
+            }
+            repeat += int(brRead(d.br, extraBits)) + 3;
+            const int repeatDelta = repeat - oldRepeat;
+            if (symbol + uint(repeatDelta) > numSymbols) return false;
+            for (int i = 0; i < repeatDelta; ++i) arena[lengthsOff + symbol + uint(i)] = repeatCodeLen;
+            symbol += uint(repeatDelta);
+            if (repeatCodeLen != 0) {
+                space -= repeatDelta << (15 - repeatCodeLen);
+            }
+        }
+    }
+    if (space != 0) return false;
+    for (; symbol < numSymbols; ++symbol) arena[lengthsOff + symbol] = 0;
+    return true;
+}
+
+/// ReadSimpleCode into the 256-entry table at tableOff.
+bool readSimpleCode(inout Dec d, uint alphabet, uint tableOff) {
+    const uint maxBits = alphabet > 1 ? firstbithigh(alphabet - 1) + 1 : 0;
+    uint numSymbols = brRead(d.br, 2) + 1;
+    uint symbols[4] = {0, 0, 0, 0};
+    for (uint i = 0; i < numSymbols; ++i) {
+        const uint s = brRead(d.br, maxBits);
+        if (s >= alphabet) return false;
+        symbols[i] = s;
+    }
+    for (uint i = 0; i + 1 < numSymbols; ++i) {
+        for (uint j = i + 1; j < numSymbols; ++j) {
+            if (symbols[i] == symbols[j]) return false;
+        }
+    }
+    if (numSymbols == 4) numSymbols += brRead(d.br, 1);
+    uint tableSize = 1;
+    switch (numSymbols) {
+    case 1:
+        arena[tableOff] = huffEntry(0, symbols[0]);
+        break;
+    case 2:
+        if (symbols[0] > symbols[1]) { uint t = symbols[0]; symbols[0] = symbols[1]; symbols[1] = t; }
+        arena[tableOff + 0] = huffEntry(1, symbols[0]);
+        arena[tableOff + 1] = huffEntry(1, symbols[1]);
+        tableSize = 2;
+        break;
+    case 3:
+        if (symbols[1] > symbols[2]) { uint t = symbols[1]; symbols[1] = symbols[2]; symbols[2] = t; }
+        arena[tableOff + 0] = huffEntry(1, symbols[0]);
+        arena[tableOff + 2] = huffEntry(1, symbols[0]);
+        arena[tableOff + 1] = huffEntry(2, symbols[1]);
+        arena[tableOff + 3] = huffEntry(2, symbols[2]);
+        tableSize = 4;
+        break;
+    case 4:
+        for (uint i = 0; i < 3; ++i) {
+            for (uint j = i + 1; j < 4; ++j) {
+                if (symbols[i] > symbols[j]) { uint t = symbols[i]; symbols[i] = symbols[j]; symbols[j] = t; }
+            }
+        }
+        arena[tableOff + 0] = huffEntry(2, symbols[0]);
+        arena[tableOff + 2] = huffEntry(2, symbols[1]);
+        arena[tableOff + 1] = huffEntry(2, symbols[2]);
+        arena[tableOff + 3] = huffEntry(2, symbols[3]);
+        tableSize = 4;
+        break;
+    case 5:
+        if (symbols[2] > symbols[3]) { uint t = symbols[2]; symbols[2] = symbols[3]; symbols[3] = t; }
+        arena[tableOff + 0] = huffEntry(1, symbols[0]);
+        arena[tableOff + 1] = huffEntry(2, symbols[1]);
+        arena[tableOff + 2] = huffEntry(1, symbols[0]);
+        arena[tableOff + 3] = huffEntry(3, symbols[2]);
+        arena[tableOff + 4] = huffEntry(1, symbols[0]);
+        arena[tableOff + 5] = huffEntry(2, symbols[1]);
+        arena[tableOff + 6] = huffEntry(1, symbols[0]);
+        arena[tableOff + 7] = huffEntry(3, symbols[3]);
+        tableSize = 8;
+        break;
+    default:
+        return false;
+    }
+    const uint goal = 1u << kHuffmanTableBits;
+    while (tableSize != goal) {
+        for (uint i = 0; i < tableSize; ++i) arena[tableOff + tableSize + i] = arena[tableOff + i];
+        tableSize <<= 1;
+    }
+    return true;
+}
+
+/// HuffmanDecodingData::ReadFromBitStream: the table for one cluster, allocated
+/// in the arena; returns its offset (or sets an error).
+uint readHuffmanCode(inout Dec d, uint alphabet) {
+    if (alphabet > (1u << kPrefixMaxBits)) {
+        fail(d, kErrCorrupt);
+        return d.base;
+    }
+    const uint tableOff = alloc(d, max(alphabet + 376, 256u));
+    if (d.error != kErrNone) return d.base;
+    const uint simpleOrSkip = brRead(d.br, 2);
+    if (simpleOrSkip == 1) {
+        if (!readSimpleCode(d, alphabet, tableOff)) fail(d, kErrCorrupt);
+        return tableOff;
+    }
+    const uint lengthsOff = alloc(d, alphabet);
+    const uint clcOff = alloc(d, 18);
+    if (d.error != kErrNone) return d.base;
+    for (uint i = 0; i < 18; ++i) arena[clcOff + i] = 0;
+    const uint order[18] = {1, 2, 3, 4, 0, 5, 17, 6, 16, 7, 8, 9, 10, 11, 12, 13, 14, 15};
+    // Static code for the code-length code lengths: (bits, value) by 4 peeked bits.
+    const uint huffBitsTab[16] = {2, 2, 2, 3, 2, 2, 2, 4, 2, 2, 2, 3, 2, 2, 2, 4};
+    const uint huffValTab[16] = {0, 4, 3, 2, 0, 4, 3, 1, 0, 4, 3, 2, 0, 4, 3, 5};
+    int space = 32;
+    uint numCodes = 0;
+    for (uint i = simpleOrSkip; i < 18 && space > 0; ++i) {
+        const uint idx = brPeek(d.br, 4);
+        brConsume(d.br, huffBitsTab[idx]);
+        const uint v = huffValTab[idx];
+        arena[clcOff + order[i]] = v;
+        if (v != 0) {
+            space -= int(32u >> v);
+            ++numCodes;
+        }
+    }
+    if (!(numCodes == 1 || space == 0)) {
+        fail(d, kErrCorrupt);
+        return tableOff;
+    }
+    if (!readHuffmanCodeLengths(d, clcOff, alphabet, lengthsOff)) {
+        fail(d, kErrCorrupt);
+        return tableOff;
+    }
+    if (buildHuffmanTable(d, tableOff, kHuffmanTableBits, lengthsOff, alphabet) == 0) {
+        fail(d, kErrCorrupt);
+    }
+    return tableOff;
+}
+
+uint readPrefixSymbol(inout Dec d, uint tableOff) {
+    uint at = tableOff + brPeek(d.br, kHuffmanTableBits);
+    uint e = arena[at];
+    uint nBits = huffBits(e);
+    if (nBits > kHuffmanTableBits) {
+        brConsume(d.br, kHuffmanTableBits);
+        nBits -= kHuffmanTableBits;
+        at += huffValue(e);
+        at += brPeek(d.br, nBits);
+        e = arena[at];
+    }
+    brConsume(d.br, huffBits(e));
+    return huffValue(e);
+}
+
+// --- ANS (dec_ans.cc ReadHistogram, ans_common.cc InitAliasTable) ---------------------
+
+uint decodeVarLenUint8(inout Dec d) {
+    if (brRead(d.br, 1) != 0) {
+        const uint nbits = brRead(d.br, 3);
+        if (nbits == 0) return 1;
+        return brRead(d.br, nbits) + (1u << nbits);
+    }
+    return 0;
+}
+
+uint decodeVarLenUint16(inout Dec d) {
+    if (brRead(d.br, 1) != 0) {
+        const uint nbits = brRead(d.br, 4);
+        if (nbits == 0) return 1;
+        return brRead(d.br, nbits) + (1u << nbits);
+    }
+    return 0;
+}
+
+uint populationCountPrecision(uint logcount, uint shift) {
+    const int r = min(int(logcount), int(shift) - int((kAnsLogTabSize - logcount) >> 1));
+    return r < 0 ? 0 : uint(r);
+}
+
+/// ReadHistogram: `counts` (int) at countsOff, 256 entries available; returns the
+/// alphabet length, 0 on error.
+uint readAnsHistogram(inout Dec d, uint countsOff) {
+    const uint range = kAnsTabSize;
+    for (uint i = 0; i < 256; ++i) arena[countsOff + i] = 0;
+    if (brRead(d.br, 1) == 1) {
+        uint symbols[2] = {0, 0};
+        uint maxSymbol = 0;
+        const uint numSymbols = brRead(d.br, 1) + 1;
+        for (uint i = 0; i < numSymbols; ++i) {
+            symbols[i] = decodeVarLenUint8(d);
+            maxSymbol = max(maxSymbol, symbols[i]);
+        }
+        if (numSymbols == 1) {
+            arena[countsOff + symbols[0]] = range;
+        } else {
+            if (symbols[0] == symbols[1]) return 0;
+            arena[countsOff + symbols[0]] = brRead(d.br, kAnsLogTabSize);
+            arena[countsOff + symbols[1]] = range - arena[countsOff + symbols[0]];
+        }
+        return maxSymbol + 1;
+    }
+    if (brRead(d.br, 1) == 1) {
+        const uint alphabet = decodeVarLenUint8(d) + 1;
+        if (alphabet > range) return 0;
+        const uint count = range / alphabet;
+        const uint rem = range % alphabet;
+        for (uint i = 0; i < alphabet; ++i) arena[countsOff + i] = count + (i < rem ? 1 : 0);
+        return alphabet;
+    }
+    uint shift;
+    {
+        const uint upperBoundLog = firstbithigh(kAnsLogTabSize + 1);
+        uint lg = 0;
+        for (; lg < upperBoundLog; ++lg) {
+            if (brRead(d.br, 1) == 0) break;
+        }
+        shift = (brRead(d.br, lg) | (1u << lg)) - 1;
+        if (shift > kAnsLogTabSize + 1) return 0;
+    }
+    const uint length = decodeVarLenUint8(d) + 3;
+    if (length > 256) return 0;
+    // (bits, value) of the static 7-bit code for log counts, by index & 7 and index >> 3.
+    // huff[idx] from dec_ans.cc: columns repeat with period 8 except column 1.
+    const uint logOff = alloc(d, 256);
+    const uint sameOff = alloc(d, 256);
+    if (d.error != kErrNone) return 0;
+    int omitLog = -1;
+    int omitPos = -1;
+    for (uint i = 0; i < length; ++i) arena[sameOff + i] = 0;
+    for (uint i = 0; i < length; ++i) {
+        const uint idx = brPeek(d.br, 7);
+        uint bits, value;
+        const uint col = idx & 7;
+        if (col == 1) {
+            // {7,12},{4,4},{5,0},{4,4},{6,11},{4,4},{5,0},{4,4}, {7,13},{4,4},{5,0},{4,4},{6,11},{4,4},{5,0},{4,4}
+            const uint row = idx >> 3;
+            const uint b[16] = {7, 4, 5, 4, 6, 4, 5, 4, 7, 4, 5, 4, 6, 4, 5, 4};
+            const uint v[16] = {12, 4, 0, 4, 11, 4, 0, 4, 13, 4, 0, 4, 11, 4, 0, 4};
+            bits = b[row];
+            value = v[row];
+        } else {
+            const uint b[8] = {3, 0, 3, 4, 3, 3, 3, 4};
+            const uint v[8] = {10, 0, 7, 3, 6, 8, 9, 5};
+            bits = b[col];
+            value = v[col];
+            if (col == 3 || col == 7) {
+                // column 3 alternates {4,3}/{4,1}; column 7 alternates {4,5}/{4,2} by row parity
+                const uint row = idx >> 3;
+                if (col == 3) value = (row & 1) == 0 ? 3 : 1;
+                else value = (row & 1) == 0 ? 5 : 2;
+            }
+        }
+        brConsume(d.br, bits);
+        const int logcount = int(value) - 1;
+        arena[logOff + i] = uint(logcount);
+        if (logcount == int(kAnsLogTabSize)) {
+            const uint rleLength = decodeVarLenUint8(d);
+            arena[sameOff + i] = rleLength + 5;
+            i += rleLength + 3;
+            continue;
+        }
+        if (logcount > omitLog) {
+            omitLog = logcount;
+            omitPos = int(i);
+        }
+    }
+    if (omitPos < 0) return 0;
+    if (uint(omitPos) + 1 < length && int(arena[logOff + uint(omitPos) + 1]) == int(kAnsLogTabSize)) return 0;
+    int prev = 0;
+    int numsame = 0;
+    int total = 0;
+    for (uint i = 0; i < length; ++i) {
+        if (arena[sameOff + i] != 0) {
+            numsame = int(arena[sameOff + i]) - 1;
+            prev = i > 0 ? int(arena[countsOff + i - 1]) : 0;
+        }
+        if (numsame > 0) {
+            arena[countsOff + i] = uint(prev);
+            --numsame;
+        } else {
+            const int code = int(arena[logOff + i]);
+            if (int(i) == omitPos || code < 0) {
+                continue;
+            } else if (shift == 0 || code == 0) {
+                arena[countsOff + i] = 1u << code;
+            } else {
+                const uint bitcount = populationCountPrecision(uint(code), shift);
+                arena[countsOff + i] = (1u << code) + (brRead(d.br, bitcount) << (uint(code) - bitcount));
+            }
+        }
+        total += int(arena[countsOff + i]);
+    }
+    const int omitted = int(range) - total;
+    if (omitted <= 0) return 0;
+    arena[countsOff + uint(omitPos)] = uint(omitted);
+    return length;
+}
+
+/// Alias entry packing: word0 = cutoff | right << 8 | freq0 << 16; word1 = offsets1 | freq1xor << 16.
+void aliasSet(uint off, uint i, uint cutoff, uint right, uint freq0, uint offsets1, uint freq1xor) {
+    arena[off + 2 * i] = (cutoff & 0xFF) | ((right & 0xFF) << 8) | ((freq0 & 0xFFFF) << 16);
+    arena[off + 2 * i + 1] = (offsets1 & 0xFFFF) | ((freq1xor & 0xFFFF) << 16);
+}
+
+/// InitAliasTable for the counts at countsOff (length `length`), table size 1 << logAlpha,
+/// written at tableOff (2 words per entry). False on an invalid distribution.
+bool initAliasTable(inout Dec d, uint countsOff, uint length, uint logAlpha, uint tableOff) {
+    const uint tableSize = 1u << logAlpha;
+    while (length > 0 && arena[countsOff + length - 1] == 0) --length;
+    if (length == 0) {
+        arena[countsOff] = kAnsTabSize;
+        length = 1;
+    }
+    if (length > tableSize) return false;
+    const uint entrySize = kAnsTabSize >> logAlpha;
+    int single = -1;
+    uint sum = 0;
+    for (uint s = 0; s < length; ++s) {
+        const uint v = arena[countsOff + s];
+        sum += v;
+        if (v == kAnsTabSize) single = int(s);
+    }
+    if (sum != kAnsTabSize) return false;
+    if (single >= 0) {
+        for (uint i = 0; i < tableSize; ++i) {
+            aliasSet(tableOff, i, 0, uint(single), 0, entrySize * i, kAnsTabSize);
+        }
+        return true;
+    }
+    const uint cutoffsOff = alloc(d, tableSize);
+    const uint underOff = alloc(d, tableSize);
+    const uint overOff = alloc(d, tableSize);
+    // right values and offsets1 are accumulated in the table words as we go
+    if (d.error != kErrNone) return false;
+    uint nUnder = 0, nOver = 0;
+    for (uint i = 0; i < length; ++i) {
+        arena[cutoffsOff + i] = arena[countsOff + i];
+        if (arena[cutoffsOff + i] > entrySize) arena[overOff + nOver++] = i;
+        else if (arena[cutoffsOff + i] < entrySize) arena[underOff + nUnder++] = i;
+    }
+    for (uint i = length; i < tableSize; ++i) {
+        arena[cutoffsOff + i] = 0;
+        arena[underOff + nUnder++] = i;
+    }
+    // temporaries: right value and offsets1 per entry, in the table's second words meanwhile
+    for (uint i = 0; i < tableSize; ++i) {
+        arena[tableOff + 2 * i] = i;       // right_value
+        arena[tableOff + 2 * i + 1] = 0;   // offsets1
+    }
+    while (nOver > 0) {
+        const uint overI = arena[overOff + --nOver];
+        if (nUnder == 0) return false;
+        const uint underI = arena[underOff + --nUnder];
+        const uint underBy = entrySize - arena[cutoffsOff + underI];
+        arena[cutoffsOff + overI] -= underBy;
+        arena[tableOff + 2 * underI] = overI;
+        arena[tableOff + 2 * underI + 1] = arena[cutoffsOff + overI];
+        if (arena[cutoffsOff + overI] < entrySize) arena[underOff + nUnder++] = overI;
+        else if (arena[cutoffsOff + overI] > entrySize) arena[overOff + nOver++] = overI;
+    }
+    for (uint i = 0; i < tableSize; ++i) {
+        uint right = arena[tableOff + 2 * i];
+        uint offsets1 = arena[tableOff + 2 * i + 1];
+        uint cutoff;
+        if (arena[cutoffsOff + i] == entrySize) {
+            right = i;
+            offsets1 = 0;
+            cutoff = 0;
+        } else {
+            offsets1 -= arena[cutoffsOff + i];
+            cutoff = arena[cutoffsOff + i];
+        }
+        const uint freq0 = i < length ? arena[countsOff + i] : 0;
+        const uint freq1 = right < length ? arena[countsOff + right] : 0;
+        aliasSet(tableOff, i, cutoff, right, freq0, offsets1, freq1 ^ freq0);
+    }
+    return true;
+}
+
+// --- code sets (DecodeHistograms) ------------------------------------------------------
+
+// A code set's fields, at codeSet + k.
+static const uint kCsLz77Enabled = 0;
+static const uint kCsMinSymbol = 1;
+static const uint kCsMinLength = 2;
+static const uint kCsLengthConfig = 3;
+static const uint kCsNumContexts = 4;    // including the LZ77 distance context when enabled
+static const uint kCsNumClusters = 5;
+static const uint kCsUsePrefix = 6;
+static const uint kCsLogAlpha = 7;
+static const uint kCsCtxMapOff = 8;      // numContexts words
+static const uint kCsConfigsOff = 9;     // numClusters packed configs
+static const uint kCsTablesOff = 10;     // numClusters table offsets
+static const uint kCsDistanceCtx = 11;
+static const uint kCsSize = 12;
+
+/// InverseMoveToFrontTransform over the context map.
+void inverseMtf(inout Dec d, uint mapOff, uint n) {
+    const uint mtfOff = alloc(d, 256);
+    if (d.error != kErrNone) return;
+    for (uint i = 0; i < 256; ++i) arena[mtfOff + i] = i;
+    for (uint i = 0; i < n; ++i) {
+        const uint index = arena[mapOff + i];
+        const uint value = arena[mtfOff + index];
+        arena[mapOff + i] = value;
+        for (uint j = index; j > 0; --j) arena[mtfOff + j] = arena[mtfOff + j - 1];
+        arena[mtfOff] = value;
+    }
+}
+
+struct SymReader {
+    uint codeSet;
+    uint state;
+    uint logAlpha;
+    uint logEntrySize;
+    uint entryMask;
+    uint usePrefix;
+    // LZ77
+    uint windowOff;    // arena offset of a kLz77WindowSize window, or 0xFFFFFFFF
+    uint numDecoded;
+    uint numToCopy;
+    uint copyPos;
+    uint distMul;      // distance_multiplier (0: no special distances)
+};
+
+uint csField(uint codeSet, uint field) { return arena[codeSet + field]; }
+
+/// Everything of DecodeHistograms after the context map: prefix flag, configs,
+/// the per-cluster codes. Writes the fields into the code set.
+void decodeCodeTail(inout Dec d, uint codeSet, uint numClusters) {
+    const uint usePrefix = brRead(d.br, 1);
+    const uint logAlpha = usePrefix != 0 ? kPrefixMaxBits : brRead(d.br, 2) + 5;
+    arena[codeSet + kCsUsePrefix] = usePrefix;
+    arena[codeSet + kCsLogAlpha] = logAlpha;
+    arena[codeSet + kCsNumClusters] = numClusters;
+    const uint configsOff = alloc(d, numClusters);
+    const uint tablesOff = alloc(d, numClusters);
+    arena[codeSet + kCsConfigsOff] = configsOff;
+    arena[codeSet + kCsTablesOff] = tablesOff;
+    if (d.error != kErrNone) return;
+    for (uint c = 0; c < numClusters; ++c) {
+        arena[configsOff + c] = decodeUintConfig(d, logAlpha);
+    }
+    if (usePrefix != 0) {
+        const uint sizesOff = alloc(d, numClusters);
+        if (d.error != kErrNone) return;
+        for (uint c = 0; c < numClusters; ++c) {
+            arena[sizesOff + c] = decodeVarLenUint16(d) + 1;
+            if (arena[sizesOff + c] > (1u << kPrefixMaxBits)) { fail(d, kErrCorrupt); return; }
+        }
+        for (uint c = 0; c < numClusters; ++c) {
+            const uint alphabet = arena[sizesOff + c];
+            if (alphabet > 1) {
+                arena[tablesOff + c] = readHuffmanCode(d, alphabet);
+            } else {
+                const uint t = alloc(d, 256);
+                for (uint i = 0; i < 256; ++i) arena[t + i] = huffEntry(0, 0);
+                arena[tablesOff + c] = t;
+            }
+            if (d.error != kErrNone) return;
+        }
+    } else {
+        const uint countsOff = alloc(d, 256);
+        if (d.error != kErrNone) return;
+        for (uint c = 0; c < numClusters; ++c) {
+            const uint length = readAnsHistogram(d, countsOff);
+            if (length == 0 || d.error != kErrNone) { fail(d, kErrCorrupt); return; }
+            if (length > (1u << logAlpha)) { fail(d, kErrCorrupt); return; }
+            const uint tableOff = alloc(d, 2u << logAlpha);
+            if (d.error != kErrNone) return;
+            if (!initAliasTable(d, countsOff, length, logAlpha, tableOff)) { fail(d, kErrCorrupt); return; }
+            arena[tablesOff + c] = tableOff;
+        }
+    }
+}
+
+SymReader makeSymReader(inout Dec d, uint codeSet, uint windowOff, uint distMul);
+uint readHybridUintClustered(inout Dec d, inout SymReader r, uint cluster);
+uint readHybridUint(inout Dec d, inout SymReader r, uint ctx);
+bool checkFinalState(SymReader r);
+
+/// DecodeHistograms with `numContexts` contexts (before any LZ77 context).
+/// Returns the code set's arena offset. `windowOff` is this thread's LZ77
+/// window for the nested context-map stream (0xFFFFFFFF when it has none).
+uint decodeHistograms(inout Dec d, uint numContexts, bool disallowLz77, uint windowOff) {
+    const uint codeSet = alloc(d, kCsSize);
+    if (d.error != kErrNone) return codeSet;
+    for (uint i = 0; i < kCsSize; ++i) arena[codeSet + i] = 0;
+    // LZ77Params
+    const uint lz77 = brRead(d.br, 1);
+    arena[codeSet + kCsLz77Enabled] = lz77;
+    if (lz77 != 0) {
+        arena[codeSet + kCsMinSymbol] = brU32(d.br, distrVal(224), distrVal(512), distrVal(4096), distrBitsOffset(15, 8));
+        arena[codeSet + kCsMinLength] = brU32(d.br, distrVal(3), distrVal(4), distrBitsOffset(2, 5), distrBitsOffset(8, 9));
+        ++numContexts;
+        arena[codeSet + kCsLengthConfig] = decodeUintConfig(d, 8);
+        if (disallowLz77) { fail(d, kErrCorrupt); return codeSet; }
+    }
+    arena[codeSet + kCsNumContexts] = numContexts;
+    const uint mapOff = alloc(d, numContexts);
+    arena[codeSet + kCsCtxMapOff] = mapOff;
+    if (d.error != kErrNone) return codeSet;
+    uint numClusters = 1;
+    for (uint i = 0; i < numContexts; ++i) arena[mapOff + i] = 0;
+    if (numContexts > 1) {
+        const uint isSimple = brRead(d.br, 1);
+        if (isSimple != 0) {
+            const uint bitsPerEntry = brRead(d.br, 2);
+            if (bitsPerEntry != 0) {
+                for (uint i = 0; i < numContexts; ++i) arena[mapOff + i] = brRead(d.br, bitsPerEntry);
+            }
+        } else {
+            const uint useMtf = brRead(d.br, 1);
+            // A nested code set with one context (no context map of its own).
+            const uint inner = alloc(d, kCsSize);
+            if (d.error != kErrNone) return codeSet;
+            for (uint i = 0; i < kCsSize; ++i) arena[inner + i] = 0;
+            const uint innerLz = brRead(d.br, 1);
+            arena[inner + kCsLz77Enabled] = innerLz;
+            uint innerContexts = 1;
+            if (innerLz != 0) {
+                arena[inner + kCsMinSymbol] = brU32(d.br, distrVal(224), distrVal(512), distrVal(4096), distrBitsOffset(15, 8));
+                arena[inner + kCsMinLength] = brU32(d.br, distrVal(3), distrVal(4), distrBitsOffset(2, 5), distrBitsOffset(8, 9));
+                innerContexts = 2;
+                arena[inner + kCsLengthConfig] = decodeUintConfig(d, 8);
+                if (numContexts <= 2) { fail(d, kErrCorrupt); return codeSet; }
+            }
+            arena[inner + kCsNumContexts] = innerContexts;
+            const uint innerMap = alloc(d, innerContexts);
+            if (d.error != kErrNone) return codeSet;
+            for (uint i = 0; i < innerContexts; ++i) arena[innerMap + i] = 0;
+            arena[inner + kCsCtxMapOff] = innerMap;
+            arena[inner + kCsDistanceCtx] = innerContexts - 1;
+            decodeCodeTail(d, inner, 1);
+            if (d.error != kErrNone) return codeSet;
+            SymReader r = makeSymReader(d, inner, windowOff, 0);
+            if (d.error != kErrNone) return codeSet;
+            uint maxSym = 0;
+            for (uint i = 0; i < numContexts; ++i) {
+                const uint sym = readHybridUint(d, r, 0);
+                maxSym = max(maxSym, sym);
+                arena[mapOff + i] = sym;
+            }
+            if (maxSym >= 256 || !checkFinalState(r)) { fail(d, kErrCorrupt); return codeSet; }
+            if (useMtf != 0) inverseMtf(d, mapOff, numContexts);
+        }
+        uint maxEntry = 0;
+        for (uint i = 0; i < numContexts; ++i) maxEntry = max(maxEntry, arena[mapOff + i]);
+        numClusters = maxEntry + 1;
+        // Every cluster must be used.
+        const uint seenOff = alloc(d, numClusters);
+        if (d.error != kErrNone) return codeSet;
+        for (uint c = 0; c < numClusters; ++c) arena[seenOff + c] = 0;
+        for (uint i = 0; i < numContexts; ++i) arena[seenOff + arena[mapOff + i]] = 1;
+        for (uint c = 0; c < numClusters; ++c) {
+            if (arena[seenOff + c] == 0) { fail(d, kErrCorrupt); return codeSet; }
+        }
+    }
+    arena[codeSet + kCsDistanceCtx] = arena[mapOff + numContexts - 1];
+    decodeCodeTail(d, codeSet, numClusters);
+    return codeSet;
+}
+
+// --- symbol reading -------------------------------------------------------------------
+
+static const int kSpecialDistances[120][2] = {
+    {0, 1},  {1, 0},  {1, 1},  {-1, 1}, {0, 2},  {2, 0},  {1, 2},  {-1, 2}, {2, 1},  {-2, 1}, {2, 2},  {-2, 2},
+    {0, 3},  {3, 0},  {1, 3},  {-1, 3}, {3, 1},  {-3, 1}, {2, 3},  {-2, 3}, {3, 2},  {-3, 2}, {0, 4},  {4, 0},
+    {1, 4},  {-1, 4}, {4, 1},  {-4, 1}, {3, 3},  {-3, 3}, {2, 4},  {-2, 4}, {4, 2},  {-4, 2}, {0, 5},  {3, 4},
+    {-3, 4}, {4, 3},  {-4, 3}, {5, 0},  {1, 5},  {-1, 5}, {5, 1},  {-5, 1}, {2, 5},  {-2, 5}, {5, 2},  {-5, 2},
+    {4, 4},  {-4, 4}, {3, 5},  {-3, 5}, {5, 3},  {-5, 3}, {0, 6},  {6, 0},  {1, 6},  {-1, 6}, {6, 1},  {-6, 1},
+    {2, 6},  {-2, 6}, {6, 2},  {-6, 2}, {4, 5},  {-4, 5}, {5, 4},  {-5, 4}, {3, 6},  {-3, 6}, {6, 3},  {-6, 3},
+    {0, 7},  {7, 0},  {1, 7},  {-1, 7}, {5, 5},  {-5, 5}, {7, 1},  {-7, 1}, {4, 6},  {-4, 6}, {6, 4},  {-6, 4},
+    {2, 7},  {-2, 7}, {7, 2},  {-7, 2}, {3, 7},  {-3, 7}, {7, 3},  {-7, 3}, {5, 6},  {-5, 6}, {6, 5},  {-6, 5},
+    {8, 0},  {4, 7},  {-4, 7}, {7, 4},  {-7, 4}, {8, 1},  {8, 2},  {6, 6},  {-6, 6}, {8, 3},  {5, 7},  {-5, 7},
+    {7, 5},  {-7, 5}, {8, 4},  {6, 7},  {-6, 7}, {7, 6},  {-7, 6}, {8, 5},  {7, 7},  {-7, 7}, {8, 6},  {8, 7}};
+
+uint specialDistance(uint index, uint multiplier) {
+    const int dist = kSpecialDistances[index][0] + int(multiplier) * kSpecialDistances[index][1];
+    return dist > 1 ? uint(dist) : 1;
+}
+
+/// ANSSymbolReader::Create: reads the 32-bit initial state for ANS codes.
+SymReader makeSymReader(inout Dec d, uint codeSet, uint windowOff, uint distMul) {
+    SymReader r;
+    r.codeSet = codeSet;
+    r.usePrefix = csField(codeSet, kCsUsePrefix);
+    r.logAlpha = csField(codeSet, kCsLogAlpha);
+    if (r.usePrefix == 0) {
+        r.state = brRead(d.br, 32);
+        r.logEntrySize = kAnsLogTabSize - r.logAlpha;
+        r.entryMask = (1u << r.logEntrySize) - 1;
+    } else {
+        r.state = kAnsSignature << 16;
+        r.logEntrySize = 0;
+        r.entryMask = 0;
+    }
+    r.windowOff = windowOff;
+    r.numDecoded = 0;
+    r.numToCopy = 0;
+    r.copyPos = 0;
+    r.distMul = distMul;
+    if (csField(codeSet, kCsLz77Enabled) != 0 && windowOff == 0xFFFFFFFFu) {
+        fail(d, kErrLz77Window);
+    }
+    return r;
+}
+
+uint readSymbol(inout Dec d, inout SymReader r, uint cluster) {
+    const uint tableOff = arena[csField(r.codeSet, kCsTablesOff) + cluster];
+    if (r.usePrefix != 0) {
+        return readPrefixSymbol(d, tableOff);
+    }
+    const uint res = r.state & (kAnsTabSize - 1);
+    const uint i = res >> r.logEntrySize;
+    const uint pos = res & r.entryMask;
+    const uint w0 = arena[tableOff + 2 * i];
+    const uint w1 = arena[tableOff + 2 * i + 1];
+    const uint cutoff = w0 & 0xFF;
+    const uint right = (w0 >> 8) & 0xFF;
+    const uint freq0 = w0 >> 16;
+    const bool greater = pos >= cutoff;
+    const uint offsets1 = greater ? (w1 & 0xFFFF) : 0;
+    const uint freq1xor = greater ? (w1 >> 16) : 0;
+    const uint value = greater ? right : i;
+    const uint offset = offsets1 + pos;
+    const uint freq = freq0 ^ freq1xor;
+    r.state = freq * (r.state >> kAnsLogTabSize) + offset;
+    if (r.state < (1u << 16)) {
+        r.state = (r.state << 16) | brPeek(d.br, 16);
+        brConsume(d.br, 16);
+    }
+    return value;
+}
+
+/// ReadHybridUintClustered, LZ77 included.
+uint readHybridUintClustered(inout Dec d, inout SymReader r, uint cluster) {
+    const bool lz77 = csField(r.codeSet, kCsLz77Enabled) != 0;
+    if (lz77) {
+        if (r.numToCopy > 0) {
+            const uint ret = arena[r.windowOff + (r.copyPos & (kLz77WindowSize - 1))];
+            ++r.copyPos;
+            --r.numToCopy;
+            arena[r.windowOff + (r.numDecoded & (kLz77WindowSize - 1))] = ret;
+            ++r.numDecoded;
+            return ret;
+        }
+    }
+    const uint token = readSymbol(d, r, cluster);
+    const uint configsOff = csField(r.codeSet, kCsConfigsOff);
+    if (lz77) {
+        const uint threshold = csField(r.codeSet, kCsMinSymbol);
+        if (token >= threshold) {
+            r.numToCopy = readHybridUintConfig(d, csField(r.codeSet, kCsLengthConfig), token - threshold) +
+                          csField(r.codeSet, kCsMinLength);
+            const uint distCtx = csField(r.codeSet, kCsDistanceCtx);
+            const uint dToken = readSymbol(d, r, distCtx);
+            uint distance = readHybridUintConfig(d, arena[configsOff + distCtx], dToken);
+            const uint numSpecial = r.distMul == 0 ? 0 : kNumSpecialDistances;
+            if (distance < numSpecial) {
+                distance = specialDistance(distance, r.distMul);
+            } else {
+                distance = distance + 1 - numSpecial;
+            }
+            if (distance > r.numDecoded) distance = r.numDecoded;
+            if (distance > kLz77WindowSize) distance = kLz77WindowSize;
+            r.copyPos = r.numDecoded - distance;
+            if (distance == 0) {
+                const uint toFill = min(r.numToCopy, kLz77WindowSize);
+                for (uint i = 0; i < toFill; ++i) arena[r.windowOff + i] = 0;
+            }
+            if (r.numToCopy < csField(r.codeSet, kCsMinLength)) {
+                r.numToCopy = 0;
+                fail(d, kErrCorrupt);
+                return 0;
+            }
+            const uint ret = arena[r.windowOff + (r.copyPos & (kLz77WindowSize - 1))];
+            ++r.copyPos;
+            --r.numToCopy;
+            arena[r.windowOff + (r.numDecoded & (kLz77WindowSize - 1))] = ret;
+            ++r.numDecoded;
+            return ret;
+        }
+    }
+    const uint ret = readHybridUintConfig(d, arena[configsOff + cluster], token);
+    if (lz77) {
+        arena[r.windowOff + (r.numDecoded & (kLz77WindowSize - 1))] = ret;
+        ++r.numDecoded;
+    }
+    return ret;
+}
+
+uint readHybridUint(inout Dec d, inout SymReader r, uint ctx) {
+    return readHybridUintClustered(d, r, arena[csField(r.codeSet, kCsCtxMapOff) + ctx]);
+}
+
+bool checkFinalState(SymReader r) {
+    return r.usePrefix != 0 || r.state == (kAnsSignature << 16);
+}
+
+/// IsSingleValueAndAdvance: a cluster whose ANS table holds one symbol below the
+/// split, so `count` values are that symbol without reading. False for prefix.
+bool singleValueAndAdvance(inout Dec d, inout SymReader r, uint cluster, out uint value, uint count) {
+    value = 0;
+    if (r.usePrefix != 0 || r.numToCopy != 0) return false;
+    const uint tableOff = arena[csField(r.codeSet, kCsTablesOff) + cluster];
+    const uint res = r.state & (kAnsTabSize - 1);
+    const uint i = res >> r.logEntrySize;
+    const uint pos = res & r.entryMask;
+    const uint w0 = arena[tableOff + 2 * i];
+    const uint w1 = arena[tableOff + 2 * i + 1];
+    const uint cutoff = w0 & 0xFF;
+    const bool greater = pos >= cutoff;
+    const uint freq = (w0 >> 16) ^ (greater ? (w1 >> 16) : 0);
+    const uint sym = greater ? ((w0 >> 8) & 0xFF) : i;
+    if (freq != kAnsTabSize) return false;
+    const uint config = arena[csField(r.codeSet, kCsConfigsOff) + cluster];
+    if ((1u << (config & 0xFF)) <= sym) return false;
+    if (csField(r.codeSet, kCsLz77Enabled) != 0) {
+        if (sym >= csField(r.codeSet, kCsMinSymbol)) return false;
+        for (uint k = 0; k < count; ++k) {
+            arena[r.windowOff + (r.numDecoded & (kLz77WindowSize - 1))] = sym;
+            ++r.numDecoded;
+        }
+    }
+    value = sym;
+    return true;
+}
