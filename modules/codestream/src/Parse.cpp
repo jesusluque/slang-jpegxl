@@ -443,6 +443,9 @@ Result<Parsed> parse(std::span<const uint8_t> file) {
     if (m.orientation != 1) return unsupported("orientation other than identity");
     if (m.bitsPerSample > 16 || m.floatingPointSample) return unsupported("floating point or >16-bit samples");
     if (m.customWeightsMask != 0) return unsupported("custom upsampling weights");
+    if (!m.tfHaveGamma && m.transferFunction != 13 && m.transferFunction != 8 && m.transferFunction != 17) {
+        return unsupported("transfer functions other than sRGB, linear, gamma and DCI (PQ/HLG/709)");
+    }
 
     br.jumpToByteBoundary();
     ParsedFrame& frame = p.frame;

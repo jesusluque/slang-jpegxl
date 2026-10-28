@@ -853,8 +853,23 @@ uint decodeHistograms(inout Dec d, uint numContexts, bool disallowLz77, uint win
             if (d.error != kErrNone) return codeSet;
             for (uint i = 0; i < innerContexts; ++i) arena[innerMap + i] = 0;
             arena[inner + kCsCtxMapOff] = innerMap;
-            arena[inner + kCsDistanceCtx] = innerContexts - 1;
-            decodeCodeTail(d, inner, 1);
+            uint innerClusters = 1;
+            if (innerContexts > 1) {
+                // With LZ77 the nested stream has two contexts and a context map
+                // of its own; the simple form is read here, a nested coded map
+                // (a third level) is not.
+                if (brRead(d.br, 1) == 0) { fail(d, kErrUnsupported); return codeSet; }
+                const uint bitsPerEntry = brRead(d.br, 2);
+                if (bitsPerEntry != 0) {
+                    for (uint i = 0; i < innerContexts; ++i) arena[innerMap + i] = brRead(d.br, bitsPerEntry);
+                }
+                uint maxEntry = 0;
+                for (uint i = 0; i < innerContexts; ++i) maxEntry = max(maxEntry, arena[innerMap + i]);
+                innerClusters = maxEntry + 1;
+                if (innerClusters > 2) { fail(d, kErrCorrupt); return codeSet; }
+            }
+            arena[inner + kCsDistanceCtx] = arena[innerMap + innerContexts - 1];
+            decodeCodeTail(d, inner, innerClusters);
             if (d.error != kErrNone) return codeSet;
             SymReader r = makeSymReader(d, inner, windowOff, 0);
             if (d.error != kErrNone) return codeSet;

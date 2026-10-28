@@ -7,6 +7,7 @@
 
 #include "sjxl/core/Log.h"
 #include "sjxl/core/Platform.h"
+#include <algorithm>
 #include <bit>
 #include <cstdlib>
 #include "sjxl/gpu/CommandBatch.h"
@@ -61,7 +62,7 @@ Result<image::Rgb8> Decoder::decode(std::span<const uint8_t> file) {
     SJXL_ASSIGN(const codestream::Parsed parsed, codestream::parse(file));
     auto first = run(parsed, false);
     if (!first && first.error().code() == ErrorCode::Unsupported && first.error().message() == "LZ77 window") {
-        log::info("decoder: LZ77 in use, decoding again with windows");
+        log::debug("decoder: LZ77 in use, decoding again with windows");
         return run(parsed, true);
     }
     return first;
@@ -259,13 +260,33 @@ Result<image::Rgb8> Decoder::run(const codestream::Parsed& parsed, bool withLz77
         }
         c["params"]["negBias"][3].setData(0.0f);
         c["params"]["negBiasCbrt"][3].setData(0.0f);
+        // The transfer function of the declared colour encoding (dec_xyb.cc inverse_gamma).
+        uint32_t transfer = 0;
+        float gamma = 1.0f;
+        if (m.tfHaveGamma) {
+            transfer = 2;
+            gamma = static_cast<float>(m.tfGamma) * 1e-7f;
+        } else if (m.transferFunction == 8) {
+            transfer = 1;
+        } else if (m.transferFunction == 17) {   // DCI
+            transfer = 2;
+            gamma = 1.0f / 2.6f;
+        }
+        c["params"]["transfer"].setData(transfer);
+        c["params"]["gamma"].setData(gamma);
     });
     SJXL_TRY(batch.submit(true));
 
     SJXL_ASSIGN(const std::vector<uint32_t> statusHost, status.readAll<uint32_t>(dev));
     for (uint32_t i = 0; i < numThreads; ++i) {
-        const uint32_t code = statusHost[i];
+        const uint32_t code = statusHost[i] & 0xFF;
+        const uint32_t stage = statusHost[i] >> 8;
         if (code == kErrNone) continue;
+        if (code == kErrLz77Window) {
+            log::debug("decoder: thread {} needs an LZ77 window (stage {})", i, stage);
+        } else {
+            log::info("decoder: thread {} failed with code {} at stage {} (1 DcGlobal, 2 DC group, 3 AcGlobal, 4 AC group)", i, code, stage);
+        }
         const std::string where = i == 0 ? "the global sections" : i <= numDcGroups ? std::format("DC group {}", i - 1)
                                                                                     : std::format("AC group {}", i - 1 - numDcGroups);
         if (code == kErrLz77Window) return Error(ErrorCode::Unsupported, "LZ77 window");
@@ -300,6 +321,27 @@ Result<image::Rgb8> Decoder::run(const codestream::Parsed& parsed, bool withLz77
         }
         log::info("dec debug: dc block{} = {} {} {} (qf {})", dbgBlock, dcHost[dbgBlock], dcHost[nblocks + dbgBlock], dcHost[2 * nblocks + dbgBlock], qfHost[dbgBlock]);
         SJXL_ASSIGN(const auto fbHost, firstBlock.readAll<uint32_t>(dev));
+        {
+            SJXL_ASSIGN(const auto orders, arena.readRange<uint32_t>(dev, header[43], 3 * 64));
+            for (uint32_t ch = 0; ch < 3; ++ch) {
+                std::string o;
+                for (int k = 0; k < 64; ++k) o += std::format("{} ", orders[ch * 64 + k]);
+                log::info("dec debug: order bucket0 c{} = {}", ch, o);
+            }
+        }
+        log::info("dec debug: loop filter gab={} custom={} epfIters={} sharpCustom={} weightCustom={} sigmaCustom={} flags={:#x} xqm={} bqm={}", lf.gab,
+                  lf.gabCustom, lf.epfIters, lf.epfSharpCustom, lf.epfWeightCustom, lf.epfSigmaCustom, frame.header.flags, frame.header.xQmScale,
+                  frame.header.bQmScale);
+        SJXL_ASSIGN(const auto ytoxHost, ytox.readAll<int32_t>(dev));
+        SJXL_ASSIGN(const auto ytobHost, ytob.readAll<int32_t>(dev));
+        {
+            int minX = 999, maxX = -999, minB = 999, maxB = -999;
+            for (size_t i = 0; i < ytoxHost.size(); ++i) { minX = std::min(minX, ytoxHost[i]); maxX = std::max(maxX, ytoxHost[i]); minB = std::min(minB, ytobHost[i]); maxB = std::max(maxB, ytobHost[i]); }
+            uint32_t minQf = 9999, maxQf = 0, acsMask = 0;
+            for (uint32_t b = 0; b < nblocks; ++b) { minQf = std::min(minQf, qfHost[b]); maxQf = std::max(maxQf, qfHost[b]); if (acsHost[b] & 1) acsMask |= 1u << (acsHost[b] >> 1); }
+            log::info("dec debug: ytox [{}, {}] ytob [{}, {}] qf [{}, {}] acs mask 0x{:x} cfl base ({}, {}) cf {} dcCtxs {} nqf {} usedOrders 0x{:x} numHist {}",
+                      minX, maxX, minB, maxB, minQf, maxQf, acsMask, std::bit_cast<float>(header[13]), std::bit_cast<float>(header[14]), header[12], header[21], header[22], header[42], header[40]);
+        }
         log::info("dec debug: xqm {} bqm {} xDm {} bDm {}; firstBlock[0..4] = {} {} {} {}; acs[0..4] = {} {} {} {}", frame.header.xQmScale,
                   frame.header.bQmScale, std::pow(1.25f, 2 - static_cast<int>(frame.header.xQmScale)),
                   std::pow(1.25f, 2 - static_cast<int>(frame.header.bQmScale)), fbHost[0], fbHost[1], fbHost[2], fbHost[3], acsHost[0],

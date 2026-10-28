@@ -15,11 +15,16 @@ struct OutputParams {
     float inverseMatrix[12];   // 3x3 row-major, scaled by 255 / intensity_target, padded rows of 4
     float negBias[4];          // opsin biases (negative) and padding
     float negBiasCbrt[4];
+    uint  transfer;            // 0 sRGB, 1 linear, 2 power (gamma)
+    float gamma;               // the exponent for transfer 2 (e.g. 1/2.2)
+    uint  pad0, pad1;
 };
 ConstantBuffer<OutputParams> params;
 
-float srgbFromLinear(float v) {
+float encodeFromLinear(float v) {
     v = clamp(v, 0.0f, 1.0f);
+    if (params.transfer == 1) return v;
+    if (params.transfer == 2) return pow(v, params.gamma);
     return v <= 0.0031308f ? 12.92f * v : 1.055f * pow(v, 1.0f / 2.4f) - 0.055f;
 }
 
@@ -38,7 +43,7 @@ uint byteFor(uint index) {
     const float mg = gg * gg * gg + params.negBias[1];
     const float mb = gb * gb * gb + params.negBias[2];
     const float lin = params.inverseMatrix[c * 4 + 0] * mr + params.inverseMatrix[c * 4 + 1] * mg + params.inverseMatrix[c * 4 + 2] * mb;
-    return uint(round(srgbFromLinear(lin) * 255.0f));
+    return uint(round(encodeFromLinear(lin) * 255.0f));
 }
 
 [shader("compute")]

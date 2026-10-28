@@ -18,8 +18,10 @@ build/macos-arm64-debug/bin/sjxl_gpu_tests "prefix sum*"    # one Catch2 case by
 cmake --build build/macos-arm64-debug --target sjxl_gpu_tests   # one binary
 build/macos-arm64-debug/bin/sjxl info                       # open the device, print backend/adapter
 build/macos-arm64-debug/bin/sjxl encode in.png out.jxl --distance 1.0   # M1
-build/macos-arm64-debug/bin/sjxl decode in.jxl out.png                  # M2
+build/macos-arm64-debug/bin/sjxl decode in.jxl out.png                  # VarDCT, every stage on the GPU
 build/macos-arm64-debug/bin/sjxl compare a.png b.png                    # PSNR + largest diff, on the GPU
+build/macos-arm64-debug/bin/sjxl pixel a.png x y ; sjxl convert in.png out.png   # one pixel; re-save as RGB8
+SJXL_DEBUG=1 SJXL_DEBUG_BLOCK=57 build/macos-arm64-debug/bin/sjxl decode ...    # dumps one block's coefficients, DC, orders
 ~/tools/slang/bin/slangc shaders/sjxl/<dir>/<file>.slang -I shaders -target metal -entry <entry> -stage compute -o /dev/null
 cjxl in.png ref.jxl -d 1 -e 5 ; djxl out.jxl check.png      # Homebrew oracle (/opt/homebrew/bin)
 ```
@@ -50,7 +52,15 @@ cjxl in.png ref.jxl -d 1 -e 5 ; djxl out.jxl check.png      # Homebrew oracle (/
 - **Shader parameters are bound by name** through reflection
   (`cursor["coeffs"].setBinding(...)`, uniforms as `ConstantBuffer<Params> params`),
   never by slot. Dispatch sizes are in threads; `[numthreads]` is read from
-  reflection; kernels bounds-check.
+  reflection; kernels bounds-check. `setData` writes the argument's own type:
+  pass a `float` (cast `std::pow` results), never a double, into a float field.
+- **Coefficient memory is libjxl's**: square and tall blocks store
+  `[horizontal freq][vertical freq]`, wide blocks `[vertical][horizontal]`
+  (`transforms.slang memIndex`). Orders and quant tables are memory indices.
+- **Decoder scratch is one `arena` buffer** partitioned by the host; a thread's
+  code sets, trees and channels are arena offsets, so AC threads read the code
+  set the globals thread decoded. A thread reports errors through `status`
+  (code | stage << 8), never silently.
 - **Errors are `Result<T>`** with `SJXL_TRY` / `SJXL_ASSIGN`; no exceptions.
   A codestream feature not implemented fails with `ErrorCode::Unsupported`
   naming the feature. Never a silent CPU path.
@@ -88,6 +98,7 @@ Modules are static libraries `sjxl_<name>` aliased `sjxl::<name>`
 | image | file I/O only: PNG/PPM/JPEG via stb (`readRgb8`, `writePng`, `readFile`, `writeFile`) |
 | metrics | `metrics::compare`: PSNR, largest difference and where, measured by `shaders/sjxl/metrics/compare.slang`; what tests and `sjxl compare` use |
 | encoder | `enc::Encoder::encode(Rgb8, Options{distance})`: the GPU encode pipeline (`shaders/sjxl/enc/`): xyb → dct_quant → items (mode 0 histogram, 1 count, 2 emit) → codes (Huffman + headers per DC group, globals) → prefix sums → layout → emit |
+| decoder | `dec::Decoder::decode(bytes)`: `codestream::parse` on the CPU, then `shaders/sjxl/dec/`: sections (one thread per section: globals, DC groups, AC groups; libraries entropy/modular/frame .slangh over one `arena` buffer) → tables → dc_finalize → transforms → filters → output |
 | decoder (M2) | `dec::Decoder`: the GPU decode pipeline |
 
 Granularity glossary: block 8×8 px; varblock = one transform (8×8 to 256×256);
@@ -102,7 +113,7 @@ prefix sums (section bit offsets, section byte sizes) → bit emission by
 `InterlockedOr` into a zeroed body buffer → readback of sizes and body; CPU
 writes headers + TOC and appends the body.
 
-Decoder stages (M2): CPU parses signature/headers/TOC into a section table →
+Decoder stages: CPU parses signature/headers/TOC into a section table →
 one-thread kernels decode DcGlobal and AcGlobal (quantizer, block context
 map, dequant matrices, coefficient orders, histograms → prefix/ANS tables) →
 one thread per DC group (modular DC + AcMetadata, MA tree, predictors) → per

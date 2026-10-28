@@ -98,12 +98,15 @@ void decodeGlobals(uint3 tid: SV_DispatchThreadID) {
     arena[kGsHeaderSize - 1] = params.blocksX * params.blocksY;   // nblocks, read by the DC group body
     Dec d = makeDec(0, kGsHeaderSize, params.globalsCap);
     const uint window = windowFor(0);
+    uint stage = 1;
     decodeDcGlobal(d, window);
     arena[kGsDcGlobalBits] = d.br.pos - sections[0].x;
     if (d.error == kErrNone && params.singleSection != 0) {
+        stage = 2;
         decodeDcGroup(d, dcGeom(0), window);
     }
     if (d.error == kErrNone) {
+        stage = 3;
         if (params.singleSection == 0) {
             d.br.pos = sections[1 + params.numDcGroups].x;
             d.br.end = sections[1 + params.numDcGroups].y;
@@ -112,9 +115,10 @@ void decodeGlobals(uint3 tid: SV_DispatchThreadID) {
         arena[kGsAcGlobalBits] = d.br.pos;
     }
     if (d.error == kErrNone && params.singleSection != 0) {
+        stage = 4;
         decodeAcGroup(d, acGeom(0), window);
     }
-    status[0] = d.error;
+    status[0] = d.error | (d.error != kErrNone ? (stage << 8) : 0);
     arena[kGsError] = d.error;
 }
 

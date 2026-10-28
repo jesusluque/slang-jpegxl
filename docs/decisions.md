@@ -104,3 +104,72 @@ Natural order: `dct8NaturalOrder()` follows `CoeffOrderAndLut` literally; the
 first diagonal is memory index 1 then 8 (libjxl swaps x and y on odd
 diagonals). Coefficient memory layout is `coef[fx * 8 + fy]` with fx the
 horizontal frequency, as cujpegxl checked against libjxl.
+
+## M2 decoder, VarDCT (2026-10-29)
+
+Layout of the work on the device (`shaders/sjxl/dec/`):
+
+- `sections.slang`: one thread per entropy-coded section. `decodeGlobals`
+  reads DcGlobal (DC dequant, quantizer, block context map, colour
+  correlation, global MA tree) and AcGlobal (dequant matrix encodings,
+  `num_histograms`, coefficient orders with Lehmer codes, the AC histograms);
+  with one TOC entry it also runs the DC and AC group bodies, since they share
+  one bit stream. `decodeDcGroups`: VarDCT DC as a three-channel modular image,
+  DequantDC with the DC chroma-from-luma factors and the DC context bucket,
+  then AcMetadata (YtoX/YtoB per tile, strategies and quant field, EPF
+  sharpness) and the raster placement with the overlap and group-boundary
+  checks. `decodeAcGroups`: histogram selector, blocks in raster order,
+  channels Y, X, B, non-zero count from the group-local prediction, then
+  coefficients in coefficient order. Coefficient k of a varblock lives at the
+  slot of its k/64-th covered block, k%64, so the dequantisation kernel finds
+  it from the `firstBlock` grid.
+- `entropy.slangh` / `modular.slangh` / `frame.slangh`: the libraries behind
+  it. Everything decoded sits in one `arena` buffer (code sets, context maps,
+  prefix tables with Brotli's two-level layout, ANS alias tables, trees,
+  channel storage, LZ77 windows), partitioned by the host: 16 MB for the
+  globals thread, 4 MB per DC group, 4 KB per AC group. LZ77 windows (4 MB a
+  thread) are allocated only on a retry after a thread reports it needed one.
+- Then parallel kernels: `tables.slang` (one thread per dequant matrix entry;
+  libjxl's library constants and the DCT/ID/DCT2/DCT4/DCT4X8/AFV formulas),
+  `dc_finalize.slang` (AdaptiveDCSmoothing, EPF sigma), `transforms.slang`
+  (dequant with the quant bias and chroma-from-luma per coefficient; LLF from
+  the DC image, inverse DCT for 8–32 px blocks as a direct separable
+  transform, IDENTITY/DCT2X2/DCT4X4/DCT4X8/DCT8X4/AFV per libjxl), `filters.slang`
+  (Gaborish, EPF0/1/2 as whole-image passes with mirrored borders at the frame
+  edge), `output.slang` (XYB → linear → the declared transfer function:
+  sRGB, linear, gamma, DCI).
+
+Facts that cost time, kept here so they are not re-learned:
+
+- **Coefficient memory orientation** (`dct-inl.h ComputeScaledDCT`): a wide
+  block (rows < cols) stores `[vertical freq][horizontal freq]`; a tall or
+  *square* block stores `[horizontal][vertical]`. The natural order and the
+  quant tables are just memory indices, so only the IDCT cares.
+- **`ShaderCursor::setData` takes the argument's type literally**: a `double`
+  (e.g. `std::pow(float, int)` promotes) written into a `float` field leaves
+  garbage — here 0, which silenced the chroma channels.
+- **slang-rhi resources are untracked** (Metal untracked hazard mode); every
+  encoder waits on and updates one queue fence, so passes are serialised
+  with memory visibility. `ComputeKernel::dispatch` still issues
+  `globalBarrier()` after each pass for the other backends' contract.
+- **A nested context-map stream can itself use LZ77**: it then has two
+  contexts and a context map of its own (simple form supported; a third
+  level is reported Unsupported).
+- **The output transfer function is the declared colour encoding's**: a PNG
+  with gAMA 1/2.2 makes cjxl declare gamma 0.4545, and djxl applies it. The
+  synthetic PPM tests (no gamma) hid this; the photos showed a uniform ±2.
+- `cjxl` at effort 1–5 on these photos used only DCT8 with a uniform quant
+  field and zero chroma-from-luma, but custom coefficient orders (bit 0 of
+  used_orders) and LZ77 in the AcGlobal context map.
+
+Measured (ours vs djxl 0.12, `sjxl compare`): our own encoder's streams and
+cjxl's at effort 1–5 (d 1 and 3) decode within 1 LSB (≈54 dB) on the test
+set, including EPF iterations 0–3 and Gaborish. Debug build, 320×180:
+≈300 ms a decode, dominated by the single-thread section kernels compiling
+and running cold; not measured for speed yet (M5).
+
+Not done: transforms of 64–256 px (`flags` reports them), RAW quant tables,
+modular Squeeze, Modular frames, extra channels, ICC, animation, previews,
+progressive passes, TOC permutations, a third level of nested context maps.
+Effort 7 streams still differ (max 12–73): to be investigated (AFV / DCT4x4
+paths or EPF sharpness with custom quant field).
