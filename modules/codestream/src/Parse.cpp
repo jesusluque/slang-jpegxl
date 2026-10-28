@@ -1,6 +1,7 @@
 // Copyright (c) 2026 jesus luque.
 #include "sjxl/codestream/Parse.h"
 
+#include <format>
 #include <cmath>
 #include <cstring>
 
@@ -453,7 +454,11 @@ Result<Parsed> parse(std::span<const uint8_t> file) {
     SJXL_TRY(readFrameHeader(br, m, frame.header));
     if (!br.withinBounds()) return corrupt("truncated frame header");
     const FrameHeader& f = frame.header;
-    if (f.isModular) return unsupported("Modular frames (lossless)");
+    if (f.isModular) {
+        return unsupported(std::format("Modular frames (frame type {}, {}{}, size {}x{})", f.frameType, f.isLast ? "last" : "not last",
+                                       f.saveAsReference != 0 ? ", saved as reference" : "", f.customSizeOrOrigin ? f.frameXsize : m.xsize,
+                                       f.customSizeOrOrigin ? f.frameYsize : m.ysize));
+    }
     if (f.frameType != 0) return unsupported("DC, reference-only or skip-progressive frames");
     if (f.flags & FrameHeader::kNoise) return unsupported("noise synthesis");
     if (f.flags & FrameHeader::kPatches) return unsupported("patches");
