@@ -440,7 +440,6 @@ Result<Parsed> parse(std::span<const uint8_t> file) {
     if (m.numExtraChannels != 0) return unsupported("extra channels (alpha, depth, ...)");
     if (m.havePreview) return unsupported("preview frames");
     if (m.haveAnimation) return unsupported("animation");
-    if (!m.xybEncoded) return unsupported("frames not encoded in XYB");
     if (m.orientation != 1) return unsupported("orientation other than identity");
     if (m.bitsPerSample > 16 || m.floatingPointSample) return unsupported("floating point or >16-bit samples");
     if (m.customWeightsMask != 0) return unsupported("custom upsampling weights");
@@ -455,9 +454,16 @@ Result<Parsed> parse(std::span<const uint8_t> file) {
     if (!br.withinBounds()) return corrupt("truncated frame header");
     const FrameHeader& f = frame.header;
     if (f.isModular) {
-        return unsupported(std::format("Modular frames (frame type {}, {}{}, size {}x{})", f.frameType, f.isLast ? "last" : "not last",
-                                       f.saveAsReference != 0 ? ", saved as reference" : "", f.customSizeOrOrigin ? f.frameXsize : m.xsize,
-                                       f.customSizeOrOrigin ? f.frameYsize : m.ysize));
+        if (f.frameType != 0) {
+            return unsupported(std::format("Modular frames of type {} ({}{}, size {}x{}; patches)", f.frameType, f.isLast ? "last" : "not last",
+                                           f.saveAsReference != 0 ? ", saved as reference" : "", f.customSizeOrOrigin ? f.frameXsize : m.xsize,
+                                           f.customSizeOrOrigin ? f.frameYsize : m.ysize));
+        }
+        if (f.colorTransform == 2) return unsupported("Modular frames in YCbCr");
+        if (m.colorSpace != 0 && m.colorSpace != 1) return unsupported("Modular frames in a colour space other than RGB or grey");
+        if (m.floatingPointSample) return unsupported("floating point samples");
+    } else {
+        if (!m.xybEncoded || f.colorTransform != 0) return unsupported("VarDCT frames not encoded in XYB");
     }
     if (f.frameType != 0) return unsupported("DC, reference-only or skip-progressive frames");
     if (f.flags & FrameHeader::kNoise) return unsupported("noise synthesis");
@@ -469,7 +475,7 @@ Result<Parsed> parse(std::span<const uint8_t> file) {
     if (f.customSizeOrOrigin) return unsupported("frames with a custom size or origin");
     if (!f.isLast) return unsupported("multiple frames");
 
-    frame.dim = frameDim(m.xsize, m.ysize);
+    frame.dim = frameDim(m.xsize, m.ysize, f.groupSizeShift);
     const uint32_t numEntries = frame.dim.singleSection() ? 1 : frame.dim.numSections();
     frame.singleSection = frame.dim.singleSection();
     // TOC

@@ -157,18 +157,20 @@ void writeToc(BitWriter& w, std::span<const uint32_t> sectionBytes) {
     w.zeroPadToByte();
 }
 
-FrameDim frameDim(uint32_t xsize, uint32_t ysize) {
+FrameDim frameDim(uint32_t xsize, uint32_t ysize, uint32_t groupSizeShift) {
     FrameDim d;
     d.xsize = xsize;
     d.ysize = ysize;
+    d.groupDim = 128u << groupSizeShift;
+    const uint32_t groupBlocks = d.groupDim / kBlockDim;
     d.xsizeBlocks = ceilDiv(xsize, kBlockDim);
     d.ysizeBlocks = ceilDiv(ysize, kBlockDim);
     d.xsizePadded = d.xsizeBlocks * kBlockDim;
     d.ysizePadded = d.ysizeBlocks * kBlockDim;
-    d.xsizeGroups = ceilDiv(d.xsizeBlocks, kGroupDimBlocks);
-    d.ysizeGroups = ceilDiv(d.ysizeBlocks, kGroupDimBlocks);
-    d.xsizeDcGroups = ceilDiv(d.xsizeBlocks, kDcGroupDimBlocks);
-    d.ysizeDcGroups = ceilDiv(d.ysizeBlocks, kDcGroupDimBlocks);
+    d.xsizeGroups = ceilDiv(d.xsizeBlocks, groupBlocks);
+    d.ysizeGroups = ceilDiv(d.ysizeBlocks, groupBlocks);
+    d.xsizeDcGroups = ceilDiv(d.xsizeBlocks, d.groupDim);
+    d.ysizeDcGroups = ceilDiv(d.ysizeBlocks, d.groupDim);
     return d;
 }
 

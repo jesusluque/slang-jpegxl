@@ -100,7 +100,7 @@ Modules are static libraries `sjxl_<name>` aliased `sjxl::<name>`
 | image | file I/O only: PNG/PPM/JPEG via stb (`readRgb8`, `writePng`, `readFile`, `writeFile`) |
 | metrics | `metrics::compare`: PSNR, largest difference and where, measured by `shaders/sjxl/metrics/compare.slang`; what tests and `sjxl compare` use |
 | encoder | `enc::Encoder::encode(Rgb8, Options{distance})`: the GPU encode pipeline (`shaders/sjxl/enc/`): xyb → dct_quant → items (mode 0 histogram, 1 count, 2 emit) → codes (Huffman + headers per DC group, globals) → prefix sums → layout → emit |
-| decoder | `dec::Decoder::decode(bytes)`: `codestream::parse` on the CPU, then `shaders/sjxl/dec/`: sections (one thread per section: globals, DC groups, AC groups; libraries entropy/modular/frame .slangh over one `arena` buffer) → tables → dc_finalize → transforms → filters → output |
+| decoder | `dec::Decoder::decode(bytes)`: `codestream::parse` on the CPU, then `shaders/sjxl/dec/`: sections (one thread per section: globals, DC groups, AC groups; libraries entropy/modular/frame/modframe .slangh over one `arena` buffer) → VarDCT: tables → dc_finalize → transforms; Modular: finalise (inverse transforms) → modular_out (channels to planes) → filters → output |
 | decoder (M2) | `dec::Decoder`: the GPU decode pipeline |
 
 Granularity glossary: block 8×8 px; varblock = one transform (8×8 to 256×256);
@@ -124,3 +124,10 @@ block DequantDC, AdaptiveDCSmoothing, EPF sigma → one thread per AC group
 CfL, per covered block LLF, per pixel separable IDCT (rows, then columns; any
 size 8–256), per varblock the 8×8 special transforms → whole-image Gaborish,
 EPF passes, XYB→sRGB8 → readback; CPU writes the file.
+
+Modular frames (lossless; `modframe.slangh`): the globals thread decodes the
+global tree and the channels that fit a group; group threads decode their
+rectangle of the big channels through strided views into the full-image
+channels; one thread undoes RCT/palette; a per-pixel kernel scales the
+integers into the planes; the output stage copies them (mode 1) or, for XYB
+modular, runs the usual colour transform. Squeeze is not implemented yet.

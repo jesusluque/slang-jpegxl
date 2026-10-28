@@ -23,6 +23,7 @@ struct DcGroupGeom {
     uint tilesX;         // image width in tiles
     uint numDcGroups;
     uint group;
+    uint groupBlocks;    // AC group size in blocks (groupDim / 8)
 };
 
 void decodeDcGroup(inout Dec d, DcGroupGeom g, uint windowOff) {
@@ -119,8 +120,8 @@ void decodeDcGroup(inout Dec d, DcGroupGeom g, uint windowOff) {
             usedAcs |= 1u << strategy;
             const uint cx = kCoveredX[strategy];
             const uint cy = kCoveredY[strategy];
-            const uint nextXGroup = (x / 32 + 1) * 32;
-            const uint nextYGroup = (y / 32 + 1) * 32;
+            const uint nextXGroup = (x / g.groupBlocks + 1) * g.groupBlocks;
+            const uint nextYGroup = (y / g.groupBlocks + 1) * g.groupBlocks;
             if (x + cx > nextXGroup || x + cx > g.x0 + g.w || y + cy > nextYGroup || y + cy > g.y0 + g.h) {
                 fail(d, kErrCorrupt);
                 return;

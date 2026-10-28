@@ -1,6 +1,6 @@
 // Copyright (c) 2026 jesus luque.
 //
-// The VarDCT decoder. The CPU parses headers and the TOC (codestream::parse);
+// The VarDCT and Modular frame decoder. The CPU parses headers and the TOC (codestream::parse);
 // every section is decoded by a kernel thread, and dequantisation, inverse
 // transforms, loop filters and the colour transform are kernels
 // (shaders/sjxl/dec). Features not implemented fail with Unsupported.
@@ -42,7 +42,7 @@ private:
     std::shared_ptr<gpu::ShaderLibrary> library_;
     gpu::Device*                        device_ = nullptr;
     gpu::ComputeKernel globals_, dcGroups_, acGroups_, tables_, smoothDc_, computeSigma_, dequantCoeffs_, llfFromDc_, idctRows_, idctCols_, transformSpecial_,
-        gaborish_, epf_, output_;
+        gaborish_, epf_, output_, modularGlobals_, modularDcGroups_, modularAcGroups_, modularFinalize_, modularToPlanes_;
     Stats stats_;
 };
 

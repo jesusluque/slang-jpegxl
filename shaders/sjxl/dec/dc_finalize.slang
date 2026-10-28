@@ -19,7 +19,9 @@ struct DcFinalizeParams {
     uint  epfIters;
     float epfQuantMul;
     float sharpLut[8];
-    float pad0, pad1, pad2;
+    float constantInvSigma;   // modular frames: kInvSigmaNum / epf_sigma_for_modular for every block
+    uint  useConstantSigma;
+    float pad2;
 };
 ConstantBuffer<DcFinalizeParams> params;
 
@@ -67,6 +69,10 @@ void computeSigma(uint3 tid: SV_DispatchThreadID) {
     if (block >= params.blocksX * params.blocksY) return;
     if (params.epfIters == 0) {
         sigma[block] = 0.0f;
+        return;
+    }
+    if (params.useConstantSigma != 0) {
+        sigma[block] = params.constantInvSigma;
         return;
     }
     // Every covered block carries its varblock's qf (set by the DC group decode).

@@ -17,7 +17,8 @@ struct OutputParams {
     float negBiasCbrt[4];
     uint  transfer;            // 0 sRGB, 1 linear, 2 power (gamma)
     float gamma;               // the exponent for transfer 2 (e.g. 1/2.2)
-    uint  pad0, pad1;
+    uint  mode;                // 0: XYB planes; 1: planes already hold the output encoding in [0, 1]
+    uint  pad1;
 };
 ConstantBuffer<OutputParams> params;
 
@@ -35,6 +36,7 @@ uint byteFor(uint index) {
     const uint y = pixel / params.width;
     const uint plane = params.paddedWidth * params.paddedHeight;
     const uint at = y * params.paddedWidth + x;
+    if (params.mode == 1) return uint(round(clamp(xyb[c * plane + at], 0.0f, 1.0f) * 255.0f));
     const float ox = xyb[at], oy = xyb[plane + at], ob = xyb[2 * plane + at];
     float gr = oy + ox - params.negBiasCbrt[0];
     float gg = oy - ox - params.negBiasCbrt[1];

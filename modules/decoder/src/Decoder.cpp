@@ -20,6 +20,8 @@ constexpr uint32_t kGsHeaderSize = 64;
 constexpr uint32_t kGlobalsWords = 4u << 20;      // 16 MB: AC code sets, orders, matrices encodings
 constexpr uint32_t kDcGroupWords = 1u << 20;      // 4 MB per DC group
 constexpr uint32_t kAcGroupWords = 1024;
+constexpr uint32_t kModularGroupWords = 1u << 19;   // a group's local trees, histograms and predictor state
+constexpr float    kInvSigmaNum = -1.1715728752538099024f;
 constexpr uint32_t kLz77WindowWords = 1u << 20;
 constexpr uint32_t kDequantTableFloats = 394752;
 constexpr uint32_t kErrNone = 0, kErrCorrupt = 1, kErrUnsupported = 2, kErrArena = 3, kErrLz77Window = 4;
@@ -56,6 +58,11 @@ Result<std::unique_ptr<Decoder>> Decoder::create(std::shared_ptr<gpu::ShaderLibr
     SJXL_ASSIGN(dec->idctRows_, gpu::ComputeKernel::create(lib, "sjxl/dec/transforms", "idctRows"));
     SJXL_ASSIGN(dec->idctCols_, gpu::ComputeKernel::create(lib, "sjxl/dec/transforms", "idctCols"));
     SJXL_ASSIGN(dec->transformSpecial_, gpu::ComputeKernel::create(lib, "sjxl/dec/transforms", "inverseTransformSpecial"));
+    SJXL_ASSIGN(dec->modularGlobals_, gpu::ComputeKernel::create(lib, "sjxl/dec/sections", "decodeModularGlobals"));
+    SJXL_ASSIGN(dec->modularDcGroups_, gpu::ComputeKernel::create(lib, "sjxl/dec/sections", "decodeModularDcGroups"));
+    SJXL_ASSIGN(dec->modularAcGroups_, gpu::ComputeKernel::create(lib, "sjxl/dec/sections", "decodeModularAcGroups"));
+    SJXL_ASSIGN(dec->modularFinalize_, gpu::ComputeKernel::create(lib, "sjxl/dec/sections", "modularFinalizeFrame"));
+    SJXL_ASSIGN(dec->modularToPlanes_, gpu::ComputeKernel::create(lib, "sjxl/dec/modular_out", "modularToPlanes"));
     SJXL_ASSIGN(dec->gaborish_, gpu::ComputeKernel::create(lib, "sjxl/dec/filters", "gaborish"));
     SJXL_ASSIGN(dec->epf_, gpu::ComputeKernel::create(lib, "sjxl/dec/filters", "epf"));
     SJXL_ASSIGN(dec->output_, gpu::ComputeKernel::create(lib, "sjxl/dec/output", "xybToSrgb8"));
@@ -84,6 +91,9 @@ Result<image::Rgb8> Decoder::run(const codestream::Parsed& parsed, bool withLz77
     const uint32_t numThreads = 1 + numDcGroups + numGroups;
     const uint32_t tilesX = (dim.xsizeBlocks + 7) / 8;
     const uint32_t tilesY = (dim.ysizeBlocks + 7) / 8;
+    const bool modular = frame.header.isModular;
+    const bool modularXyb = modular && frame.header.colorTransform == 0;
+    const uint32_t colorChannels = (modular && m.colorSpace == 1 && frame.header.colorTransform == 1) ? 1u : 3u;
 
     // The codestream and the section table (bit positions).
     std::vector<uint32_t> csWords((parsed.codestream.size() + 3) / 4 + 2, 0);
@@ -95,10 +105,23 @@ Result<image::Rgb8> Decoder::run(const codestream::Parsed& parsed, bool withLz77
     }
     SJXL_ASSIGN(auto sectionBuf, gpu::Buffer::fromSpan<Uint2>(dev, sections, "dec.sections"));
 
-    // Arena partition.
-    const uint32_t dcArenaBase = kGlobalsWords;
-    const uint32_t acArenaBase = dcArenaBase + numDcGroups * kDcGroupWords;
-    const uint32_t windowBase = acArenaBase + numGroups * kAcGroupWords;
+    // Arena partition. A modular frame keeps its full-image channels in the globals
+    // region, decodes groups into them through views, and expands palettes at the
+    // finalise step in the AC groups' region.
+    uint32_t globalsWords = kGlobalsWords, dcGroupWords = kDcGroupWords, acGroupWords = kAcGroupWords;
+    if (modular) {
+        const uint64_t pixels = uint64_t{m.xsize} * m.ysize;
+        if (pixels * (colorChannels + 2) > (uint64_t{1} << 31)) return Error(ErrorCode::Unsupported, "modular frames above 512 Mpixel");
+        globalsWords = kGlobalsWords + static_cast<uint32_t>((colorChannels + 1) * pixels);
+        dcGroupWords = kModularGroupWords;
+        acGroupWords = std::max(kModularGroupWords, 4u * dim.groupDim * dim.groupDim);
+        if (uint64_t{acGroupWords} * numGroups < (colorChannels + 1) * pixels) {
+            acGroupWords = static_cast<uint32_t>(((colorChannels + 1) * pixels + numGroups - 1) / numGroups);
+        }
+    }
+    const uint32_t dcArenaBase = globalsWords;
+    const uint32_t acArenaBase = dcArenaBase + numDcGroups * dcGroupWords;
+    const uint32_t windowBase = acArenaBase + numGroups * acGroupWords;
     const uint32_t windowCount = withLz77Windows ? numThreads : 0;
     const uint64_t arenaWords = uint64_t{windowBase} + uint64_t{windowCount} * kLz77WindowWords;
     SJXL_ASSIGN(auto arena, gpu::Buffer::ofType<uint32_t>(dev, arenaWords, "dec.arena"));
@@ -145,14 +168,51 @@ Result<image::Rgb8> Decoder::run(const codestream::Parsed& parsed, bool withLz77
         c["params"]["numGroups"].setData(numGroups);
         c["params"]["numDcGroups"].setData(numDcGroups);
         c["params"]["singleSection"].setData(uint32_t{frame.singleSection ? 1u : 0u});
-        c["params"]["globalsCap"].setData(kGlobalsWords);
+        c["params"]["globalsCap"].setData(globalsWords);
         c["params"]["dcArenaBase"].setData(dcArenaBase);
-        c["params"]["dcArenaWords"].setData(kDcGroupWords);
+        c["params"]["dcArenaWords"].setData(dcGroupWords);
         c["params"]["acArenaBase"].setData(acArenaBase);
-        c["params"]["acArenaWords"].setData(kAcGroupWords);
+        c["params"]["acArenaWords"].setData(acGroupWords);
         c["params"]["windowBase"].setData(withLz77Windows ? windowBase : 0xFFFFFFFFu);
         c["params"]["windowCount"].setData(windowCount);
+        c["params"]["groupDim"].setData(dim.groupDim);
+        c["params"]["xsize"].setData(m.xsize);
+        c["params"]["ysize"].setData(m.ysize);
+        c["params"]["colorChannels"].setData(colorChannels);
+        c["params"]["bitDepth"].setData(m.bitsPerSample);
     };
+    if (modular) {
+        modularGlobals_.dispatch(batch, {1, 1, 1}, bindSections);
+        modularDcGroups_.dispatch(batch, {numDcGroups, 1, 1}, bindSections);
+        modularAcGroups_.dispatch(batch, {numGroups, 1, 1}, bindSections);
+        modularFinalize_.dispatch(batch, {1, 1, 1}, bindSections);
+        modularToPlanes_.dispatch(batch, {m.xsize * m.ysize, 1, 1}, [&](rhi::ShaderCursor c) {
+            c["arena"].setBinding(arena.rhi());
+            c["xyb"].setBinding(xybA.rhi());
+            c["params"]["width"].setData(m.xsize);
+            c["params"]["height"].setData(m.ysize);
+            c["params"]["paddedWidth"].setData(dim.xsizePadded);
+            c["params"]["paddedHeight"].setData(dim.ysizePadded);
+            c["params"]["xybMode"].setData(uint32_t{modularXyb ? 1u : 0u});
+            c["params"]["sampleScale"].setData(1.0f / static_cast<float>((uint64_t{1} << m.bitsPerSample) - 1));
+        });
+        if (lf.epfIters > 0) {
+            computeSigma_.dispatch(batch, {nblocks, 1, 1}, [&](rhi::ShaderCursor c) {
+                c["arena"].setBinding(arena.rhi());
+                c["dc"].setBinding(dc.rhi());
+                c["dcSmooth"].setBinding(dcSmooth.rhi());
+                c["acs"].setBinding(acs.rhi());
+                c["qf"].setBinding(qf.rhi());
+                c["epfSharp"].setBinding(epfSharp.rhi());
+                c["sigma"].setBinding(sigma.rhi());
+                c["params"]["blocksX"].setData(dim.xsizeBlocks);
+                c["params"]["blocksY"].setData(dim.ysizeBlocks);
+                c["params"]["epfIters"].setData(lf.epfIters);
+                c["params"]["useConstantSigma"].setData(uint32_t{1});
+                c["params"]["constantInvSigma"].setData(kInvSigmaNum / lf.epfSigmaForModular);
+            });
+        }
+    } else {
     globals_.dispatch(batch, {1, 1, 1}, bindSections);
     dcGroups_.dispatch(batch, {numDcGroups, 1, 1}, bindSections);
     tables_.dispatch(batch, {kDequantTableFloats, 1, 1}, [&](rhi::ShaderCursor c) {
@@ -174,6 +234,8 @@ Result<image::Rgb8> Decoder::run(const codestream::Parsed& parsed, bool withLz77
         c["params"]["epfIters"].setData(lf.epfIters);
         c["params"]["epfQuantMul"].setData(lf.epfQuantMul);
         for (int i = 0; i < 8; ++i) c["params"]["sharpLut"][i].setData(lf.epfSharpLut[static_cast<size_t>(i)]);
+        c["params"]["useConstantSigma"].setData(uint32_t{0});
+        c["params"]["constantInvSigma"].setData(0.0f);
     };
     smoothDc_.dispatch(batch, {dim.xsizeBlocks, dim.ysizeBlocks, 1}, bindFinalize);
     computeSigma_.dispatch(batch, {nblocks, 1, 1}, bindFinalize);
@@ -205,6 +267,7 @@ Result<image::Rgb8> Decoder::run(const codestream::Parsed& parsed, bool withLz77
     idctRows_.dispatch(batch, {static_cast<uint32_t>(3 * planePixels), 1, 1}, bindTransforms);
     idctCols_.dispatch(batch, {static_cast<uint32_t>(3 * planePixels), 1, 1}, bindTransforms);
     transformSpecial_.dispatch(batch, {3 * nblocks, 1, 1}, bindTransforms);
+    }   // VarDCT
 
     // Loop filters, ping-pong between the two XYB buffers.
     gpu::Buffer* src = &xybA;
@@ -280,6 +343,7 @@ Result<image::Rgb8> Decoder::run(const codestream::Parsed& parsed, bool withLz77
         }
         c["params"]["transfer"].setData(transfer);
         c["params"]["gamma"].setData(gamma);
+        c["params"]["mode"].setData(uint32_t{(modular && !modularXyb) ? 1u : 0u});
     });
     SJXL_TRY(batch.submit(true));
 
@@ -291,7 +355,7 @@ Result<image::Rgb8> Decoder::run(const codestream::Parsed& parsed, bool withLz77
         if (code == kErrLz77Window) {
             log::debug("decoder: thread {} needs an LZ77 window (stage {})", i, stage);
         } else {
-            log::debug("decoder: thread {} failed with code {} at stage {} (1 DcGlobal, 2 DC group, 3 AcGlobal, 4 AC group)", i, code, stage);
+            log::debug("decoder: thread {} failed with code {} at stage {} (1 DcGlobal, 2 DC group, 3 AcGlobal, 4 AC group, 5 modular finalise)", i, code, stage);
         }
         const std::string where = i == 0 ? "the global sections" : i <= numDcGroups ? std::format("DC group {}", i - 1)
                                                                                     : std::format("AC group {}", i - 1 - numDcGroups);
@@ -304,7 +368,7 @@ Result<image::Rgb8> Decoder::run(const codestream::Parsed& parsed, bool withLz77
     stats_.dcGlobalBits = header[45];
     stats_.usedAcs = header[47];
 
-    if (!platform::env("SJXL_DEBUG").empty()) {
+    if (!modular && !platform::env("SJXL_DEBUG").empty()) {
         SJXL_ASSIGN(const auto dcHost, dc.readAll<float>(dev));
         SJXL_ASSIGN(const auto dcsHost, dcSmooth.readAll<float>(dev));
         SJXL_ASSIGN(const auto coHost, coeffs.readAll<int32_t>(dev));

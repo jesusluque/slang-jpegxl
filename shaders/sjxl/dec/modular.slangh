@@ -18,6 +18,7 @@ static const uint kChanH = 1;
 static const uint kChanHShift = 2;
 static const uint kChanVShift = 3;
 static const uint kChanData = 4;
+static const uint kChanStride = 5;   // words per row (the width, or the full image's for a group view)
 static const uint kMaxChannels = 24;
 
 static const uint kTreeWords = 8;   // property(int, -1 leaf), splitval, lchild, rchild, predictor, offset, multiplier, leaf id
@@ -35,7 +36,8 @@ static const uint kPredZero = 0, kPredLeft = 1, kPredTop = 2, kPredAverage0 = 3,
 struct Channel {
     uint w, h;
     int hshift, vshift;
-    uint data;   // arena offset
+    uint data;     // arena offset
+    uint stride;   // words per row: w, or the full channel's width for a group view
 };
 
 Channel loadChannel(uint chansOff, uint i) {
@@ -46,6 +48,7 @@ Channel loadChannel(uint chansOff, uint i) {
     c.hshift = int(arena[o + kChanHShift]);
     c.vshift = int(arena[o + kChanVShift]);
     c.data = arena[o + kChanData];
+    c.stride = arena[o + kChanStride];
     return c;
 }
 
@@ -56,6 +59,7 @@ void storeChannel(uint chansOff, uint i, Channel c) {
     arena[o + kChanHShift] = uint(c.hshift);
     arena[o + kChanVShift] = uint(c.vshift);
     arena[o + kChanData] = c.data;
+    arena[o + kChanStride] = c.stride;
 }
 
 /// A channel with zeroed storage.
@@ -65,13 +69,35 @@ Channel newChannel(inout Dec d, uint w, uint h, int hshift, int vshift) {
     c.h = h;
     c.hshift = hshift;
     c.vshift = vshift;
+    c.stride = w;
     c.data = alloc(d, max(w * h, 1u));
     for (uint i = 0; i < w * h; ++i) arena[c.data + i] = 0;
     return c;
 }
 
-int px(Channel c, uint x, uint y) { return int(arena[c.data + y * c.w + x]); }
-void setPx(Channel c, uint x, uint y, int v) { arena[c.data + y * c.w + x] = uint(v); }
+/// A channel over storage that is already zero (a fresh arena).
+Channel newChannelUncleared(inout Dec d, uint w, uint h, int hshift, int vshift) {
+    Channel c;
+    c.w = w;
+    c.h = h;
+    c.hshift = hshift;
+    c.vshift = vshift;
+    c.stride = w;
+    c.data = alloc(d, max(w * h, 1u));
+    return c;
+}
+
+/// The rectangle (x0, y0, w, h) of `full` as a channel of its own: a group's view.
+Channel channelView(Channel full, uint x0, uint y0, uint w, uint h) {
+    Channel v = full;
+    v.w = w;
+    v.h = h;
+    v.data = full.data + y0 * full.stride + x0;
+    return v;
+}
+
+int px(Channel c, uint x, uint y) { return int(arena[c.data + y * c.stride + x]); }
+void setPx(Channel c, uint x, uint y, int v) { arena[c.data + y * c.stride + x] = uint(v); }
 
 // --- weighted predictor header and state -----------------------------------------------
 
@@ -697,6 +723,118 @@ struct GlobalTree {
     Tree tree;
 };
 
+/// The GroupHeader of a modular stream and the transforms it declares.
+struct StreamHeader {
+    uint useGlobalTree;
+    WpHeader wp;
+    uint numTransforms;
+    uint transformsOff;   // kTransformWords each
+    uint nbMeta;          // meta channels (palettes) after MetaApply
+};
+
+static const uint kStreamHeaderWords = 16;
+
+void storeStreamHeader(uint off, StreamHeader h) {
+    arena[off + 0] = h.useGlobalTree;
+    arena[off + 1] = uint(h.wp.p1C); arena[off + 2] = uint(h.wp.p2C);
+    arena[off + 3] = uint(h.wp.p3Ca); arena[off + 4] = uint(h.wp.p3Cb); arena[off + 5] = uint(h.wp.p3Cc);
+    arena[off + 6] = uint(h.wp.p3Cd); arena[off + 7] = uint(h.wp.p3Ce);
+    arena[off + 8] = h.wp.w0; arena[off + 9] = h.wp.w1; arena[off + 10] = h.wp.w2; arena[off + 11] = h.wp.w3;
+    arena[off + 12] = h.numTransforms;
+    arena[off + 13] = h.transformsOff;
+    arena[off + 14] = h.nbMeta;
+}
+
+StreamHeader loadStreamHeader(uint off) {
+    StreamHeader h;
+    h.useGlobalTree = arena[off + 0];
+    h.wp.p1C = int(arena[off + 1]); h.wp.p2C = int(arena[off + 2]);
+    h.wp.p3Ca = int(arena[off + 3]); h.wp.p3Cb = int(arena[off + 4]); h.wp.p3Cc = int(arena[off + 5]);
+    h.wp.p3Cd = int(arena[off + 6]); h.wp.p3Ce = int(arena[off + 7]);
+    h.wp.w0 = arena[off + 8]; h.wp.w1 = arena[off + 9]; h.wp.w2 = arena[off + 10]; h.wp.w3 = arena[off + 11];
+    h.numTransforms = arena[off + 12];
+    h.transformsOff = arena[off + 13];
+    h.nbMeta = arena[off + 14];
+    return h;
+}
+
+/// ModularDecode's first part: GroupHeader (use_global_tree, wp_header, transforms)
+/// and MetaApply of every transform on the channel list at chansOff.
+StreamHeader readStreamHeader(inout Dec d, uint chansOff, inout uint numChannels) {
+    StreamHeader h;
+    h.useGlobalTree = brRead(d.br, 1);
+    h.wp = readWpHeader(d);
+    h.numTransforms = brU32(d.br, distrVal(0), distrVal(1), distrBitsOffset(4, 2), distrBitsOffset(8, 18));
+    h.transformsOff = alloc(d, max(h.numTransforms, 1u) * kTransformWords);
+    h.nbMeta = 0;
+    if (d.error != kErrNone) return h;
+    for (uint i = 0; i < h.numTransforms; ++i) {
+        readTransform(d, h.transformsOff + i * kTransformWords);
+        if (d.error != kErrNone) return h;
+        metaApply(d, h.transformsOff + i * kTransformWords, chansOff, numChannels, h.nbMeta);
+        if (d.error != kErrNone) return h;
+    }
+    return h;
+}
+
+/// Whether channel i stops the stream: a non-meta channel wider or taller than maxChanSize.
+bool stopsStream(Channel c, uint i, uint nbMeta, uint maxChanSize) {
+    return i >= nbMeta && (c.w > maxChanSize || c.h > maxChanSize);
+}
+
+/// ModularDecode's second part: the tree (local, or the frame's global one), the
+/// symbols and every channel up to the first that stops the stream. Returns the
+/// index of that channel (numChannels when every channel was decoded).
+uint decodeStreamChannels(inout Dec d, StreamHeader h, uint chansOff, uint numChannels, uint streamId, GlobalTree global,
+                          uint windowOff, uint maxChanSize) {
+    uint distanceMultiplier = 0;
+    uint numChans = 0;
+    uint end = numChannels;
+    for (uint i = 0; i < numChannels; ++i) {
+        const Channel c = loadChannel(chansOff, i);
+        if (stopsStream(c, i, h.nbMeta, maxChanSize)) { end = i; break; }
+        if (c.w == 0 || c.h == 0) continue;
+        distanceMultiplier = max(distanceMultiplier, c.w);
+        ++numChans;
+    }
+    if (numChans == 0) return end;
+    Tree tree;
+    if (h.useGlobalTree == 0) {
+        tree = decodeTree(d, windowOff);
+        if (d.error != kErrNone) return end;
+        tree.codeSet = decodeHistograms(d, (tree.numNodes + 1) / 2, false, windowOff);
+        if (d.error != kErrNone) return end;
+    } else {
+        if (!global.present) { fail(d, kErrCorrupt); return end; }
+        tree = global.tree;
+    }
+    SymReader r = makeSymReader(d, tree.codeSet, windowOff, distanceMultiplier);
+    if (d.error != kErrNone) return end;
+    for (uint i = 0; i < end; ++i) {
+        ChannelDecodeArgs a;
+        a.chansOff = chansOff;
+        a.numChannels = numChannels;
+        a.chan = i;
+        a.streamId = streamId;
+        decodeChannel(d, r, tree, h.wp, a);
+        if (d.error != kErrNone) return end;
+    }
+    if (!checkFinalState(r)) fail(d, kErrCorrupt);
+    return end;
+}
+
+/// Image::undo_transforms over the channel list.
+void undoTransforms(inout Dec d, StreamHeader h, uint chansOff, inout uint numChannels, uint bitDepth) {
+    uint nbMeta = h.nbMeta;
+    for (uint i = h.numTransforms; i > 0; --i) {
+        const uint off = h.transformsOff + (i - 1) * kTransformWords;
+        const uint id = arena[off + kTrId];
+        if (id == kTrRct) invRct(d, off, chansOff);
+        else if (id == kTrPalette) invPalette(d, off, chansOff, numChannels, nbMeta, h.wp, bitDepth);
+        if (d.error != kErrNone) return;
+    }
+}
+
 /// ModularGenericDecompress with undo_transforms: GroupHeader, transforms,
 /// local or global tree, every channel, inverse transforms. The channel
 /// descriptors at chansOff (numChannels entries, each with storage) are the
@@ -704,55 +842,9 @@ struct GlobalTree {
 void decodeModularStream(inout Dec d, uint chansOff, inout uint numChannels, uint streamId, GlobalTree global,
                          uint windowOff, uint bitDepth) {
     if (numChannels == 0) return;
-    // GroupHeader
-    const uint useGlobalTree = brRead(d.br, 1);
-    const WpHeader wpHeader = readWpHeader(d);
-    const uint numTransforms = brU32(d.br, distrVal(0), distrVal(1), distrBitsOffset(4, 2), distrBitsOffset(8, 18));
-    const uint transformsOff = alloc(d, max(numTransforms, 1u) * kTransformWords);
+    const StreamHeader h = readStreamHeader(d, chansOff, numChannels);
     if (d.error != kErrNone) return;
-    uint nbMeta = 0;
-    for (uint i = 0; i < numTransforms; ++i) {
-        readTransform(d, transformsOff + i * kTransformWords);
-        if (d.error != kErrNone) return;
-        metaApply(d, transformsOff + i * kTransformWords, chansOff, numChannels, nbMeta);
-        if (d.error != kErrNone) return;
-    }
-    uint distanceMultiplier = 0;
-    uint numChans = 0;
-    for (uint i = 0; i < numChannels; ++i) {
-        const Channel c = loadChannel(chansOff, i);
-        if (c.w == 0 || c.h == 0) continue;
-        distanceMultiplier = max(distanceMultiplier, c.w);
-        ++numChans;
-    }
-    if (numChans == 0) return;
-    Tree tree;
-    if (useGlobalTree == 0) {
-        tree = decodeTree(d, windowOff);
-        if (d.error != kErrNone) return;
-        tree.codeSet = decodeHistograms(d, (tree.numNodes + 1) / 2, false, windowOff);
-        if (d.error != kErrNone) return;
-    } else {
-        if (!global.present) { fail(d, kErrCorrupt); return; }
-        tree = global.tree;
-    }
-    SymReader r = makeSymReader(d, tree.codeSet, windowOff, distanceMultiplier);
+    decodeStreamChannels(d, h, chansOff, numChannels, streamId, global, windowOff, 0xFFFFFFFFu);
     if (d.error != kErrNone) return;
-    for (uint i = 0; i < numChannels; ++i) {
-        ChannelDecodeArgs a;
-        a.chansOff = chansOff;
-        a.numChannels = numChannels;
-        a.chan = i;
-        a.streamId = streamId;
-        decodeChannel(d, r, tree, wpHeader, a);
-        if (d.error != kErrNone) return;
-    }
-    if (!checkFinalState(r)) { fail(d, kErrCorrupt); return; }
-    for (uint i = numTransforms; i > 0; --i) {
-        const uint off = transformsOff + (i - 1) * kTransformWords;
-        const uint id = arena[off + kTrId];
-        if (id == kTrRct) invRct(d, off, chansOff);
-        else if (id == kTrPalette) invPalette(d, off, chansOff, numChannels, nbMeta, wpHeader, bitDepth);
-        if (d.error != kErrNone) return;
-    }
+    undoTransforms(d, h, chansOff, numChannels, bitDepth);
 }

@@ -104,3 +104,33 @@ TEST_CASE("the decoder matches djxl on cjxl's output", "[decoder][conformance][c
                      decoder().stats().usedAcs));
     CHECK(metrics->maxAbsDiff <= 1);
 }
+
+TEST_CASE("the decoder reproduces cjxl's lossless output exactly", "[decoder][conformance][cjxl][modular]") {
+    const std::filesystem::path djxl = test::findTool("djxl");
+    const std::filesystem::path cjxl = test::findTool("cjxl");
+    if (djxl.empty() || cjxl.empty()) SKIP("cjxl/djxl are not installed");
+    const std::string name = GENERATE(std::string("sveti_64.png"), std::string("berlin_200.png"), std::string("sveti_crop_257x129.png"),
+                                      std::string("sveti_stefan_320.png"));
+    const int effort = GENERATE(1, 3, 7, 9);
+    CAPTURE(name, effort);
+    const std::filesystem::path jxl = test::scratchDir() / std::format("dec_lossless_{}_e{}.jxl", name, effort);
+    const std::filesystem::path png = test::scratchDir() / std::format("dec_lossless_{}_e{}.djxl.png", name, effort);
+    REQUIRE(test::run(std::format("\"{}\" \"{}\" \"{}\" -d 0 -e {} >/dev/null 2>&1", cjxl.string(), test::testData(name).string(),
+                                  jxl.string(), effort)));
+    REQUIRE(test::run(std::format("\"{}\" \"{}\" \"{}\" >/dev/null 2>&1", djxl.string(), jxl.string(), png.string())));
+    auto bytes = image::readFile(jxl);
+    REQUIRE(bytes);
+    auto reference = image::readRgb8(png);
+    REQUIRE(reference);
+    auto ours = decoder().decode(*bytes);
+    if (!ours && ours.error().code() == ErrorCode::Unsupported) {
+        WARN(std::format("{} e{} lossless: unsupported: {}", name, effort, ours.error().message()));
+        SUCCEED();
+        return;
+    }
+    REQUIRE(ours);
+    auto metrics = test::compare(*reference, *ours);
+    REQUIRE(metrics);
+    WARN(std::format("{} e{} lossless: vs djxl max diff {}", name, effort, metrics->maxAbsDiff));
+    CHECK(metrics->maxAbsDiff == 0);
+}

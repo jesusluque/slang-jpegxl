@@ -43,6 +43,7 @@ struct FrameDim {
     uint32_t xsizePadded = 0, ysizePadded = 0;   ///< blocks * 8
     uint32_t xsizeGroups = 0, ysizeGroups = 0;   ///< AC groups
     uint32_t xsizeDcGroups = 0, ysizeDcGroups = 0;
+    uint32_t groupDim = 256;                     ///< AC group size in pixels: 128 << group_size_shift
     [[nodiscard]] uint32_t numGroups() const { return xsizeGroups * ysizeGroups; }
     [[nodiscard]] uint32_t numDcGroups() const { return xsizeDcGroups * ysizeDcGroups; }
     [[nodiscard]] uint32_t numBlocks() const { return xsizeBlocks * ysizeBlocks; }
@@ -51,6 +52,7 @@ struct FrameDim {
     /// Sections in codestream order: DcGlobal, DcGroups, AcGlobal, AcGroups.
     [[nodiscard]] uint32_t numSections() const { return 2 + numDcGroups() + numGroups(); }
 };
-[[nodiscard]] FrameDim frameDim(uint32_t xsize, uint32_t ysize);
+/// `groupSizeShift` is the frame header field (1 for 256 px groups).
+[[nodiscard]] FrameDim frameDim(uint32_t xsize, uint32_t ysize, uint32_t groupSizeShift = 1);
 
 }   // namespace sjxl::codestream

@@ -54,9 +54,10 @@ per subsystem or milestone, appended to as the work goes. Dates are absolute.
 - **M3 encoder quality**: inverse Gaborish + default LoopFilter, EPF sharpness,
   CfL per tile, adaptive quant field, DCT16/32 strategy search, context
   clustering (≤ 32, fixed-point costs as cujpegxl), ANS for AC.
-- **M4 decoder completeness**: upsampling, patches/splines/noise,
-  progressive, Modular frames (lossless), alpha, >8-bit. (64–256 px
-  transforms: done in M2.)
+- **M4 decoder completeness**: Squeeze (lossy modular, progressive
+  lossless), patches, upsampling, splines/noise, progressive passes,
+  alpha and extra channels, >8-bit output, ICC, animation, JPEG
+  recompression. (64–256 px transforms and lossless Modular frames: done.)
 - **M5 platforms and speed**: Linux CUDA/Vulkan, async readback, batching,
   per-stage timings here.
 
@@ -199,3 +200,48 @@ and running cold; not measured for speed yet (M5).
 Not done: RAW quant tables,
 modular Squeeze, Modular frames, extra channels, ICC, animation, previews,
 progressive passes, TOC permutations, a third level of nested context maps.
+
+## Modular frames (2026-10-29)
+
+Lossless images (`cjxl -d 0`) are a single Modular frame; the same path
+will carry lossy modular (XYB, needs Squeeze) and the reference frames of
+patches. Design (`shaders/sjxl/dec/modframe.slangh`, entries in
+`sections.slang`):
+
+- **Globals thread** (DcGlobal): the DC dequant factors (read for every
+  frame), the frame's global MA tree, then the global modular stream:
+  GroupHeader, transforms with MetaApply, and every channel no larger than
+  the group dimension (`ModularDecode` stops at the first bigger one; meta
+  channels, i.e. palettes, never stop it). The full-image channels live in
+  the globals arena region, sized by the host as (channels + 1) × pixels.
+- **Group threads** decode their rectangle of the remaining channels as
+  *views* into the full-image channels (a `stride` field on `Channel`), which
+  is libjxl's DecodeGroup + CopyImageTo in one step with no per-group
+  storage. Each group reads its own GroupHeader; a group-local transform is
+  reported Unsupported (libjxl's encoder never writes one). DC groups take
+  the channels with shift ≥ 3, AC groups those with shift 0–2 (single pass).
+  Properties use the group-local channel index and coordinates, as in
+  libjxl, so a group's prediction never sees its neighbours.
+- **Finalise** (one thread, after all groups): inverse RCT and palette over
+  the full image, allocating in the AC groups' region (palettes expand into
+  full channels). `modular_out.slang` then writes the three float planes:
+  samples × 1/(2^bits − 1) for RGB and grey (grey replicated), or Y, X, B ×
+  the DC dequant factors with B relative to Y for XYB frames. The output
+  stage has a mode that stores those planes as they are (no XYB transform),
+  since non-XYB samples are already in the output encoding.
+- Group size: `group_size_shift` is honoured everywhere now (`frameDim`
+  takes it; the section kernels get `groupDim`), including the VarDCT
+  AcMetadata boundary check that assumed 256 px groups.
+
+Measured: `cjxl -d 0` at efforts 1, 3, 7 and 9 on the four test images,
+a grey PGM, a six-colour palette image and a 768 px gradient with `-g 0`,
+`-g 2` and `-g 3` (128, 512 and 1024 px groups) all decode bit-exact
+against djxl (`sjxl_decoder_tests "the decoder reproduces cjxl's lossless
+output exactly"`). Lossy modular (`cjxl -m 1 -d 1`) uses Squeeze and is
+reported Unsupported.
+
+Not done: Squeeze, YCbCr modular frames, extra channels, floating point and
+>8-bit output (16-bit samples decode but the output is 8-bit), group-local
+transforms, patches (the reference-frame plumbing: parsing a second frame
+and keeping the first), the per-pixel finalise (RCT/palette run in one
+thread; fine at these sizes, a kernel later).
