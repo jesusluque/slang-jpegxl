@@ -230,23 +230,18 @@ float weightAt(uint kind, uint c, uint x, uint y, Enc e) {
         if (y == 1 && x == 0) w /= e.dct4x8mul;
         return w;
     }
-    case 5: {   // AFV
+    case 5: {   // AFV (quant_weights.cc ComputeQuantTable kQuantModeAFV)
         if (x == 0 && y == 0) return 1.0f;
-        if ((y & 1) == 1) {
-            // odd rows: 4x8 weights
-            return dctWeight(e.bands, e.numBands, 4, 8, x, y / 2);
-        }
-        if ((x & 1) == 1) {
-            // even rows, odd columns: 4x4 weights
-            return dctWeight(e.bandsAfv, e.numBandsAfv, 4, 4, x / 2, y / 2);
-        }
-        // even/even: the AFV positions
+        // (0, 1) and (1, 0): the DC positions of the 4x8 and 4x4 halves.
+        if (x == 0 && y == 1) return e.afvw[0];
+        if (x == 1 && y == 0) return e.afvw[1];
+        if ((y & 1) == 1) return dctWeight(e.bands, e.numBands, 4, 8, x, y / 2);               // odd rows: 4x8 weights
+        if ((x & 1) == 1) return dctWeight(e.bandsAfv, e.numBandsAfv, 4, 4, x / 2, y / 2);     // even rows, odd columns: 4x4 weights
+        // even/even: the AFV positions; the three around the corner have their own weights
         const uint ax = x / 2, ay = y / 2;
-        if (ax == 0 && ay == 1) return e.afvw[0];
-        if (ax == 1 && ay == 0) return e.afvw[1];
-        if (ax == 0 && ay == 2) return e.afvw[2];
-        if (ax == 2 && ay == 0) return e.afvw[3];
-        if (ax == 2 && ay == 2) return e.afvw[4];
+        if (ax == 0 && ay == 1) return e.afvw[2];
+        if (ax == 1 && ay == 0) return e.afvw[3];
+        if (ax == 1 && ay == 1) return e.afvw[4];
         const float kFreqs[16] = {0.0f, 0.0f, 0.8517778890324296f, 5.37778436506804f, 0.0f, 0.0f, 4.734747904497923f, 5.449245381693219f,
                                   1.6598270267479331f, 4.0f, 7.275749096817861f, 10.423227632456525f, 2.662932286148962f, 7.630657783650829f,
                                   8.962388608184032f, 12.97166202570235f};

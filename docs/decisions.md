@@ -158,18 +158,35 @@ Facts that cost time, kept here so they are not re-learned:
 - **The output transfer function is the declared colour encoding's**: a PNG
   with gAMA 1/2.2 makes cjxl declare gamma 0.4545, and djxl applies it. The
   synthetic PPM tests (no gamma) hid this; the photos showed a uniform ±2.
-- `cjxl` at effort 1–5 on these photos used only DCT8 with a uniform quant
+- **The LLF resample scales are the decoder's set.** `dct_scales.h` has two
+  families: `DCTResampleScales<8N, N>` (values below 1, the encoder's
+  DCFromLowestFrequencies) and `<N, 8N>` (above 1: 1.1089 for 2→16; 1.0258,
+  1.1089, 1.2706 for 4→32), and `LowestFrequenciesFromDC` uses the second.
+  Using the first gave a smooth low-frequency error (up to 26/255) in every
+  block covering more than one 8×8 in both directions, invisible in flat
+  regions and in 8×16 blocks.
+- **The AFV quant table** (`ComputeQuantTable kQuantModeAFV`) puts
+  `afv_weights[0..1]` at raw positions (0,1) and (1,0) — the DC slots of the
+  4×8 and 4×4 halves — and `afv_weights[2..4]` at the AFV positions (0,2),
+  (2,0), (2,2); the other even/even positions interpolate over `kFreqs`.
+  A wrong reading of that mapping left the AFV blocks ±11.
+- `cjxl` at effort 1–3 on these photos used only DCT8 with a uniform quant
   field and zero chroma-from-luma, but custom coefficient orders (bit 0 of
-  used_orders) and LZ77 in the AcGlobal context map.
+  used_orders) and LZ77 in the AcGlobal context map. Effort 5 adds 16×16 to
+  32×32 (and 64×64 on the 320 px image), effort 7 adds DCT2X2/4X4/4X8, AFV
+  and identity, with chroma-from-luma and a varying quant field.
 
 Measured (ours vs djxl 0.12, `sjxl compare`): our own encoder's streams and
-cjxl's at effort 1–5 (d 1 and 3) decode within 1 LSB (≈54 dB) on the test
-set, including EPF iterations 0–3 and Gaborish. Debug build, 320×180:
+cjxl's at effort 1, 3, 5 and 7 (d 1 and 3) decode within 1 LSB (≈54 dB) on
+the test set wherever the stream stays inside the supported feature set,
+including EPF iterations 0–3, Gaborish, every 8–32 px transform, AFV and
+chroma-from-luma. `cjxl --epf=0 --gaborish=0` streams isolate the transform
+path from the filters when a block type misbehaves; `SJXL_DEBUG_ACS=1`
+prints the strategy map and `SJXL_DEBUG_TABLES=<file>` dumps the dequant
+tables (checked against cujpegxl's extracted DCT8/16/32: ≤ 2e-6 relative). Debug build, 320×180:
 ≈300 ms a decode, dominated by the single-thread section kernels compiling
 and running cold; not measured for speed yet (M5).
 
 Not done: transforms of 64–256 px (`flags` reports them), RAW quant tables,
 modular Squeeze, Modular frames, extra channels, ICC, animation, previews,
 progressive passes, TOC permutations, a third level of nested context maps.
-Effort 7 streams still differ (max 12–73): to be investigated (AFV / DCT4x4
-paths or EPF sharpness with custom quant field).

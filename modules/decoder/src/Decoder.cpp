@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstring>
 #include <format>
+#include <fstream>
 
 #include "sjxl/core/Log.h"
 #include "sjxl/core/Platform.h"
@@ -285,7 +286,7 @@ Result<image::Rgb8> Decoder::run(const codestream::Parsed& parsed, bool withLz77
         if (code == kErrLz77Window) {
             log::debug("decoder: thread {} needs an LZ77 window (stage {})", i, stage);
         } else {
-            log::info("decoder: thread {} failed with code {} at stage {} (1 DcGlobal, 2 DC group, 3 AcGlobal, 4 AC group)", i, code, stage);
+            log::debug("decoder: thread {} failed with code {} at stage {} (1 DcGlobal, 2 DC group, 3 AcGlobal, 4 AC group)", i, code, stage);
         }
         const std::string where = i == 0 ? "the global sections" : i <= numDcGroups ? std::format("DC group {}", i - 1)
                                                                                     : std::format("AC group {}", i - 1 - numDcGroups);
@@ -346,6 +347,17 @@ Result<image::Rgb8> Decoder::run(const codestream::Parsed& parsed, bool withLz77
                   frame.header.bQmScale, std::pow(1.25f, 2 - static_cast<int>(frame.header.xQmScale)),
                   std::pow(1.25f, 2 - static_cast<int>(frame.header.bQmScale)), fbHost[0], fbHost[1], fbHost[2], fbHost[3], acsHost[0],
                   acsHost[1], acsHost[2], acsHost[3]);
+        if (!platform::env("SJXL_DEBUG_ACS").empty()) {
+            // strategy map: one char per 8x8 block (hex strategy, '.' for a non-first block of a varblock)
+            for (uint32_t by = 0; by < dim.ysizeBlocks; ++by) {
+                std::string row;
+                for (uint32_t bx = 0; bx < dim.xsizeBlocks; ++bx) {
+                    const uint32_t a = acsHost[by * dim.xsizeBlocks + bx];
+                    row += (a & 1) ? std::format("{:x} ", a >> 1) : ". ";
+                }
+                log::info("dec debug: acs row {:3} {}", by, row);
+            }
+        }
         for (uint32_t ch = 0; ch < 3; ++ch) {
             std::string dq;
             for (int k = 0; k < 16; ++k) dq += std::format("{:.5f} ", dqHost[(ch * nblocks + dbgBlock) * 64 + k]);
@@ -356,6 +368,11 @@ Result<image::Rgb8> Decoder::run(const codestream::Parsed& parsed, bool withLz77
         }
         log::info("dec debug: xyb(0,0) = {} {} {}", xybHost[0], xybHost[planePixels], xybHost[2 * planePixels]);
         SJXL_ASSIGN(const auto tabHost, dequant.readAll<float>(dev));
+        if (const auto dumpPath = platform::env("SJXL_DEBUG_TABLES"); !dumpPath.empty()) {
+            std::ofstream out(dumpPath, std::ios::binary);
+            out.write(reinterpret_cast<const char*>(tabHost.data()), static_cast<std::streamsize>(tabHost.size() * sizeof(float)));
+            log::info("dec debug: dequant tables written to {}", dumpPath);
+        }
         log::info("dec debug: dequant DCT8 X[0,1,8,9,63] = {} {} {} {} {}; Y[0,1,8] = {} {} {}; B[0,1,8,63] = {} {} {} {}", tabHost[0], tabHost[1], tabHost[8], tabHost[9], tabHost[63],
                   tabHost[64], tabHost[65], tabHost[72], tabHost[128], tabHost[129], tabHost[136], tabHost[191]);
         log::info("dec debug: dequant DCT16 X[0,1] = {} {}; AFV X[0..4] = {} {} {} {}", tabHost[768], tabHost[769], tabHost[7488], tabHost[7489], tabHost[7490], tabHost[7491]);

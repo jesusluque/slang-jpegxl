@@ -121,8 +121,10 @@ uint memIndex(uint v, uint u, uint ny, uint nx) {
     return ny < nx ? v * nx + u : u * ny + v;
 }
 
-static const float kResample2[2] = {1.0f, 0.901764195028874394f};
-static const float kResample4[4] = {1.0f, 0.974886821136879522f, 0.901764195028874394f, 0.787054918159101335f};
+// DCTResampleScales<cy, 8 cy> (the decoder's set, values above 1); the encoder's
+// DCFromLowestFrequencies uses the inverse set <8 cy, cy>.
+static const float kResample2[2] = {1.0f, 1.108937353592731823f};
+static const float kResample4[4] = {1.0f, 1.025760096781116015f, 1.108937353592731823f, 1.270559368765487251f};
 float resampleScale(uint n, uint k) {
     if (n == 2) return kResample2[k];
     if (n == 4) return kResample4[k];

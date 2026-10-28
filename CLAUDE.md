@@ -22,6 +22,8 @@ build/macos-arm64-debug/bin/sjxl decode in.jxl out.png                  # VarDCT
 build/macos-arm64-debug/bin/sjxl compare a.png b.png                    # PSNR + largest diff, on the GPU
 build/macos-arm64-debug/bin/sjxl pixel a.png x y ; sjxl convert in.png out.png   # one pixel; re-save as RGB8
 SJXL_DEBUG=1 SJXL_DEBUG_BLOCK=57 build/macos-arm64-debug/bin/sjxl decode ...    # dumps one block's coefficients, DC, orders
+SJXL_DEBUG=1 SJXL_DEBUG_ACS=1 SJXL_DEBUG_TABLES=/tmp/t.bin ... decode ...      # strategy map per block; dequant tables to a file
+cjxl in.png x.jxl -e 7 -d 1 --epf=0 --gaborish=0   # isolates the transform path from the filters
 ~/tools/slang/bin/slangc shaders/sjxl/<dir>/<file>.slang -I shaders -target metal -entry <entry> -stage compute -o /dev/null
 cjxl in.png ref.jxl -d 1 -e 5 ; djxl out.jxl check.png      # Homebrew oracle (/opt/homebrew/bin)
 ```
