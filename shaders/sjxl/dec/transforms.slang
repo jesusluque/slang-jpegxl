@@ -1,9 +1,13 @@
 // Copyright (c) 2026 jesus luque.
 //
 // From quantised coefficients to XYB pixels: dequantisation with the quant
-// bias and chroma-from-luma (one thread per coefficient), then the lowest
-// frequencies from the DC image and the inverse transform of each varblock
-// (one thread per varblock and channel). libjxl dec_group.cc DequantBlock,
+// bias and chroma-from-luma (one thread per coefficient), the lowest
+// frequencies from the DC image (one thread per covered block), then the
+// inverse DCT of every varblock as two separable passes with one thread per
+// pixel (rows into `tmp`, then columns into `xyb`), so a 256x256 transform
+// costs a thread 512 multiply-adds and no large private array. The 8x8
+// special transforms (IDENTITY, DCT2X2, DCT4X4, DCT4X8, DCT8X4, AFV) run
+// one thread per varblock. libjxl dec_group.cc DequantBlock,
 // dec_transforms-inl.h TransformToPixels / LowestFrequenciesFromDC.
 //
 // Coefficient slots are those of acgroup.slangh: coefficient k of a varblock
@@ -20,8 +24,8 @@ StructuredBuffer<uint>     firstBlock;
 StructuredBuffer<int>      ytox;
 StructuredBuffer<int>      ytob;
 StructuredBuffer<float>    dcSmooth;   // 3 planes of nblocks
+RWStructuredBuffer<float>  tmp;        // 3 planes of paddedWidth * paddedHeight: rows transformed
 RWStructuredBuffer<float>  xyb;        // 3 planes of paddedWidth * paddedHeight
-RWStructuredBuffer<uint>   flags;      // [0] |= 1 when a strategy beyond 32 px was met
 
 struct TransformParams {
     uint  blocksX;
@@ -45,6 +49,10 @@ static const uint kCoveredX[27] = {1, 1, 1, 1, 2, 4, 1, 2, 1, 4, 2, 4, 1, 1, 1, 
 static const uint kCoveredY[27] = {1, 1, 1, 1, 2, 4, 2, 1, 4, 1, 4, 2, 1, 1, 1, 1, 1, 1, 8, 8, 4, 16, 16, 8, 32, 32, 16};
 static const uint kTableBase[18] = {0, 192, 384, 576, 768, 1536, 4608, 4992, 5760, 7296, 7488, 7680, 19968, 26112, 75264, 99840, 296448, 394752};
 static const float kSqrt2 = 1.41421356237309504880f;
+static const float kPi = 3.14159265358979323846f;
+
+/// DCT, and the DCT16X16 .. DCT256X256 family: a plain separable transform.
+bool isDctFamily(uint strategy) { return strategy == 0 || (strategy >= 4 && strategy <= 11) || strategy >= 18; }
 
 float adjustQuantBias(uint c, int q) {
     if (q == 0) return 0.0f;
@@ -100,18 +108,23 @@ void dequantCoeffs(uint3 tid: SV_DispatchThreadID) {
     dequantF[s] = v;
 }
 
-// --- inverse transforms --------------------------------------------------------------
+// --- bases and layouts ------------------------------------------------------------------
 
-/// 1D inverse of libjxl's scaled DCT: x[t] = sum_k c(k) X[k] cos(pi (t + 1/2) k / N), c(0) = 1, else sqrt 2.
+/// cos(pi (t + 1/2) k / n) with the angle reduced in integers first, so a
+/// 256-point basis keeps full float precision.
+float cosBasis(uint k, uint t, uint n) {
+    const uint m = ((2 * t + 1) * k) % (4 * n);
+    return cos(kPi * float(m) / float(2 * n));
+}
+
+/// 1D inverse of libjxl's scaled DCT: x[t] = sum_k c(k) X[k] cos(pi (t + 1/2) k / n), c(0) = 1, else sqrt 2.
 float idctBasis(uint k, uint t, uint n) {
-    const float c = k == 0 ? 1.0f : kSqrt2;
-    return c * cos(3.14159265358979323846f * (float(t) + 0.5f) * float(k) / float(n));
+    return (k == 0 ? 1.0f : kSqrt2) * cosBasis(k, t, n);
 }
 
 /// libjxl's forward scaled DCT basis: g(0) = 1/N, g(k) = sqrt(2)/N.
 float fdctBasis(uint k, uint t, uint n) {
-    const float g = (k == 0 ? 1.0f : kSqrt2) / float(n);
-    return g * cos(3.14159265358979323846f * (float(t) + 0.5f) * float(k) / float(n));
+    return ((k == 0 ? 1.0f : kSqrt2) / float(n)) * cosBasis(k, t, n);
 }
 
 /// Coefficient memory of an ny x nx (pixel) transform (dct-inl.h ComputeScaledDCT): a
@@ -121,43 +134,119 @@ uint memIndex(uint v, uint u, uint ny, uint nx) {
     return ny < nx ? v * nx + u : u * ny + v;
 }
 
-// DCTResampleScales<cy, 8 cy> (the decoder's set, values above 1); the encoder's
-// DCFromLowestFrequencies uses the inverse set <8 cy, cy>.
-static const float kResample2[2] = {1.0f, 1.108937353592731823f};
-static const float kResample4[4] = {1.0f, 1.025760096781116015f, 1.108937353592731823f, 1.270559368765487251f};
-float resampleScale(uint n, uint k) {
-    if (n == 2) return kResample2[k];
-    if (n == 4) return kResample4[k];
-    return 1.0f;
-}
+/// DCTResampleScales<n, 8 n>, the decoder's set (LowestFrequenciesFromDC): every set is
+/// a subsampling of the <32, 256> one. The encoder's DCFromLowestFrequencies uses the
+/// inverse set <8 n, n>.
+static const float kResample32[32] = {
+    1.0f,               1.0003954307206069f, 1.0015830492062623f, 1.0035668445360069f, 1.0063534990068217f, 1.009952439375063f,
+    1.0143759095928793f, 1.0196390660647288f, 1.0257600967811158f, 1.0327603660498115f, 1.0406645869480142f, 1.049501024072585f,
+    1.0593017296817173f, 1.0701028169146336f, 1.0819447744633812f, 1.0948728278734026f, 1.1089373535927318f, 1.124194353004584f,
+    1.1407059950032632f, 1.158541237256391f,  1.1777765381970435f, 1.1984966740820495f, 1.2207956782315876f, 1.244777922949508f,
+    1.2705593687654873f, 1.2982690107339132f, 1.3280505578213306f, 1.3600643892400104f, 1.3944898413647777f, 1.4315278911623237f,
+    1.4714043176061107f, 1.5143734423314616f};
+float resampleScale(uint n, uint k) { return kResample32[k * (32 / n)]; }
 
-/// Generic separable IDCT of `coef` (memory layout above) into pixels at
-/// (px, py) of channel c.
-void idctToPixels(float coef[1024], uint ny, uint nx, uint c, uint px, uint py) {
-    float tmp[1024];
-    for (uint v = 0; v < ny; ++v) {
-        for (uint tx = 0; tx < nx; ++tx) {
-            float sum = 0.0f;
-            for (uint u = 0; u < nx; ++u) sum += coef[memIndex(v, u, ny, nx)] * idctBasis(u, tx, nx);
-            tmp[v * nx + tx] = sum;
+uint planeIndex(uint c, uint x, uint y) { return c * params.paddedWidth * params.paddedHeight + y * params.paddedWidth + x; }
+
+// --- lowest frequencies from the DC image -------------------------------------------------
+
+/// LowestFrequenciesFromDC: covered block q of a DCT-family varblock owns coefficient
+/// (v, u) = (q / cx, q % cx): the scaled DCT of the cy x cx DC patch times the resample
+/// scales, written over the (zero) slot the AC decode never touches.
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void llfFromDc(uint3 tid: SV_DispatchThreadID) {
+    const uint nb = nblocks();
+    if (tid.x >= 3 * nb) return;
+    const uint c = tid.x / nb;
+    const uint block = tid.x - c * nb;
+    const uint first = firstBlock[block];
+    const uint strategy = acs[first] >> 1;
+    if (strategy >= 27 || !isDctFamily(strategy)) return;
+    const uint cx = kCoveredX[strategy];
+    const uint cy = kCoveredY[strategy];
+    const uint fbx = first % params.blocksX;
+    const uint fby = first / params.blocksX;
+    const uint q = (block / params.blocksX - fby) * cx + (block % params.blocksX - fbx);
+    const uint v = q / cx;
+    const uint u = q % cx;
+    float sum = 0.0f;
+    for (uint y = 0; y < cy; ++y) {
+        const float gy = fdctBasis(v, y, cy);
+        for (uint x = 0; x < cx; ++x) {
+            sum += dcSmooth[c * nb + (fby + y) * params.blocksX + fbx + x] * gy * fdctBasis(u, x, cx);
         }
     }
+    dequantF[slotOf(c, first, cx, memIndex(v, u, cy * 8, cx * 8))] = sum * resampleScale(cy, v) * resampleScale(cx, u);
+}
+
+// --- separable inverse DCT, one thread per pixel ------------------------------------------
+
+struct PixelBlock {
+    uint first;      // first block of the varblock
+    uint strategy;
+    uint cx, cy;     // covered blocks
+    uint fpx, fpy;   // pixel origin of the varblock
+};
+
+bool locate(uint px, uint py, out PixelBlock pb) {
+    const uint block = (py / 8) * params.blocksX + px / 8;
+    pb.first = firstBlock[block];
+    const uint entry = acs[pb.first];
+    pb.strategy = entry >> 1;
+    pb.cx = 1; pb.cy = 1; pb.fpx = 0; pb.fpy = 0;
+    if (entry == 0xFFu || pb.strategy >= 27) return false;
+    pb.cx = kCoveredX[pb.strategy];
+    pb.cy = kCoveredY[pb.strategy];
+    pb.fpx = (pb.first % params.blocksX) * 8;
+    pb.fpy = (pb.first / params.blocksX) * 8;
+    return isDctFamily(pb.strategy);
+}
+
+/// Rows: tmp[v][tx] = sum_u coef(v, u) basis(u, tx).
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void idctRows(uint3 tid: SV_DispatchThreadID) {
     const uint plane = params.paddedWidth * params.paddedHeight;
-    for (uint ty = 0; ty < ny; ++ty) {
-        for (uint tx = 0; tx < nx; ++tx) {
-            float sum = 0.0f;
-            for (uint v = 0; v < ny; ++v) sum += tmp[v * nx + tx] * idctBasis(v, ty, ny);
-            xyb[c * plane + (py + ty) * params.paddedWidth + px + tx] = sum;
-        }
+    if (tid.x >= 3 * plane) return;
+    const uint c = tid.x / plane;
+    const uint p = tid.x - c * plane;
+    const uint px = p % params.paddedWidth;
+    const uint py = p / params.paddedWidth;
+    PixelBlock pb;
+    if (!locate(px, py, pb)) return;
+    const uint nx = pb.cx * 8, ny = pb.cy * 8;
+    const uint v = py - pb.fpy;
+    const uint tx = px - pb.fpx;
+    float sum = 0.0f;
+    for (uint u = 0; u < nx; ++u) {
+        sum += dequantF[slotOf(c, pb.first, pb.cx, memIndex(v, u, ny, nx))] * idctBasis(u, tx, nx);
     }
+    tmp[tid.x] = sum;
 }
 
-/// A small transform held in `coef` (same conventions), written to pixels.
-void idctSmall(float small[32], uint ny, uint nx, uint c, uint px, uint py) {
-    float coef[1024];
-    for (uint i = 0; i < ny * nx; ++i) coef[i] = small[i];
-    idctToPixels(coef, ny, nx, c, px, py);
+/// Columns: xyb[ty][tx] = sum_v tmp[v][tx] basis(v, ty).
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void idctCols(uint3 tid: SV_DispatchThreadID) {
+    const uint plane = params.paddedWidth * params.paddedHeight;
+    if (tid.x >= 3 * plane) return;
+    const uint c = tid.x / plane;
+    const uint p = tid.x - c * plane;
+    const uint px = p % params.paddedWidth;
+    const uint py = p / params.paddedWidth;
+    PixelBlock pb;
+    if (!locate(px, py, pb)) return;
+    const uint ny = pb.cy * 8;
+    const uint ty = py - pb.fpy;
+    float sum = 0.0f;
+    for (uint v = 0; v < ny; ++v) {
+        sum += tmp[planeIndex(c, px, pb.fpy + v)] * idctBasis(v, ty, ny);
+    }
+    xyb[tid.x] = sum;
 }
+
+// --- the 8x8 special transforms, one thread per varblock ----------------------------------
 
 static const float kAfvBasis[16][16] = {
     {0.25f, 0.25f, 0.25f, 0.25f, 0.25f, 0.25f, 0.25f, 0.25f, 0.25f, 0.25f, 0.25f, 0.25f, 0.25f, 0.25f, 0.25f, 0.25f},
@@ -177,11 +266,28 @@ static const float kAfvBasis[16][16] = {
     {0.0f, 0.0f, -0.17437602599651067f, 0.0702790691196284f, 0.0f, -0.2921026642334881f, 0.3623817333531167f, 0.0f, -0.1743760259965108f, 0.36238173335311646f, 0.29210266423348785f, -0.4326608024727445f, 0.07027906911962818f, 0.0f, -0.4326608024727457f, 0.34875205199302267f},
     {0.0f, 0.0f, 0.11354987314994337f, -0.07417504595810355f, 0.0f, 0.19402893032594343f, -0.435190496523228f, 0.21918684838857466f, 0.11354987314994257f, -0.4351904965232251f, 0.5550443808910661f, -0.25468277124066463f, -0.07417504595810233f, 0.2191868483885728f, -0.25468277124066413f, 0.1135498731499429f}};
 
-void putPixel(uint c, uint x, uint y, float v) {
-    xyb[c * params.paddedWidth * params.paddedHeight + y * params.paddedWidth + x] = v;
+void putPixel(uint c, uint x, uint y, float v) { xyb[planeIndex(c, x, y)] = v; }
+
+/// A small ny x nx (<= 32 coefficients, memory layout above) IDCT written to pixels.
+void idctSmall(float small[32], uint ny, uint nx, uint c, uint px, uint py) {
+    float rows[32];
+    for (uint v = 0; v < ny; ++v) {
+        for (uint tx = 0; tx < nx; ++tx) {
+            float sum = 0.0f;
+            for (uint u = 0; u < nx; ++u) sum += small[memIndex(v, u, ny, nx)] * idctBasis(u, tx, nx);
+            rows[v * nx + tx] = sum;
+        }
+    }
+    for (uint ty = 0; ty < ny; ++ty) {
+        for (uint tx = 0; tx < nx; ++tx) {
+            float sum = 0.0f;
+            for (uint v = 0; v < ny; ++v) sum += rows[v * nx + tx] * idctBasis(v, ty, ny);
+            putPixel(c, px + tx, py + ty, sum);
+        }
+    }
 }
 
-void transformSpecial(uint strategy, float coef[1024], uint c, uint px, uint py) {
+void transformSpecial(uint strategy, float coef[64], uint c, uint px, uint py) {
     float small[32];
     if (strategy == 1) {   // IDENTITY
         const float b00 = coef[0], b01 = coef[1], b10 = coef[8], b11 = coef[9];
@@ -211,19 +317,19 @@ void transformSpecial(uint strategy, float coef[1024], uint c, uint px, uint py)
         float blk[64];
         for (uint i = 0; i < 64; ++i) blk[i] = coef[i];
         for (uint s = 2; s <= 8; s *= 2) {
-            float tmp[64];
+            float t2[64];
             const uint n2 = s / 2;
             for (uint y = 0; y < n2; ++y) {
                 for (uint x = 0; x < n2; ++x) {
                     const float c00 = blk[y * 8 + x], c01 = blk[y * 8 + n2 + x];
                     const float c10 = blk[(y + n2) * 8 + x], c11 = blk[(y + n2) * 8 + n2 + x];
-                    tmp[y * 2 * 8 + x * 2] = c00 + c01 + c10 + c11;
-                    tmp[y * 2 * 8 + x * 2 + 1] = c00 + c01 - c10 - c11;
-                    tmp[(y * 2 + 1) * 8 + x * 2] = c00 - c01 + c10 - c11;
-                    tmp[(y * 2 + 1) * 8 + x * 2 + 1] = c00 - c01 - c10 + c11;
+                    t2[y * 2 * 8 + x * 2] = c00 + c01 + c10 + c11;
+                    t2[y * 2 * 8 + x * 2 + 1] = c00 + c01 - c10 - c11;
+                    t2[(y * 2 + 1) * 8 + x * 2] = c00 - c01 + c10 - c11;
+                    t2[(y * 2 + 1) * 8 + x * 2 + 1] = c00 - c01 - c10 + c11;
                 }
             }
-            for (uint y = 0; y < s; ++y) for (uint x = 0; x < s; ++x) blk[y * 8 + x] = tmp[y * 8 + x];
+            for (uint y = 0; y < s; ++y) for (uint x = 0; x < s; ++x) blk[y * 8 + x] = t2[y * 8 + x];
         }
         for (uint y = 0; y < 8; ++y) for (uint x = 0; x < 8; ++x) putPixel(c, px + x, py + y, blk[y * 8 + x]);
         return;
@@ -323,9 +429,10 @@ void transformSpecial(uint strategy, float coef[1024], uint c, uint px, uint py)
     }
 }
 
+/// One thread per (channel, block): the 8x8 special transforms, with the DC in slot 0.
 [shader("compute")]
 [numthreads(64, 1, 1)]
-void inverseTransform(uint3 tid: SV_DispatchThreadID) {
+void inverseTransformSpecial(uint3 tid: SV_DispatchThreadID) {
     const uint nb = nblocks();
     if (tid.x >= 3 * nb) return;
     const uint c = tid.x / nb;
@@ -333,36 +440,9 @@ void inverseTransform(uint3 tid: SV_DispatchThreadID) {
     const uint entry = acs[block];
     if ((entry & 1) == 0 || entry == 0xFFu) return;
     const uint strategy = entry >> 1;
-    if (strategy >= 18) {
-        uint before;
-        InterlockedOr(flags[0], 1u, before);
-        return;
-    }
-    const uint cx = kCoveredX[strategy];
-    const uint cy = kCoveredY[strategy];
-    const uint size = 64 * cx * cy;
-    const uint bx = block % params.blocksX;
-    const uint by = block / params.blocksX;
-    float coef[1024];
-    for (uint k = 0; k < size; ++k) coef[k] = dequantF[slotOf(c, block, cx, k)];
-    // LowestFrequenciesFromDC: the cy x cx DC patch, scaled DCT, resample scales.
-    const uint ny = cy * 8, nx = cx * 8;
-    for (uint v = 0; v < cy; ++v) {
-        for (uint u = 0; u < cx; ++u) {
-            float sum = 0.0f;
-            for (uint y = 0; y < cy; ++y) {
-                for (uint x = 0; x < cx; ++x) {
-                    const float dcv = dcSmooth[c * nb + (by + y) * params.blocksX + bx + x];
-                    sum += dcv * fdctBasis(v, y, cy) * fdctBasis(u, x, cx);
-                }
-            }
-            coef[memIndex(v, u, ny, nx)] = sum * resampleScale(cy, v) * resampleScale(cx, u);
-        }
-    }
-    const uint px = bx * 8, py = by * 8;
-    if (strategy == 0 || (strategy >= 4 && strategy <= 11)) {
-        idctToPixels(coef, ny, nx, c, px, py);
-    } else {
-        transformSpecial(strategy, coef, c, px, py);
-    }
+    if (strategy >= 27 || isDctFamily(strategy)) return;
+    float coef[64];
+    for (uint k = 0; k < 64; ++k) coef[k] = dequantF[(c * nb + block) * 64 + k];
+    coef[0] = dcSmooth[c * nb + block];
+    transformSpecial(strategy, coef, c, (block % params.blocksX) * 8, (block / params.blocksX) * 8);
 }

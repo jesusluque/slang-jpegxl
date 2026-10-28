@@ -52,7 +52,10 @@ Result<std::unique_ptr<Decoder>> Decoder::create(std::shared_ptr<gpu::ShaderLibr
     SJXL_ASSIGN(dec->smoothDc_, gpu::ComputeKernel::create(lib, "sjxl/dec/dc_finalize", "smoothDc"));
     SJXL_ASSIGN(dec->computeSigma_, gpu::ComputeKernel::create(lib, "sjxl/dec/dc_finalize", "computeSigma"));
     SJXL_ASSIGN(dec->dequantCoeffs_, gpu::ComputeKernel::create(lib, "sjxl/dec/transforms", "dequantCoeffs"));
-    SJXL_ASSIGN(dec->inverseTransform_, gpu::ComputeKernel::create(lib, "sjxl/dec/transforms", "inverseTransform"));
+    SJXL_ASSIGN(dec->llfFromDc_, gpu::ComputeKernel::create(lib, "sjxl/dec/transforms", "llfFromDc"));
+    SJXL_ASSIGN(dec->idctRows_, gpu::ComputeKernel::create(lib, "sjxl/dec/transforms", "idctRows"));
+    SJXL_ASSIGN(dec->idctCols_, gpu::ComputeKernel::create(lib, "sjxl/dec/transforms", "idctCols"));
+    SJXL_ASSIGN(dec->transformSpecial_, gpu::ComputeKernel::create(lib, "sjxl/dec/transforms", "inverseTransformSpecial"));
     SJXL_ASSIGN(dec->gaborish_, gpu::ComputeKernel::create(lib, "sjxl/dec/filters", "gaborish"));
     SJXL_ASSIGN(dec->epf_, gpu::ComputeKernel::create(lib, "sjxl/dec/filters", "epf"));
     SJXL_ASSIGN(dec->output_, gpu::ComputeKernel::create(lib, "sjxl/dec/output", "xybToSrgb8"));
@@ -118,7 +121,6 @@ Result<image::Rgb8> Decoder::run(const codestream::Parsed& parsed, bool withLz77
     const uint64_t planePixels = uint64_t{dim.xsizePadded} * dim.ysizePadded;
     SJXL_ASSIGN(auto xybA, gpu::Buffer::ofType<float>(dev, 3 * planePixels, "dec.xybA"));
     SJXL_ASSIGN(auto xybB, gpu::Buffer::ofType<float>(dev, 3 * planePixels, "dec.xybB"));
-    SJXL_ASSIGN(auto flags, gpu::Buffer::ofType<uint32_t>(dev, 1, "dec.flags"));
     const uint32_t outBytes = m.xsize * m.ysize * 3;
     SJXL_ASSIGN(auto rgb8, gpu::Buffer::ofType<uint32_t>(dev, (outBytes + 3) / 4, "dec.rgb8"));
 
@@ -187,8 +189,8 @@ Result<image::Rgb8> Decoder::run(const codestream::Parsed& parsed, bool withLz77
         c["ytox"].setBinding(ytox.rhi());
         c["ytob"].setBinding(ytob.rhi());
         c["dcSmooth"].setBinding(dcSmooth.rhi());
+        c["tmp"].setBinding(xybB.rhi());
         c["xyb"].setBinding(xybA.rhi());
-        c["flags"].setBinding(flags.rhi());
         c["params"]["blocksX"].setData(dim.xsizeBlocks);
         c["params"]["blocksY"].setData(dim.ysizeBlocks);
         c["params"]["paddedWidth"].setData(dim.xsizePadded);
@@ -199,7 +201,10 @@ Result<image::Rgb8> Decoder::run(const codestream::Parsed& parsed, bool withLz77
         for (int i = 0; i < 4; ++i) c["params"]["quantBias"][i].setData(m.quantBiases[static_cast<size_t>(i)]);
     };
     dequantCoeffs_.dispatch(batch, {3 * nblocks * 64, 1, 1}, bindTransforms);
-    inverseTransform_.dispatch(batch, {3 * nblocks, 1, 1}, bindTransforms);
+    llfFromDc_.dispatch(batch, {3 * nblocks, 1, 1}, bindTransforms);
+    idctRows_.dispatch(batch, {static_cast<uint32_t>(3 * planePixels), 1, 1}, bindTransforms);
+    idctCols_.dispatch(batch, {static_cast<uint32_t>(3 * planePixels), 1, 1}, bindTransforms);
+    transformSpecial_.dispatch(batch, {3 * nblocks, 1, 1}, bindTransforms);
 
     // Loop filters, ping-pong between the two XYB buffers.
     gpu::Buffer* src = &xybA;
@@ -295,8 +300,6 @@ Result<image::Rgb8> Decoder::run(const codestream::Parsed& parsed, bool withLz77
         if (code == kErrArena) return Error::make(ErrorCode::OutOfMemory, "{} in {}", describe(code), where);
         return Error::make(ErrorCode::Corrupt, "{} in {}", describe(code), where);
     }
-    SJXL_ASSIGN(const std::vector<uint32_t> flagsHost, flags.readAll<uint32_t>(dev));
-    if (flagsHost[0] & 1) return Error(ErrorCode::Unsupported, "transforms larger than 32x32 (DCT64 and up)");
     SJXL_ASSIGN(const std::vector<uint32_t> header, arena.readRange<uint32_t>(dev, 0, kGsHeaderSize));
     stats_.dcGlobalBits = header[45];
     stats_.usedAcs = header[47];

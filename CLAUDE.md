@@ -120,6 +120,7 @@ one-thread kernels decode DcGlobal and AcGlobal (quantizer, block context
 map, dequant matrices, coefficient orders, histograms → prefix/ANS tables) →
 one thread per DC group (modular DC + AcMetadata, MA tree, predictors) → per
 block DequantDC, AdaptiveDCSmoothing, EPF sigma → one thread per AC group
-(ANS/prefix tokens → quantised coefficients) → per varblock dequant, CfL,
-LLF, IDCT → whole-image Gaborish, EPF passes, XYB→sRGB8 → readback; CPU
-writes the file.
+(ANS/prefix tokens → quantised coefficients) → per coefficient dequant and
+CfL, per covered block LLF, per pixel separable IDCT (rows, then columns; any
+size 8–256), per varblock the 8×8 special transforms → whole-image Gaborish,
+EPF passes, XYB→sRGB8 → readback; CPU writes the file.

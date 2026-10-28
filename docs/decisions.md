@@ -54,8 +54,9 @@ per subsystem or milestone, appended to as the work goes. Dates are absolute.
 - **M3 encoder quality**: inverse Gaborish + default LoopFilter, EPF sharpness,
   CfL per tile, adaptive quant field, DCT16/32 strategy search, context
   clustering (≤ 32, fixed-point costs as cujpegxl), ANS for AC.
-- **M4 decoder completeness**: 64–256 px transforms, upsampling,
-  patches/splines/noise, progressive, Modular frames (lossless), alpha, >8-bit.
+- **M4 decoder completeness**: upsampling, patches/splines/noise,
+  progressive, Modular frames (lossless), alpha, >8-bit. (64–256 px
+  transforms: done in M2.)
 - **M5 platforms and speed**: Linux CUDA/Vulkan, async readback, batching,
   per-stage timings here.
 
@@ -132,9 +133,13 @@ Layout of the work on the device (`shaders/sjxl/dec/`):
 - Then parallel kernels: `tables.slang` (one thread per dequant matrix entry;
   libjxl's library constants and the DCT/ID/DCT2/DCT4/DCT4X8/AFV formulas),
   `dc_finalize.slang` (AdaptiveDCSmoothing, EPF sigma), `transforms.slang`
-  (dequant with the quant bias and chroma-from-luma per coefficient; LLF from
-  the DC image, inverse DCT for 8–32 px blocks as a direct separable
-  transform, IDENTITY/DCT2X2/DCT4X4/DCT4X8/DCT8X4/AFV per libjxl), `filters.slang`
+  (dequant with the quant bias and chroma-from-luma per coefficient; the
+  lowest frequencies from the DC image, one thread per covered block; the
+  inverse DCT of every 8–256 px varblock as two separable passes with one
+  thread per pixel, rows into a scratch plane and columns into the XYB
+  planes, so no thread holds a block and a 256×256 transform costs 512
+  multiply-adds a pixel; IDENTITY/DCT2X2/DCT4X4/DCT4X8/DCT8X4/AFV one thread
+  per varblock, per libjxl), `filters.slang`
   (Gaborish, EPF0/1/2 as whole-image passes with mirrored borders at the frame
   edge), `output.slang` (XYB → linear → the declared transfer function:
   sRGB, linear, gamma, DCI).
@@ -183,10 +188,14 @@ including EPF iterations 0–3, Gaborish, every 8–32 px transform, AFV and
 chroma-from-luma. `cjxl --epf=0 --gaborish=0` streams isolate the transform
 path from the filters when a block type misbehaves; `SJXL_DEBUG_ACS=1`
 prints the strategy map and `SJXL_DEBUG_TABLES=<file>` dumps the dequant
-tables (checked against cujpegxl's extracted DCT8/16/32: ≤ 2e-6 relative). Debug build, 320×180:
+tables (checked against cujpegxl's extracted DCT8/16/32: ≤ 2e-6 relative).
+DCT64X64 (the 320 px photo at effort 5–7, and a 768 px smooth gradient at
+effort 7–9, where cjxl uses nothing else) also decodes within 1 LSB; cjxl
+never emitted 128/256 px transforms on our inputs, so those share the code
+path but are unverified against djxl. Debug build, 320×180:
 ≈300 ms a decode, dominated by the single-thread section kernels compiling
 and running cold; not measured for speed yet (M5).
 
-Not done: transforms of 64–256 px (`flags` reports them), RAW quant tables,
+Not done: RAW quant tables,
 modular Squeeze, Modular frames, extra channels, ICC, animation, previews,
 progressive passes, TOC permutations, a third level of nested context maps.
