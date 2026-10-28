@@ -112,10 +112,41 @@ TEST_CASE("the decoder reproduces cjxl's lossless output exactly", "[decoder][co
     const std::string name = GENERATE(std::string("sveti_64.png"), std::string("berlin_200.png"), std::string("sveti_crop_257x129.png"),
                                       std::string("sveti_stefan_320.png"));
     const int effort = GENERATE(1, 3, 7, 9);
+    const int responsive = GENERATE(0, 1);   // 1: Squeeze (progressive lossless)
+    CAPTURE(name, effort, responsive);
+    const std::filesystem::path jxl = test::scratchDir() / std::format("dec_lossless_{}_e{}_r{}.jxl", name, effort, responsive);
+    const std::filesystem::path png = test::scratchDir() / std::format("dec_lossless_{}_e{}_r{}.djxl.png", name, effort, responsive);
+    REQUIRE(test::run(std::format("\"{}\" \"{}\" \"{}\" -d 0 -e {} --responsive={} >/dev/null 2>&1", cjxl.string(),
+                                  test::testData(name).string(), jxl.string(), effort, responsive)));
+    REQUIRE(test::run(std::format("\"{}\" \"{}\" \"{}\" >/dev/null 2>&1", djxl.string(), jxl.string(), png.string())));
+    auto bytes = image::readFile(jxl);
+    REQUIRE(bytes);
+    auto reference = image::readRgb8(png);
+    REQUIRE(reference);
+    auto ours = decoder().decode(*bytes);
+    if (!ours && ours.error().code() == ErrorCode::Unsupported) {
+        WARN(std::format("{} e{} r{} lossless: unsupported: {}", name, effort, responsive, ours.error().message()));
+        SUCCEED();
+        return;
+    }
+    REQUIRE(ours);
+    auto metrics = test::compare(*reference, *ours);
+    REQUIRE(metrics);
+    WARN(std::format("{} e{} r{} lossless: vs djxl max diff {}", name, effort, responsive, metrics->maxAbsDiff));
+    CHECK(metrics->maxAbsDiff == 0);
+}
+
+TEST_CASE("the decoder matches djxl on cjxl's lossy modular output", "[decoder][conformance][cjxl][modular]") {
+    const std::filesystem::path djxl = test::findTool("djxl");
+    const std::filesystem::path cjxl = test::findTool("cjxl");
+    if (djxl.empty() || cjxl.empty()) SKIP("cjxl/djxl are not installed");
+    const std::string name = GENERATE(std::string("sveti_64.png"), std::string("berlin_200.png"), std::string("sveti_crop_257x129.png"),
+                                      std::string("sveti_stefan_320.png"));
+    const int effort = GENERATE(3, 7);
     CAPTURE(name, effort);
-    const std::filesystem::path jxl = test::scratchDir() / std::format("dec_lossless_{}_e{}.jxl", name, effort);
-    const std::filesystem::path png = test::scratchDir() / std::format("dec_lossless_{}_e{}.djxl.png", name, effort);
-    REQUIRE(test::run(std::format("\"{}\" \"{}\" \"{}\" -d 0 -e {} >/dev/null 2>&1", cjxl.string(), test::testData(name).string(),
+    const std::filesystem::path jxl = test::scratchDir() / std::format("dec_lossymod_{}_e{}.jxl", name, effort);
+    const std::filesystem::path png = test::scratchDir() / std::format("dec_lossymod_{}_e{}.djxl.png", name, effort);
+    REQUIRE(test::run(std::format("\"{}\" \"{}\" \"{}\" -m 1 -d 1 -e {} >/dev/null 2>&1", cjxl.string(), test::testData(name).string(),
                                   jxl.string(), effort)));
     REQUIRE(test::run(std::format("\"{}\" \"{}\" \"{}\" >/dev/null 2>&1", djxl.string(), jxl.string(), png.string())));
     auto bytes = image::readFile(jxl);
@@ -124,13 +155,13 @@ TEST_CASE("the decoder reproduces cjxl's lossless output exactly", "[decoder][co
     REQUIRE(reference);
     auto ours = decoder().decode(*bytes);
     if (!ours && ours.error().code() == ErrorCode::Unsupported) {
-        WARN(std::format("{} e{} lossless: unsupported: {}", name, effort, ours.error().message()));
+        WARN(std::format("{} e{} lossy modular: unsupported: {}", name, effort, ours.error().message()));
         SUCCEED();
         return;
     }
     REQUIRE(ours);
     auto metrics = test::compare(*reference, *ours);
     REQUIRE(metrics);
-    WARN(std::format("{} e{} lossless: vs djxl max diff {}", name, effort, metrics->maxAbsDiff));
-    CHECK(metrics->maxAbsDiff == 0);
+    WARN(std::format("{} e{} lossy modular: vs djxl PSNR {:.2f} dB, max diff {}", name, effort, metrics->psnr, metrics->maxAbsDiff));
+    CHECK(metrics->maxAbsDiff <= 1);
 }

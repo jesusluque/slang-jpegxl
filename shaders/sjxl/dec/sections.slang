@@ -176,13 +176,15 @@ ModularFrameGeom modularGeom() {
 }
 
 /// Pixel rectangle of DC group g (groupDim * 8 pixels) or AC group g (groupDim pixels).
+/// Unclipped, as libjxl's mrect: each (shifted) channel clips it to its own size,
+/// which is not the same as shifting the clipped rectangle for odd sizes.
 void groupRect(uint g, bool dcGroup, out uint x0, out uint y0, out uint w, out uint h) {
     const uint dim = dcGroup ? params.groupDim * 8 : params.groupDim;
     const uint perRow = (params.xsize + dim - 1) / dim;
     x0 = (g % perRow) * dim;
     y0 = (g / perRow) * dim;
-    w = min(dim, params.xsize - x0);
-    h = min(dim, params.ysize - y0);
+    w = dim;
+    h = dim;
 }
 
 /// Stream ids (ModularStreamId): ModularDC(g) = 1 + nDC + g; ModularAC(g, pass 0) = 1 + 3 nDC + 17 + g.

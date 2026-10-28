@@ -19,7 +19,7 @@ static const uint kChanHShift = 2;
 static const uint kChanVShift = 3;
 static const uint kChanData = 4;
 static const uint kChanStride = 5;   // words per row (the width, or the full image's for a group view)
-static const uint kMaxChannels = 24;
+static const uint kMaxChannels = 256;   // Squeeze multiplies channels: 3 x (1 + 2 x levels)
 
 static const uint kTreeWords = 8;   // property(int, -1 leaf), splitval, lchild, rchild, predictor, offset, multiplier, leaf id
 static const uint kMaxTreeNodes = 8192;
@@ -357,10 +357,13 @@ Tree decodeTree(inout Dec d, uint windowOff) {
 // --- transforms (fields) -------------------------------------------------------------
 
 static const uint kTransformWords = 12;
-static const uint kTrId = 0, kTrBeginC = 1, kTrRctType = 2, kTrNumC = 3, kTrNbColors = 4, kTrNbDeltas = 5, kTrPredictor = 6;
+static const uint kTrId = 0, kTrBeginC = 1, kTrRctType = 2, kTrNumC = 3, kTrNbColors = 4, kTrNbDeltas = 5, kTrPredictor = 6,
+                  kTrNumSqueezes = 7, kTrSqueezesOff = 8;   // squeezes: 4 words each (horizontal, in_place, begin_c, num_c)
 static const uint kTrRct = 0, kTrPalette = 1, kTrSqueeze = 2;
+static const uint kSqWords = 4, kSqHorizontal = 0, kSqInPlace = 1, kSqBeginC = 2, kSqNumC = 3;
+static const uint kMaxSqueezes = 64;   // room for the default parameters of a 2^30 px image
 
-/// Transform::VisitFields. Squeeze parameters are not read (reported Unsupported).
+/// Transform::VisitFields.
 void readTransform(inout Dec d, uint off) {
     const uint id = brU32(d.br, distrVal(0), distrVal(1), distrVal(2), distrVal(3));
     arena[off + kTrId] = id;
@@ -380,13 +383,222 @@ void readTransform(inout Dec d, uint off) {
         if (arena[off + kTrPredictor] >= 14) fail(d, kErrCorrupt);
     }
     if (id == kTrSqueeze) {
-        fail(d, kErrUnsupported);   // modular transform Squeeze (M4)
+        const uint num = brU32(d.br, distrVal(0), distrBitsOffset(4, 1), distrBitsOffset(6, 9), distrBitsOffset(8, 41));
+        if (num > kMaxSqueezes) { fail(d, kErrCorrupt); return; }
+        arena[off + kTrNumSqueezes] = num;
+        const uint sq = alloc(d, kMaxSqueezes * kSqWords);   // defaults are filled in at MetaApply when num == 0
+        arena[off + kTrSqueezesOff] = sq;
+        if (d.error != kErrNone) return;
+        for (uint i = 0; i < num; ++i) {
+            const uint o = sq + i * kSqWords;
+            arena[o + kSqHorizontal] = brRead(d.br, 1);
+            arena[o + kSqInPlace] = brRead(d.br, 1);
+            arena[o + kSqBeginC] = brU32(d.br, distrBitsOffset(3, 0), distrBitsOffset(6, 8), distrBitsOffset(10, 72), distrBitsOffset(13, 1096));
+            arena[o + kSqNumC] = brU32(d.br, distrVal(1), distrVal(2), distrVal(3), distrBitsOffset(4, 4));
+        }
+    }
+}
+
+/// squeeze.cc DefaultSqueezeParameters: the parameters an empty list stands for.
+void defaultSqueezeParameters(uint off, uint chansOff, uint numChannels, uint nbMeta) {
+    const uint sq = arena[off + kTrSqueezesOff];
+    uint num = 0;
+    const uint nbChannels = numChannels - nbMeta;
+    const Channel first = loadChannel(chansOff, nbMeta);
+    uint w = first.w;
+    uint h = first.h;
+    const bool wide = w > h;
+    if (nbChannels > 2) {
+        const Channel second = loadChannel(chansOff, nbMeta + 1);
+        if (second.w == w && second.h == h) {
+            // (the comment in libjxl says 4:2:0 chroma; it fires for every RGB image)
+            for (uint k = 0; k < 2 && num < kMaxSqueezes; ++k) {   // horizontal, then vertical
+                const uint o = sq + num * kSqWords;
+                arena[o + kSqHorizontal] = k == 0 ? 1u : 0u;
+                arena[o + kSqInPlace] = 0;
+                arena[o + kSqBeginC] = nbMeta + 1;
+                arena[o + kSqNumC] = 2;
+                ++num;
+            }
+        }
+    }
+    if (!wide && h > 8 && num < kMaxSqueezes) {
+        const uint o = sq + num * kSqWords;
+        arena[o + kSqHorizontal] = 0; arena[o + kSqInPlace] = 1; arena[o + kSqBeginC] = nbMeta; arena[o + kSqNumC] = nbChannels;
+        ++num;
+        h = (h + 1) / 2;
+    }
+    while ((w > 8 || h > 8) && num + 1 < kMaxSqueezes) {
+        if (w > 8) {
+            const uint o = sq + num * kSqWords;
+            arena[o + kSqHorizontal] = 1; arena[o + kSqInPlace] = 1; arena[o + kSqBeginC] = nbMeta; arena[o + kSqNumC] = nbChannels;
+            ++num;
+            w = (w + 1) / 2;
+        }
+        if (h > 8) {
+            const uint o = sq + num * kSqWords;
+            arena[o + kSqHorizontal] = 0; arena[o + kSqInPlace] = 1; arena[o + kSqBeginC] = nbMeta; arena[o + kSqNumC] = nbChannels;
+            ++num;
+            h = (h + 1) / 2;
+        }
+    }
+    arena[off + kTrNumSqueezes] = num;
+}
+
+/// Inserts `c` at index `at` of the channel list (descriptors after it move up).
+void insertChannel(uint chansOff, inout uint numChannels, uint at, Channel c) {
+    for (uint i = numChannels; i > at; --i) storeChannel(chansOff, i, loadChannel(chansOff, i - 1));
+    storeChannel(chansOff, at, c);
+    ++numChannels;
+}
+
+/// Removes `count` channels starting at `at`.
+void eraseChannels(uint chansOff, inout uint numChannels, uint at, uint count) {
+    for (uint i = at; i + count < numChannels; ++i) storeChannel(chansOff, i, loadChannel(chansOff, i + count));
+    numChannels -= count;
+}
+
+/// squeeze.cc MetaSqueeze: halves the squeezed channels and inserts the residual
+/// channels (with storage) where the inverse expects them.
+void metaSqueeze(inout Dec d, uint off, uint chansOff, inout uint numChannels, inout uint nbMeta) {
+    if (arena[off + kTrNumSqueezes] == 0) defaultSqueezeParameters(off, chansOff, numChannels, nbMeta);
+    const uint num = arena[off + kTrNumSqueezes];
+    const uint sq = arena[off + kTrSqueezesOff];
+    for (uint i = 0; i < num; ++i) {
+        const uint o = sq + i * kSqWords;
+        const bool horizontal = arena[o + kSqHorizontal] != 0;
+        const bool inPlace = arena[o + kSqInPlace] != 0;
+        const uint beginC = arena[o + kSqBeginC];
+        const uint numC = arena[o + kSqNumC];
+        const uint endC = beginC + numC - 1;
+        if (beginC >= numChannels || endC >= numChannels || endC < beginC) { fail(d, kErrCorrupt); return; }
+        if (numChannels + numC > kMaxChannels) { fail(d, kErrCorrupt); return; }
+        if (beginC < nbMeta) {
+            if (endC >= nbMeta || !inPlace) { fail(d, kErrCorrupt); return; }
+            nbMeta += numC;
+        }
+        const uint offset = inPlace ? endC + 1 : numChannels;
+        for (uint c = beginC; c <= endC; ++c) {
+            Channel ch = loadChannel(chansOff, c);
+            if (ch.hshift > 30 || ch.vshift > 30 || ch.w == 0 || ch.h == 0) { fail(d, kErrCorrupt); return; }
+            uint w = ch.w, h = ch.h;
+            if (horizontal) {
+                ch.w = (w + 1) / 2;
+                if (ch.hshift >= 0) ch.hshift++;
+                w = w - (w + 1) / 2;
+            } else {
+                ch.h = (h + 1) / 2;
+                if (ch.vshift >= 0) ch.vshift++;
+                h = h - (h + 1) / 2;
+            }
+            ch.stride = ch.w;   // shrink(): the smaller channel is contiguous in its storage
+            storeChannel(chansOff, c, ch);
+            const Channel residual = newChannelUncleared(d, w, h, ch.hshift, ch.vshift);
+            if (d.error != kErrNone) return;
+            insertChannel(chansOff, numChannels, offset + (c - beginC), residual);
+        }
+    }
+}
+
+int smoothTendency(int B, int a, int n) {
+    int diff = 0;
+    if (B >= a && a >= n) {
+        diff = (4 * B - 3 * n - a + 6) / 12;
+        if (diff - (diff & 1) > 2 * (B - a)) diff = 2 * (B - a) + 1;
+        if (diff + (diff & 1) > 2 * (a - n)) diff = 2 * (a - n);
+    } else if (B <= a && a <= n) {
+        diff = (4 * B - 3 * n - a - 6) / 12;
+        if (diff + (diff & 1) < 2 * (B - a)) diff = 2 * (B - a) - 1;
+        if (diff - (diff & 1) < 2 * (a - n)) diff = 2 * (a - n);
+    }
+    return diff;
+}
+
+/// InvHSqueeze: channel c (averages) and rc (residuals) into a channel twice as wide.
+void invHSqueeze(inout Dec d, uint chansOff, uint c, uint rc) {
+    Channel chin = loadChannel(chansOff, c);
+    const Channel res = loadChannel(chansOff, rc);
+    if (chin.w != (chin.w + res.w + 1) / 2 || chin.h != res.h) { fail(d, kErrCorrupt); return; }
+    if (res.w == 0) { chin.hshift--; storeChannel(chansOff, c, chin); return; }
+    Channel chout = newChannelUncleared(d, chin.w + res.w, chin.h, chin.hshift - 1, chin.vshift);
+    if (d.error != kErrNone) return;
+    for (uint y = 0; y < chin.h; ++y) {
+        for (uint x = 0; x < res.w; ++x) {
+            const int diffMinusTendency = px(res, x, y);
+            const int avg = px(chin, x, y);
+            const int nextAvg = x + 1 < chin.w ? px(chin, x + 1, y) : avg;
+            const int left = x > 0 ? px(chout, 2 * x - 1, y) : avg;
+            const int diff = diffMinusTendency + smoothTendency(left, avg, nextAvg);
+            const int A = avg + diff / 2;
+            setPx(chout, 2 * x, y, A);
+            setPx(chout, 2 * x + 1, y, A - diff);
+        }
+        if ((chout.w & 1) != 0) setPx(chout, chout.w - 1, y, px(chin, chin.w - 1, y));
+    }
+    storeChannel(chansOff, c, chout);
+}
+
+/// InvVSqueeze: channel c (averages) and rc (residuals) into a channel twice as tall.
+void invVSqueeze(inout Dec d, uint chansOff, uint c, uint rc) {
+    Channel chin = loadChannel(chansOff, c);
+    const Channel res = loadChannel(chansOff, rc);
+    if (chin.h != (chin.h + res.h + 1) / 2 || chin.w != res.w) { fail(d, kErrCorrupt); return; }
+    if (res.h == 0) { chin.vshift--; storeChannel(chansOff, c, chin); return; }
+    Channel chout = newChannelUncleared(d, chin.w, chin.h + res.h, chin.hshift, chin.vshift - 1);
+    if (d.error != kErrNone) return;
+    for (uint y = 0; y < res.h; ++y) {
+        for (uint x = 0; x < chin.w; ++x) {
+            const int avg = px(chin, x, y);
+            const int nextAvg = y + 1 < chin.h ? px(chin, x, y + 1) : avg;
+            const int top = y > 0 ? px(chout, x, 2 * y - 1) : avg;
+            const int diff = px(res, x, y) + smoothTendency(top, avg, nextAvg);
+            const int o = avg + diff / 2;
+            setPx(chout, x, 2 * y, o);
+            setPx(chout, x, 2 * y + 1, o - diff);
+        }
+    }
+    if ((chout.h & 1) != 0) {
+        const uint y = chin.h - 1;
+        for (uint x = 0; x < chin.w; ++x) setPx(chout, x, 2 * y, px(chin, x, y));
+    }
+    storeChannel(chansOff, c, chout);
+}
+
+/// InvSqueeze over the channel list, last parameter first.
+void invSqueeze(inout Dec d, uint off, uint chansOff, inout uint numChannels, inout uint nbMeta) {
+    const uint num = arena[off + kTrNumSqueezes];
+    const uint sq = arena[off + kTrSqueezesOff];
+    for (uint i = num; i > 0; --i) {
+        const uint o = sq + (i - 1) * kSqWords;
+        const bool horizontal = arena[o + kSqHorizontal] != 0;
+        const bool inPlace = arena[o + kSqInPlace] != 0;
+        const uint beginC = arena[o + kSqBeginC];
+        const uint numC = arena[o + kSqNumC];
+        const uint endC = beginC + numC - 1;
+        if (beginC >= numChannels || endC >= numChannels || endC < beginC) { fail(d, kErrCorrupt); return; }
+        const uint offset = inPlace ? endC + 1 : numChannels + beginC - endC - 1;
+        if (beginC < nbMeta) {
+            if (nbMeta <= numC) { fail(d, kErrCorrupt); return; }
+            nbMeta -= numC;
+        }
+        for (uint c = beginC; c <= endC; ++c) {
+            const uint rc = offset + c - beginC;
+            if (rc >= numChannels) { fail(d, kErrCorrupt); return; }
+            const Channel a = loadChannel(chansOff, c);
+            const Channel r = loadChannel(chansOff, rc);
+            if (a.w < r.w || a.h < r.h) { fail(d, kErrCorrupt); return; }
+            if (horizontal) invHSqueeze(d, chansOff, c, rc);
+            else invVSqueeze(d, chansOff, c, rc);
+            if (d.error != kErrNone) return;
+        }
+        eraseChannels(chansOff, numChannels, offset, numC);
     }
 }
 
 /// The channel list after MetaApply of a transform.
 void metaApply(inout Dec d, uint off, uint chansOff, inout uint numChannels, inout uint nbMeta) {
     const uint id = arena[off + kTrId];
+    if (id == kTrSqueeze) { metaSqueeze(d, off, chansOff, numChannels, nbMeta); return; }
     if (id == kTrRct) {
         const uint b = arena[off + kTrBeginC];
         if (b + 2 >= numChannels) { fail(d, kErrCorrupt); return; }
@@ -831,6 +1043,7 @@ void undoTransforms(inout Dec d, StreamHeader h, uint chansOff, inout uint numCh
         const uint id = arena[off + kTrId];
         if (id == kTrRct) invRct(d, off, chansOff);
         else if (id == kTrPalette) invPalette(d, off, chansOff, numChannels, nbMeta, h.wp, bitDepth);
+        else if (id == kTrSqueeze) invSqueeze(d, off, chansOff, numChannels, nbMeta);
         if (d.error != kErrNone) return;
     }
 }

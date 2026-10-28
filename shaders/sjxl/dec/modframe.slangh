@@ -46,9 +46,6 @@ void decodeModularGlobal(inout Dec d, ModularFrameGeom g, uint windowOff) {
     if (d.error != kErrNone) return;
     StreamHeader h = readStreamHeader(d, chansOff, numChannels);
     if (d.error != kErrNone) return;
-    for (uint i = 0; i < h.numTransforms; ++i) {
-        if (arena[h.transformsOff + i * kTransformWords + kTrId] == kTrSqueeze) { fail(d, kErrUnsupported); return; }
-    }
     const uint beginC = decodeStreamChannels(d, h, chansOff, numChannels, 0, globalTree(), windowOff, g.groupDim);
     if (d.error != kErrNone) return;
     storeStreamHeader(headerOff, h);

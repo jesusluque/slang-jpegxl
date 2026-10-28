@@ -130,4 +130,5 @@ global tree and the channels that fit a group; group threads decode their
 rectangle of the big channels through strided views into the full-image
 channels; one thread undoes RCT/palette; a per-pixel kernel scales the
 integers into the planes; the output stage copies them (mode 1) or, for XYB
-modular, runs the usual colour transform. Squeeze is not implemented yet.
+modular, runs the usual colour transform. RCT, palette and Squeeze are undone
+in the finalise thread.

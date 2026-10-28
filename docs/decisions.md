@@ -54,10 +54,10 @@ per subsystem or milestone, appended to as the work goes. Dates are absolute.
 - **M3 encoder quality**: inverse Gaborish + default LoopFilter, EPF sharpness,
   CfL per tile, adaptive quant field, DCT16/32 strategy search, context
   clustering (≤ 32, fixed-point costs as cujpegxl), ANS for AC.
-- **M4 decoder completeness**: Squeeze (lossy modular, progressive
-  lossless), patches, upsampling, splines/noise, progressive passes,
-  alpha and extra channels, >8-bit output, ICC, animation, JPEG
-  recompression. (64–256 px transforms and lossless Modular frames: done.)
+- **M4 decoder completeness**: patches, upsampling, splines/noise,
+  progressive passes, alpha and extra channels, >8-bit output, ICC,
+  animation, JPEG recompression. (64–256 px transforms, Modular frames with
+  RCT/palette/Squeeze, lossy modular: done.)
 - **M5 platforms and speed**: Linux CUDA/Vulkan, async readback, batching,
   per-stage timings here.
 
@@ -203,9 +203,9 @@ progressive passes, TOC permutations, a third level of nested context maps.
 
 ## Modular frames (2026-10-29)
 
-Lossless images (`cjxl -d 0`) are a single Modular frame; the same path
-will carry lossy modular (XYB, needs Squeeze) and the reference frames of
-patches. Design (`shaders/sjxl/dec/modframe.slangh`, entries in
+Lossless images (`cjxl -d 0`), progressive lossless (`--responsive=1`,
+Squeeze) and lossy modular (`-m 1`, XYB with Squeeze) are a single Modular
+frame; the same path will carry the reference frames of patches. Design (`shaders/sjxl/dec/modframe.slangh`, entries in
 `sections.slang`):
 
 - **Globals thread** (DcGlobal): the DC dequant factors (read for every
@@ -229,19 +229,31 @@ patches. Design (`shaders/sjxl/dec/modframe.slangh`, entries in
   the DC dequant factors with B relative to Y for XYB frames. The output
   stage has a mode that stores those planes as they are (no XYB transform),
   since non-XYB samples are already in the output encoding.
+- **Squeeze** (`squeeze.cc`): the parameters (or the defaults a zero count
+  stands for, computed from the first non-meta channel at MetaApply),
+  MetaSqueeze halving channels and inserting residual channels with
+  storage, and the inverse with SmoothTendency, row by row (horizontal) or
+  column by column (vertical) in the finalise thread. With in-place
+  residuals the channel list ends up small-to-large, so the global stream
+  takes the ≤ group-dim ones and the groups the rest; DC groups get those
+  with shift ≥ 3. The group rectangle handed to a shifted channel is the
+  *unclipped* group dimension shifted, then clipped to the channel (clipping
+  first loses a column on odd sizes). `kMaxChannels` is 256 (3 × (1 + 2 ×
+  levels) channels after squeezing).
 - Group size: `group_size_shift` is honoured everywhere now (`frameDim`
   takes it; the section kernels get `groupDim`), including the VarDCT
   AcMetadata boundary check that assumed 256 px groups.
 
-Measured: `cjxl -d 0` at efforts 1, 3, 7 and 9 on the four test images,
-a grey PGM, a six-colour palette image and a 768 px gradient with `-g 0`,
-`-g 2` and `-g 3` (128, 512 and 1024 px groups) all decode bit-exact
-against djxl (`sjxl_decoder_tests "the decoder reproduces cjxl's lossless
-output exactly"`). Lossy modular (`cjxl -m 1 -d 1`) uses Squeeze and is
-reported Unsupported.
+Measured: `cjxl -d 0` at efforts 1, 3, 7 and 9, with and without
+`--responsive=1`, on the four test images, a grey PGM, a six-colour palette
+image and a 768 px gradient with `-g 0`, `-g 2` and `-g 3` (128, 512 and
+1024 px groups) all decode bit-exact against djxl (`sjxl_decoder_tests
+"[modular]"`). Lossy modular (`cjxl -m 1 -d 1`, efforts 3 and 7) is within
+1 LSB (≈54 dB).
 
-Not done: Squeeze, YCbCr modular frames, extra channels, floating point and
->8-bit output (16-bit samples decode but the output is 8-bit), group-local
+Not done: YCbCr modular frames, extra channels, floating point and >8-bit
+output (16-bit samples decode but the output is 8-bit), group-local
 transforms, patches (the reference-frame plumbing: parsing a second frame
-and keeping the first), the per-pixel finalise (RCT/palette run in one
-thread; fine at these sizes, a kernel later).
+and keeping the first), the per-pixel finalise (RCT, palette and Squeeze run
+in one thread; fine at these sizes, kernels later: Squeeze is one thread
+per row or column).
