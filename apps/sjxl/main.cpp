@@ -19,7 +19,7 @@ namespace {
 int usage() {
     std::fprintf(stderr,
                  "usage:\n"
-                 "  sjxl info                                   open the GPU device and describe it\n"
+                 "  sjxl info [in.jxl]                          describe the GPU device, or a file's headers and frames\n"
                  "  sjxl encode in.png out.jxl [--distance d]   lossy VarDCT (default distance 1.0)\n"
                  "  sjxl decode in.jxl out.png                  VarDCT frames\n"
                  "  sjxl compare a.png b.png                    PSNR and largest difference, measured on the GPU\n"
@@ -33,7 +33,30 @@ int fail(const sjxl::Error& error) {
     return 1;
 }
 
-int info() {
+int info(int argc, char** argv) {
+    if (argc >= 3) {
+        auto bytes = sjxl::image::readFile(argv[2]);
+        if (!bytes) return fail(bytes.error());
+        auto parsed = sjxl::dec::Decoder::info(*bytes);
+        if (!parsed) return fail(parsed.error());
+        const auto& m = parsed->metadata;
+        std::printf("image     %ux%u, %u-bit%s, %s, %s%s\n", m.xsize, m.ysize, m.bitsPerSample, m.floatingPointSample ? " float" : "",
+                    m.colorSpace == 0 ? "RGB" : m.colorSpace == 1 ? "grey" : "other colour space", m.xybEncoded ? "XYB" : "not XYB",
+                    m.numExtraChannels ? ", extra channels" : "");
+        std::printf("frames    %zu\n", parsed->frames.size());
+        for (size_t i = 0; i < parsed->frames.size(); ++i) {
+            const auto& f = parsed->frames[i];
+            const auto& h = f.header;
+            const char* type = h.frameType == 0 ? "regular" : h.frameType == 1 ? "DC" : h.frameType == 2 ? "reference-only" : "skip-progressive";
+            std::printf("  frame %zu %s %s %ux%u, groups %u px (%u AC, %u DC), %zu sections%s%s%s%s, gab %d, epf %u%s\n", i, type,
+                        h.isModular ? "Modular" : "VarDCT", f.dim.xsize, f.dim.ysize, f.dim.groupDim, f.dim.numGroups(), f.dim.numDcGroups(),
+                        f.sections.size(), (h.flags & sjxl::codestream::FrameHeader::kPatches) ? ", patches" : "",
+                        (h.flags & sjxl::codestream::FrameHeader::kSplines) ? ", splines" : "", (h.flags & sjxl::codestream::FrameHeader::kNoise) ? ", noise" : "",
+                        h.frameType == 2 ? (h.saveBeforeColorTransform ? ", saved before the colour transform" : ", saved after the colour transform") : "",
+                        h.loopFilter.gab ? 1 : 0, h.loopFilter.epfIters, h.isLast ? ", last" : "");
+        }
+        return 0;
+    }
     auto device = sjxl::gpu::Device::create();
     if (!device) return fail(device.error());
     const auto& caps = (*device)->caps();
@@ -130,7 +153,7 @@ int compare(int argc, char** argv) {
 int main(int argc, char** argv) {
     if (argc < 2) return usage();
     const std::string_view command = argv[1];
-    if (command == "info") return info();
+    if (command == "info") return info(argc, argv);
     if (command == "encode") return encode(argc, argv);
     if (command == "compare") return compare(argc, argv);
     if (command == "pixel") return pixel(argc, argv);

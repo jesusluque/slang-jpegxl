@@ -135,14 +135,16 @@ struct ParsedFrame {
 };
 
 struct Parsed {
-    ImageMetadata        metadata;
-    std::vector<uint8_t> codestream;   // the raw codestream (boxes unwrapped)
-    ParsedFrame          frame;        // the first frame
+    ImageMetadata            metadata;
+    std::vector<uint8_t>     codestream;   // the raw codestream (boxes unwrapped)
+    std::vector<ParsedFrame> frames;       // in codestream order; the last one is displayed
+    ParsedFrame              frame;        // the displayed (last) frame, a copy of frames.back()
 };
 
 /// Unwraps the container if present (jxlc / jxlp boxes), parses the headers
-/// and the first frame's header and TOC. Features this decoder does not
-/// implement are reported as Unsupported, naming them.
+/// and every frame's header and TOC (reference-only frames for patches, then
+/// the displayed frame). Features this decoder does not implement are
+/// reported as Unsupported, naming them.
 [[nodiscard]] Result<Parsed> parse(std::span<const uint8_t> file);
 
 }   // namespace sjxl::codestream

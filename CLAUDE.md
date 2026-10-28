@@ -16,7 +16,7 @@ ctest --preset macos-arm64-debug                            # all tests, serial 
 ctest --test-dir build/macos-arm64-debug -R prefix          # tests matching a name
 build/macos-arm64-debug/bin/sjxl_gpu_tests "prefix sum*"    # one Catch2 case by name (or a [tag])
 cmake --build build/macos-arm64-debug --target sjxl_gpu_tests   # one binary
-build/macos-arm64-debug/bin/sjxl info                       # open the device, print backend/adapter
+build/macos-arm64-debug/bin/sjxl info [in.jxl]              # device info, or a file's headers and frame list
 build/macos-arm64-debug/bin/sjxl encode in.png out.jxl --distance 1.0   # M1
 build/macos-arm64-debug/bin/sjxl decode in.jxl out.png                  # VarDCT, every stage on the GPU
 build/macos-arm64-debug/bin/sjxl compare a.png b.png                    # PSNR + largest diff, on the GPU
@@ -131,4 +131,7 @@ rectangle of the big channels through strided views into the full-image
 channels; one thread undoes RCT/palette; a per-pixel kernel scales the
 integers into the planes; the output stage copies them (mode 1) or, for XYB
 modular, runs the usual colour transform. RCT, palette and Squeeze are undone
-in the finalise thread.
+in the finalise thread. Patches: reference-only Modular frames come first in
+the codestream and keep their planes; the displayed frame's globals thread
+decodes the dictionary, and `patches.slang` blends the rectangles per pixel
+after the filters (`docs/decisions.md`, "Patches and multiple frames").

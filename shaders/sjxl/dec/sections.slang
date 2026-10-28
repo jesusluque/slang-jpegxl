@@ -47,7 +47,10 @@ struct SectionParams {
     uint ysize;
     uint colorChannels;   // modular: 1 (grey) or 3
     uint bitDepth;        // modular: bits per sample
-    uint pad0, pad1, pad2;
+    uint frameFlags;      // FrameHeader flags (bit 1: patches)
+    uint pad1, pad2;
+    uint4 refW;           // reference frame sizes per slot (0: none)
+    uint4 refH;
 };
 
 StructuredBuffer<uint2>   sections;   // bit start, bit end of each TOC entry, codestream order
@@ -116,7 +119,7 @@ void decodeGlobals(uint3 tid: SV_DispatchThreadID) {
     Dec d = makeDec(0, kGsHeaderSize, params.globalsCap);
     const uint window = windowFor(0);
     uint stage = 1;
-    decodeDcGlobal(d, window);
+    decodeDcGlobal(d, window, params.frameFlags, params.xsize, params.ysize, params.refW, params.refH);
     arena[kGsDcGlobalBits] = d.br.pos - sections[0].x;
     if (d.error == kErrNone && params.singleSection != 0) {
         stage = 2;
@@ -137,6 +140,7 @@ void decodeGlobals(uint3 tid: SV_DispatchThreadID) {
     }
     status[0] = d.error | (d.error != kErrNone ? (stage << 8) : 0);
     arena[kGsError] = d.error;
+    arena[kGsArenaTop] = d.top;
 }
 
 [shader("compute")]
@@ -199,7 +203,10 @@ void decodeModularGlobals(uint3 tid: SV_DispatchThreadID) {
     Dec d = makeDec(0, kGsHeaderSize, params.globalsCap);
     const uint window = windowFor(0);
     uint stage = 1;
-    decodeModularGlobal(d, modularGeom(), window);
+    if ((params.frameFlags & kFramePatches) != 0) {
+        readPatchDictionary(d, params.xsize, params.ysize, params.refW, params.refH, window);
+    }
+    if (d.error == kErrNone) decodeModularGlobal(d, modularGeom(), window);
     arena[kGsDcGlobalBits] = d.br.pos - sections[0].x;
     if (d.error == kErrNone && params.singleSection != 0) {
         // One section: DC group 0, (an empty AcGlobal), AC group 0 follow in the same bits.
@@ -215,6 +222,7 @@ void decodeModularGlobals(uint3 tid: SV_DispatchThreadID) {
     }
     status[0] = d.error | (d.error != kErrNone ? (stage << 8) : 0);
     arena[kGsError] = d.error;
+    arena[kGsArenaTop] = d.top;
 }
 
 [shader("compute")]

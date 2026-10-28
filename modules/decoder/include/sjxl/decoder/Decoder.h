@@ -6,8 +6,10 @@
 // (shaders/sjxl/dec). Features not implemented fail with Unsupported.
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -19,6 +21,12 @@
 #include "sjxl/image/Image.h"
 
 namespace sjxl::dec {
+
+/// A reference-only frame kept for the patches of a later frame: its XYB planes.
+struct RefFrame {
+    std::optional<gpu::Buffer> planes;   // 3 planes of paddedWidth * paddedHeight floats
+    uint32_t paddedWidth = 0, paddedHeight = 0, width = 0, height = 0;
+};
 
 struct Stats {
     uint32_t dcGlobalBits = 0;
@@ -37,12 +45,14 @@ public:
 
 private:
     Decoder() = default;
-    [[nodiscard]] Result<image::Rgb8> run(const codestream::Parsed& parsed, bool withLz77Windows);
+    /// One frame; a reference-only frame stores its planes in `refs` and returns an empty image.
+    [[nodiscard]] Result<image::Rgb8> run(const codestream::Parsed& parsed, const codestream::ParsedFrame& frame, bool withLz77Windows,
+                                          std::array<RefFrame, 4>& refs);
 
     std::shared_ptr<gpu::ShaderLibrary> library_;
     gpu::Device*                        device_ = nullptr;
     gpu::ComputeKernel globals_, dcGroups_, acGroups_, tables_, smoothDc_, computeSigma_, dequantCoeffs_, llfFromDc_, idctRows_, idctCols_, transformSpecial_,
-        gaborish_, epf_, output_, modularGlobals_, modularDcGroups_, modularAcGroups_, modularFinalize_, modularToPlanes_;
+        gaborish_, epf_, output_, modularGlobals_, modularDcGroups_, modularAcGroups_, modularFinalize_, modularToPlanes_, bucketPatches_, applyPatches_;
     Stats stats_;
 };
 

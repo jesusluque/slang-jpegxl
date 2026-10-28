@@ -165,3 +165,66 @@ TEST_CASE("the decoder matches djxl on cjxl's lossy modular output", "[decoder][
     WARN(std::format("{} e{} lossy modular: vs djxl PSNR {:.2f} dB, max diff {}", name, effort, metrics->psnr, metrics->maxAbsDiff));
     CHECK(metrics->maxAbsDiff <= 1);
 }
+
+namespace {
+
+/// A flat page of repeated glyph-like bitmaps: cjxl builds a patch dictionary for it.
+std::filesystem::path glyphPage() {
+    const std::filesystem::path path = test::scratchDir() / "glyph_page.ppm";
+    constexpr uint32_t w = 480, h = 320;
+    std::vector<uint8_t> rgb(static_cast<size_t>(w) * h * 3);
+    for (size_t i = 0; i < rgb.size(); i += 3) { rgb[i] = 235; rgb[i + 1] = 235; rgb[i + 2] = 230; }
+    uint32_t seed = 12345;
+    const auto rnd = [&]() { seed = seed * 1103515245u + 12345u; return (seed >> 16) & 0x7FFF; };
+    std::vector<std::vector<uint8_t>> glyphs(10, std::vector<uint8_t>(14 * 18));
+    for (auto& g : glyphs) for (auto& bit : g) bit = rnd() < 0x4000 ? 1 : 0;
+    for (uint32_t ty = 0; ty < 8; ++ty) {
+        for (uint32_t tx = 0; tx < 24; ++tx) {
+            const auto& g = glyphs[(tx * 3 + ty * 5) % 10];
+            for (uint32_t y = 0; y < 18; ++y) {
+                for (uint32_t x = 0; x < 14; ++x) {
+                    if (!g[y * 14 + x]) continue;
+                    const size_t at = (static_cast<size_t>(16 + ty * 36 + y) * w + 12 + tx * 19 + x) * 3;
+                    rgb[at] = 30; rgb[at + 1] = 30; rgb[at + 2] = 60;
+                }
+            }
+        }
+    }
+    std::string header = std::format("P6\n{} {}\n255\n", w, h);
+    std::vector<uint8_t> file(header.begin(), header.end());
+    file.insert(file.end(), rgb.begin(), rgb.end());
+    REQUIRE(image::writeFile(path, file));
+    return path;
+}
+
+}   // namespace
+
+TEST_CASE("the decoder applies cjxl's patches like djxl", "[decoder][conformance][cjxl][patches]") {
+    const std::filesystem::path djxl = test::findTool("djxl");
+    const std::filesystem::path cjxl = test::findTool("cjxl");
+    if (djxl.empty() || cjxl.empty()) SKIP("cjxl/djxl are not installed");
+    const std::filesystem::path page = glyphPage();
+    const std::string options = GENERATE(std::string("-d 1 -e 7"), std::string("-d 0 -e 7"), std::string("-m 1 -d 1 -e 7"));
+    CAPTURE(options);
+    const std::string tag = options == "-d 1 -e 7" ? "vardct" : options == "-d 0 -e 7" ? "lossless" : "modular";
+    const std::filesystem::path jxl = test::scratchDir() / std::format("dec_patches_{}.jxl", tag);
+    const std::filesystem::path png = test::scratchDir() / std::format("dec_patches_{}.djxl.png", tag);
+    REQUIRE(test::run(std::format("\"{}\" \"{}\" \"{}\" {} >/dev/null 2>&1", cjxl.string(), page.string(), jxl.string(), options)));
+    REQUIRE(test::run(std::format("\"{}\" \"{}\" \"{}\" >/dev/null 2>&1", djxl.string(), jxl.string(), png.string())));
+    auto bytes = image::readFile(jxl);
+    REQUIRE(bytes);
+    auto parsed = dec::Decoder::info(*bytes);
+    REQUIRE(parsed);
+    // The point of the test: a reference frame and a displayed frame with patches.
+    if (parsed->frames.size() != 2 || !(parsed->frame.header.flags & codestream::FrameHeader::kPatches)) {
+        WARN(std::format("cjxl {} did not use patches on the glyph page", options));
+    }
+    auto reference = image::readRgb8(png);
+    REQUIRE(reference);
+    auto ours = decoder().decode(*bytes);
+    REQUIRE(ours);
+    auto metrics = test::compare(*reference, *ours);
+    REQUIRE(metrics);
+    WARN(std::format("patches {}: {} frames, vs djxl PSNR {:.2f} dB, max diff {}", options, parsed->frames.size(), metrics->psnr, metrics->maxAbsDiff));
+    CHECK(metrics->maxAbsDiff <= (tag == "lossless" ? 0 : 1));
+}

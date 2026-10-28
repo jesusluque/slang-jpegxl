@@ -54,10 +54,10 @@ per subsystem or milestone, appended to as the work goes. Dates are absolute.
 - **M3 encoder quality**: inverse Gaborish + default LoopFilter, EPF sharpness,
   CfL per tile, adaptive quant field, DCT16/32 strategy search, context
   clustering (≤ 32, fixed-point costs as cujpegxl), ANS for AC.
-- **M4 decoder completeness**: patches, upsampling, splines/noise,
-  progressive passes, alpha and extra channels, >8-bit output, ICC,
-  animation, JPEG recompression. (64–256 px transforms, Modular frames with
-  RCT/palette/Squeeze, lossy modular: done.)
+- **M4 decoder completeness**: upsampling, splines/noise, progressive
+  passes, alpha and extra channels, >8-bit output, ICC, animation, JPEG
+  recompression. (64–256 px transforms, Modular frames with
+  RCT/palette/Squeeze, lossy modular, patches: done.)
 - **M5 platforms and speed**: Linux CUDA/Vulkan, async readback, batching,
   per-stage timings here.
 
@@ -257,3 +257,44 @@ transforms, patches (the reference-frame plumbing: parsing a second frame
 and keeping the first), the per-pixel finalise (RCT, palette and Squeeze run
 in one thread; fine at these sizes, kernels later: Squeeze is one thread
 per row or column).
+
+## Patches and multiple frames (2026-10-29)
+
+cjxl at effort ≥ 7 (and on repeated content at any effort) writes a
+reference-only Modular frame holding a dictionary of rectangles, then the
+displayed frame with the kPatches flag. Design:
+
+- **Parser**: `Parsed::frames` in codestream order; each frame's header, TOC
+  and sections are read, the next frame starts byte-aligned after the last
+  section. Reference-only frames must be Modular and saved before the colour
+  transform (that is what patches read); the displayed frame must be last.
+  `sjxl info in.jxl` prints the headers and the frame list.
+- **Reference frames** run through the same `run()` as any frame, at their own
+  size (`frameDim` from the frame header's size), and keep their XYB planes
+  (after their loop filters) in a `RefFrame` slot instead of producing pixels;
+  for a non-XYB image they hold the samples scaled to [0, 1], as libjxl's
+  `save_before_color_transform` frame does.
+- **Dictionary** (`frame.slangh readPatchDictionary`, first thing in
+  DcGlobal, before the DC dequant factors): 10 contexts, reference positions
+  (slot, origin, size) and positions (first absolute, then deltas with
+  UnpackSigned), one blending (mode, clamp) per position since there are no
+  extra channels; capacities 4096 reference positions and 65536 positions
+  (Unsupported beyond). The host passes the reference frame sizes for the
+  bounds checks.
+- **Application** (`patches.slang`, after EPF and before the colour transform,
+  as libjxl's render pipeline orders it): libjxl applies the positions
+  covering a pixel in dictionary order, and cjxl's additive patches do overlap,
+  so one thread per position raced (a lost update showed as a missing glyph,
+  diff ≈ 206). The kernel is one thread per *pixel* applying its covering
+  positions in order; a single-thread pass first buckets the positions by
+  32-row band (in the globals arena above `kGsArenaTop`) so a pixel scans only
+  the positions near it. Modes: replace, add, mul (with clamp); the alpha modes
+  degrade to replace/add as libjxl does without an alpha channel.
+
+Measured: the two cjxl matrix streams that needed this (effort 7, distance 3)
+are within 1 LSB; a generated glyph page (`[patches]` test: 25 reference
+rectangles, 808 positions) is within 1 LSB for VarDCT and lossy modular and
+bit-exact for lossless.
+
+Not done: extra channels and alpha blending in patches, splines, noise,
+animation/blending of several displayed frames, DC frames, upsampling.

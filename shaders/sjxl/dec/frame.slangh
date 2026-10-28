@@ -48,6 +48,15 @@ static const uint kGsQuantEncOff = 44;     // 17 * kQeWords
 static const uint kGsDcGlobalBits = 45;
 static const uint kGsAcGlobalBits = 46;
 static const uint kGsUsedAcs = 47;         // bit per strategy, ORed by DC groups
+// 48..55: modular frame fields (modframe.slangh)
+static const uint kGsPatchNumRef = 56;     // patch dictionary: reference positions (5 words: ref, x0, y0, w, h)
+static const uint kGsPatchRefOff = 57;
+static const uint kGsPatchNumPos = 58;     // positions (4 words: x, y, ref position index, blend mode | clamp << 8)
+static const uint kGsPatchPosOff = 59;
+static const uint kGsArenaTop = 60;        // first free arena word after the globals thread (for later kernels)
+static const uint kMaxPatchRefs = 4096;
+static const uint kMaxPatchPositions = 1u << 16;
+static const uint kPatchRefWords = 5, kPatchPosWords = 4;
 static const uint kGsHeaderSize = 64;
 
 static const uint kNumOrders = 13;
@@ -266,7 +275,73 @@ GlobalTree globalTree() {
 
 /// The whole DcGlobal section (no patches, splines or noise: the parser
 /// rejected those flags).
-void decodeDcGlobal(inout Dec d, uint windowOff) {
+/// PatchDictionary::Decode (no extra channels: one blending per position). The
+/// reference frame sizes come from the host, which decoded those frames first.
+void readPatchDictionary(inout Dec d, uint xsize, uint ysize, uint4 refW, uint4 refH, uint windowOff) {
+    const uint codeSet = decodeHistograms(d, 10, false, windowOff);
+    if (d.error != kErrNone) return;
+    SymReader r = makeSymReader(d, codeSet, windowOff, 0);
+    if (d.error != kErrNone) return;
+    const uint numRef = readHybridUint(d, r, 0);
+    const uint maxRefPatches = 1024 + xsize * ysize / 4;
+    if (numRef > maxRefPatches || numRef > kMaxPatchRefs) { fail(d, numRef > maxRefPatches ? kErrCorrupt : kErrUnsupported); return; }
+    const uint refOff = alloc(d, max(numRef, 1u) * kPatchRefWords);
+    const uint posOff = alloc(d, kMaxPatchPositions * kPatchPosWords);
+    if (d.error != kErrNone) return;
+    uint numPos = 0;
+    for (uint id = 0; id < numRef; ++id) {
+        const uint ref = readHybridUint(d, r, 1);
+        if (ref >= 4) { fail(d, kErrCorrupt); return; }
+        const uint rw = ref == 0 ? refW.x : ref == 1 ? refW.y : ref == 2 ? refW.z : refW.w;
+        const uint rh = ref == 0 ? refH.x : ref == 1 ? refH.y : ref == 2 ? refH.z : refH.w;
+        if (rw == 0) { fail(d, kErrCorrupt); return; }
+        const uint x0 = readHybridUint(d, r, 3);
+        const uint y0 = readHybridUint(d, r, 3);
+        const uint w = readHybridUint(d, r, 2) + 1;
+        const uint h = readHybridUint(d, r, 2) + 1;
+        if (x0 + w > rw || y0 + h > rh) { fail(d, kErrCorrupt); return; }
+        const uint ro = refOff + id * kPatchRefWords;
+        arena[ro + 0] = ref; arena[ro + 1] = x0; arena[ro + 2] = y0; arena[ro + 3] = w; arena[ro + 4] = h;
+        const uint count = readHybridUint(d, r, 7) + 1;
+        if (numPos + count > kMaxPatchPositions) { fail(d, kErrUnsupported); return; }
+        uint px = 0, py = 0;
+        for (uint i = 0; i < count; ++i) {
+            if (i == 0) {
+                px = readHybridUint(d, r, 4);
+                py = readHybridUint(d, r, 4);
+            } else {
+                const int dx = unpackSignedInt(readHybridUint(d, r, 6));
+                const int dy = unpackSignedInt(readHybridUint(d, r, 6));
+                if ((dx < 0 && uint(-dx) > px) || (dy < 0 && uint(-dy) > py)) { fail(d, kErrCorrupt); return; }
+                px = uint(int(px) + dx);
+                py = uint(int(py) + dy);
+            }
+            if (px + w > xsize || py + h > ysize) { fail(d, kErrCorrupt); return; }
+            const uint mode = readHybridUint(d, r, 5);
+            if (mode >= 8) { fail(d, kErrCorrupt); return; }
+            // Alpha channels are never chosen without extra channels; clamp is read for mul and the alpha modes.
+            uint clampBit = 0;
+            if (mode == 3 || mode >= 4) clampBit = readHybridUint(d, r, 9) != 0 ? 1u : 0u;
+            const uint po = posOff + numPos * kPatchPosWords;
+            arena[po + 0] = px; arena[po + 1] = py; arena[po + 2] = id; arena[po + 3] = mode | (clampBit << 8);
+            ++numPos;
+            if (d.error != kErrNone) return;
+        }
+    }
+    if (!checkFinalState(r)) { fail(d, kErrCorrupt); return; }
+    arena[kGsPatchNumRef] = numRef;
+    arena[kGsPatchRefOff] = refOff;
+    arena[kGsPatchNumPos] = numPos;
+    arena[kGsPatchPosOff] = posOff;
+}
+
+static const uint kFramePatches = 2;
+
+void decodeDcGlobal(inout Dec d, uint windowOff, uint frameFlags, uint xsize, uint ysize, uint4 refW, uint4 refH) {
+    if ((frameFlags & kFramePatches) != 0) {
+        readPatchDictionary(d, xsize, ysize, refW, refH, windowOff);
+        if (d.error != kErrNone) return;
+    }
     readDequantDc(d);
     if (d.error != kErrNone) return;
     readQuantizer(d);

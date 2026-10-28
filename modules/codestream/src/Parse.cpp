@@ -1,6 +1,7 @@
 // Copyright (c) 2026 jesus luque.
 #include "sjxl/codestream/Parse.h"
 
+#include <array>
 #include <format>
 #include <cmath>
 #include <cstring>
@@ -447,56 +448,74 @@ Result<Parsed> parse(std::span<const uint8_t> file) {
         return unsupported("transfer functions other than sRGB, linear, gamma and DCI (PQ/HLG/709)");
     }
 
-    br.jumpToByteBoundary();
-    ParsedFrame& frame = p.frame;
-    frame.frameHeaderBit = br.bitPosition();
-    SJXL_TRY(readFrameHeader(br, m, frame.header));
-    if (!br.withinBounds()) return corrupt("truncated frame header");
-    const FrameHeader& f = frame.header;
-    if (f.isModular) {
-        if (f.frameType != 0) {
-            return unsupported(std::format("Modular frames of type {} ({}{}, size {}x{}; patches)", f.frameType, f.isLast ? "last" : "not last",
-                                           f.saveAsReference != 0 ? ", saved as reference" : "", f.customSizeOrOrigin ? f.frameXsize : m.xsize,
-                                           f.customSizeOrOrigin ? f.frameYsize : m.ysize));
+    // Frames: reference-only Modular frames (patch dictionaries) may precede the
+    // displayed frame; each starts byte-aligned after the previous one's sections.
+    std::array<bool, 4> referenceSaved{};
+    size_t frameStartByte = (br.bitPosition() + 7) / 8;
+    for (uint32_t frameIndex = 0;; ++frameIndex) {
+        if (frameIndex >= 16) return unsupported("more than 16 frames");
+        if (frameStartByte >= p.codestream.size()) return corrupt("codestream ends before the last frame");
+        BitReader fr(p.codestream, frameStartByte * 8);
+        ParsedFrame frame;
+        frame.frameHeaderBit = fr.bitPosition();
+        SJXL_TRY(readFrameHeader(fr, m, frame.header));
+        if (!fr.withinBounds()) return corrupt("truncated frame header");
+        const FrameHeader& f = frame.header;
+        const bool referenceOnly = f.frameType == 2;
+        if (f.isModular) {
+            if (f.frameType != 0 && !referenceOnly) return unsupported(std::format("Modular frames of type {}", f.frameType));
+            if (f.colorTransform == 2) return unsupported("Modular frames in YCbCr");
+            if (m.colorSpace != 0 && m.colorSpace != 1) return unsupported("Modular frames in a colour space other than RGB or grey");
+            if (m.floatingPointSample) return unsupported("floating point samples");
+        } else {
+            if (!m.xybEncoded || f.colorTransform != 0) return unsupported("VarDCT frames not encoded in XYB");
+            if (referenceOnly) return unsupported("VarDCT reference-only frames");
         }
-        if (f.colorTransform == 2) return unsupported("Modular frames in YCbCr");
-        if (m.colorSpace != 0 && m.colorSpace != 1) return unsupported("Modular frames in a colour space other than RGB or grey");
-        if (m.floatingPointSample) return unsupported("floating point samples");
-    } else {
-        if (!m.xybEncoded || f.colorTransform != 0) return unsupported("VarDCT frames not encoded in XYB");
+        if (f.frameType == 1 || f.frameType == 3) return unsupported("DC or skip-progressive frames");
+        if (f.flags & FrameHeader::kNoise) return unsupported("noise synthesis");
+        if (f.flags & FrameHeader::kSplines) return unsupported("splines");
+        if (f.flags & FrameHeader::kUseDcFrame) return unsupported("DC frames");
+        if (f.upsampling != 1) return unsupported("upsampling");
+        if (f.numPasses != 1) return unsupported("progressive passes");
+        if (f.customSizeOrOrigin && !referenceOnly) return unsupported("frames with a custom size or origin");
+        if (referenceOnly) {
+            if (!f.saveBeforeColorTransform) return unsupported("reference frames saved after the colour transform");
+            if (f.saveAsReference >= 4) return corrupt("reference slot");
+            referenceSaved[f.saveAsReference] = true;
+        } else if (!f.isLast) {
+            return unsupported("multiple displayed frames (animation or blending)");
+        }
+        if ((f.flags & FrameHeader::kPatches) && !referenceSaved[0] && !referenceSaved[1] && !referenceSaved[2] && !referenceSaved[3]) {
+            return corrupt("patches without a reference frame");
+        }
+        const uint32_t fx = f.customSizeOrOrigin ? f.frameXsize : m.xsize;
+        const uint32_t fy = f.customSizeOrOrigin ? f.frameYsize : m.ysize;
+        frame.dim = frameDim(fx, fy, f.groupSizeShift);
+        const uint32_t numEntries = frame.dim.singleSection() ? 1 : frame.dim.numSections();
+        frame.singleSection = frame.dim.singleSection();
+        // TOC
+        if (fr.readBool()) {
+            return unsupported("TOC permutation (entropy coded; decoded on the device in a later milestone)");
+        }
+        fr.jumpToByteBoundary();
+        std::vector<uint32_t> sizes(numEntries);
+        for (uint32_t& sz : sizes) sz = fr.readU32(kTocDist);
+        fr.jumpToByteBoundary();
+        if (!fr.withinBounds()) return corrupt("truncated TOC");
+        frame.tocEndBit = fr.bitPosition();
+        size_t offset = frame.tocEndBit / 8;
+        frame.sections.resize(numEntries);
+        for (uint32_t i = 0; i < numEntries; ++i) {
+            frame.sections[i].byteOffset = offset;
+            frame.sections[i].byteSize = sizes[i];
+            offset += sizes[i];
+        }
+        if (offset > p.codestream.size()) return corrupt("sections past the end of the codestream");
+        p.frames.push_back(std::move(frame));
+        if (!referenceOnly) break;
+        frameStartByte = offset;
     }
-    if (f.frameType != 0) return unsupported("DC, reference-only or skip-progressive frames");
-    if (f.flags & FrameHeader::kNoise) return unsupported("noise synthesis");
-    if (f.flags & FrameHeader::kPatches) return unsupported("patches");
-    if (f.flags & FrameHeader::kSplines) return unsupported("splines");
-    if (f.flags & FrameHeader::kUseDcFrame) return unsupported("DC frames");
-    if (f.upsampling != 1) return unsupported("upsampling");
-    if (f.numPasses != 1) return unsupported("progressive passes");
-    if (f.customSizeOrOrigin) return unsupported("frames with a custom size or origin");
-    if (!f.isLast) return unsupported("multiple frames");
-
-    frame.dim = frameDim(m.xsize, m.ysize, f.groupSizeShift);
-    const uint32_t numEntries = frame.dim.singleSection() ? 1 : frame.dim.numSections();
-    frame.singleSection = frame.dim.singleSection();
-    // TOC
-    std::vector<uint32_t> permutation;
-    if (br.readBool()) {
-        return unsupported("TOC permutation (entropy coded; decoded on the device in a later milestone)");
-    }
-    br.jumpToByteBoundary();
-    std::vector<uint32_t> sizes(numEntries);
-    for (uint32_t& s : sizes) s = br.readU32(kTocDist);
-    br.jumpToByteBoundary();
-    if (!br.withinBounds()) return corrupt("truncated TOC");
-    frame.tocEndBit = br.bitPosition();
-    size_t offset = frame.tocEndBit / 8;
-    frame.sections.resize(numEntries);
-    for (uint32_t i = 0; i < numEntries; ++i) {
-        frame.sections[i].byteOffset = offset;
-        frame.sections[i].byteSize = sizes[i];
-        offset += sizes[i];
-    }
-    if (offset > p.codestream.size()) return corrupt("sections past the end of the codestream");
+    p.frame = p.frames.back();
     return p;
 }
 
