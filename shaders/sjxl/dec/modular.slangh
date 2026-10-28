@@ -1,0 +1,758 @@
+// Copyright (c) 2026 jesus luque.
+//
+// Modular image decoding for one thread: GroupHeader, MA trees, the fourteen
+// predictors and the weighted predictor, the inverse RCT and palette
+// transforms. A port of libjxl's modular/encoding/{encoding.cc, dec_ma.cc,
+// context_predict.h} and modular/transform/{rct,palette}.cc, in the general
+// (tree lookup per pixel) form; libjxl's fast tracks are optimisations of it.
+//
+// Requires entropy.slangh (and its `cs`/`arena` globals) included first.
+//
+// Channels live in the arena: a descriptor array of kChanWords words per
+// channel (w, h, hshift, vshift, dataOff) and w*h ints at dataOff.
+#pragma once
+
+static const uint kChanWords = 8;
+static const uint kChanW = 0;
+static const uint kChanH = 1;
+static const uint kChanHShift = 2;
+static const uint kChanVShift = 3;
+static const uint kChanData = 4;
+static const uint kMaxChannels = 24;
+
+static const uint kTreeWords = 8;   // property(int, -1 leaf), splitval, lchild, rchild, predictor, offset, multiplier, leaf id
+static const uint kMaxTreeNodes = 8192;
+
+static const uint kNumStaticProperties = 2;
+static const uint kNumNonrefProperties = kNumStaticProperties + 13 + 1;   // 16
+static const uint kWpProp = kNumNonrefProperties - 1;                      // 15
+static const uint kMaxProperties = kNumNonrefProperties + 4 * kMaxChannels;
+
+static const uint kPredZero = 0, kPredLeft = 1, kPredTop = 2, kPredAverage0 = 3, kPredSelect = 4, kPredGradient = 5,
+                  kPredWeighted = 6, kPredTopRight = 7, kPredTopLeft = 8, kPredLeftLeft = 9, kPredAverage1 = 10,
+                  kPredAverage2 = 11, kPredAverage3 = 12, kPredAverage4 = 13;
+
+struct Channel {
+    uint w, h;
+    int hshift, vshift;
+    uint data;   // arena offset
+};
+
+Channel loadChannel(uint chansOff, uint i) {
+    Channel c;
+    const uint o = chansOff + i * kChanWords;
+    c.w = arena[o + kChanW];
+    c.h = arena[o + kChanH];
+    c.hshift = int(arena[o + kChanHShift]);
+    c.vshift = int(arena[o + kChanVShift]);
+    c.data = arena[o + kChanData];
+    return c;
+}
+
+void storeChannel(uint chansOff, uint i, Channel c) {
+    const uint o = chansOff + i * kChanWords;
+    arena[o + kChanW] = c.w;
+    arena[o + kChanH] = c.h;
+    arena[o + kChanHShift] = uint(c.hshift);
+    arena[o + kChanVShift] = uint(c.vshift);
+    arena[o + kChanData] = c.data;
+}
+
+/// A channel with zeroed storage.
+Channel newChannel(inout Dec d, uint w, uint h, int hshift, int vshift) {
+    Channel c;
+    c.w = w;
+    c.h = h;
+    c.hshift = hshift;
+    c.vshift = vshift;
+    c.data = alloc(d, max(w * h, 1u));
+    for (uint i = 0; i < w * h; ++i) arena[c.data + i] = 0;
+    return c;
+}
+
+int px(Channel c, uint x, uint y) { return int(arena[c.data + y * c.w + x]); }
+void setPx(Channel c, uint x, uint y, int v) { arena[c.data + y * c.w + x] = uint(v); }
+
+// --- weighted predictor header and state -----------------------------------------------
+
+struct WpHeader {
+    int p1C, p2C, p3Ca, p3Cb, p3Cc, p3Cd, p3Ce;
+    uint w0, w1, w2, w3;
+};
+
+WpHeader defaultWpHeader() {
+    WpHeader h;
+    h.p1C = 16; h.p2C = 10; h.p3Ca = 7; h.p3Cb = 7; h.p3Cc = 7; h.p3Cd = 0; h.p3Ce = 0;
+    h.w0 = 0xd; h.w1 = 0xc; h.w2 = 0xc; h.w3 = 0xc;
+    return h;
+}
+
+WpHeader readWpHeader(inout Dec d) {
+    WpHeader h = defaultWpHeader();
+    if (brRead(d.br, 1) != 0) return h;   // all_default
+    h.p1C = int(brRead(d.br, 5));
+    h.p2C = int(brRead(d.br, 5));
+    h.p3Ca = int(brRead(d.br, 5));
+    h.p3Cb = int(brRead(d.br, 5));
+    h.p3Cc = int(brRead(d.br, 5));
+    h.p3Cd = int(brRead(d.br, 5));
+    h.p3Ce = int(brRead(d.br, 5));
+    h.w0 = brRead(d.br, 4);
+    h.w1 = brRead(d.br, 4);
+    h.w2 = brRead(d.br, 4);
+    h.w3 = brRead(d.br, 4);
+    return h;
+}
+
+static const uint kWpDivLookup[64] = {
+    16777216, 8388608, 5592405, 4194304, 3355443, 2796202, 2396745, 2097152, 1864135, 1677721, 1525201, 1398101, 1290555,
+    1198372, 1118481, 1048576, 986895, 932067, 883011, 838860, 798915, 762600, 729444, 699050, 671088, 645277, 621378,
+    599186, 578524, 559240, 541200, 524288, 508400, 493447, 479349, 466033, 453438, 441505, 430185, 419430, 409200,
+    399457, 390167, 381300, 372827, 364722, 356962, 349525, 342392, 335544, 328965, 322638, 316551, 310689, 305040,
+    299593, 294337, 289262, 284359, 279620, 275036, 270600, 266305, 262144};
+
+static const int kWpExtraBits = 3;
+static const int64_t kWpRound = ((1 << kWpExtraBits) >> 1) - 1;
+
+/// weighted::State: four prediction error rows and the error row, in the arena.
+struct WpState {
+    WpHeader header;
+    uint xsize;
+    uint predErrors;   // 4 * (xsize + 2) * 2 uints
+    uint error;        // (xsize + 2) * 2 ints
+    int64_t prediction[4];
+    int64_t pred;
+};
+
+WpState wpCreate(inout Dec d, WpHeader header, uint xsize) {
+    WpState s;
+    s.header = header;
+    s.xsize = xsize;
+    const uint rowLen = (xsize + 2) * 2;
+    s.predErrors = alloc(d, 4 * rowLen);
+    s.error = alloc(d, rowLen);
+    for (uint i = 0; i < 4 * rowLen; ++i) arena[s.predErrors + i] = 0;
+    for (uint i = 0; i < rowLen; ++i) arena[s.error + i] = 0;
+    s.prediction[0] = s.prediction[1] = s.prediction[2] = s.prediction[3] = 0;
+    s.pred = 0;
+    return s;
+}
+
+uint wpErrorWeight(uint64_t x, uint maxweight) {
+    int shift = int(firstbithigh(uint(min(x + 1, uint64_t(0xFFFFFFFFu))))) - 5;
+    if (shift < 0) shift = 0;
+    return 4 + uint((uint64_t(maxweight) * uint64_t(kWpDivLookup[uint(x >> shift)])) >> shift);
+}
+
+int64_t wpWeightedAverage(int64_t p[4], uint w[4]) {
+    uint weightSum = 0;
+    for (uint i = 0; i < 4; ++i) weightSum += w[i];
+    const uint logWeight = firstbithigh(weightSum);
+    weightSum = 0;
+    for (uint i = 0; i < 4; ++i) {
+        w[i] >>= (logWeight - 4);
+        weightSum += w[i];
+    }
+    int64_t sum = int64_t(weightSum >> 1) - 1;
+    for (uint i = 0; i < 4; ++i) sum += p[i] * int64_t(w[i]);
+    return (sum * int64_t(kWpDivLookup[weightSum - 1])) >> 24;
+}
+
+int64_t wpAddBits(int64_t x) { return x << kWpExtraBits; }
+
+/// Predict<compute_properties=true>: the prediction, and the WP property.
+int64_t wpPredict(inout WpState s, uint x, uint y, int64_t N, int64_t W, int64_t NE, int64_t NW, int64_t NN, out int wpProp) {
+    const uint xsize = s.xsize;
+    const uint curRow = (y & 1) != 0 ? 0 : (xsize + 2);
+    const uint prevRow = (y & 1) != 0 ? (xsize + 2) : 0;
+    const uint posN = prevRow + x;
+    const uint posNE = x < xsize - 1 ? posN + 1 : posN;
+    const uint posNW = x > 0 ? posN - 1 : posN;
+    const uint rowLen = (xsize + 2) * 2;
+    uint weights[4];
+    const uint hw[4] = {s.header.w0, s.header.w1, s.header.w2, s.header.w3};
+    for (uint i = 0; i < 4; ++i) {
+        const uint64_t sum = uint64_t(arena[s.predErrors + i * rowLen + posN]) + uint64_t(arena[s.predErrors + i * rowLen + posNE]) +
+                             uint64_t(arena[s.predErrors + i * rowLen + posNW]);
+        weights[i] = wpErrorWeight(sum, hw[i]);
+    }
+    N = wpAddBits(N);
+    W = wpAddBits(W);
+    NE = wpAddBits(NE);
+    NW = wpAddBits(NW);
+    NN = wpAddBits(NN);
+    const int64_t teW = x == 0 ? 0 : int64_t(int(arena[s.error + curRow + x - 1]));
+    const int64_t teN = int64_t(int(arena[s.error + posN]));
+    const int64_t teNW = int64_t(int(arena[s.error + posNW]));
+    const int64_t sumWN = teN + teW;
+    const int64_t teNE = int64_t(int(arena[s.error + posNE]));
+    {
+        int64_t p = teW;
+        if (abs(teN) > abs(p)) p = teN;
+        if (abs(teNW) > abs(p)) p = teNW;
+        if (abs(teNE) > abs(p)) p = teNE;
+        wpProp = int(p);
+    }
+    s.prediction[0] = W + NE - N;
+    s.prediction[1] = N - (((sumWN + teNE) * int64_t(s.header.p1C)) >> 5);
+    s.prediction[2] = W - (((sumWN + teNW) * int64_t(s.header.p2C)) >> 5);
+    s.prediction[3] = N - ((teNW * int64_t(s.header.p3Ca) + teN * int64_t(s.header.p3Cb) + teNE * int64_t(s.header.p3Cc) +
+                            (NN - N) * int64_t(s.header.p3Cd) + (NW - W) * int64_t(s.header.p3Ce)) >> 5);
+    s.pred = wpWeightedAverage(s.prediction, weights);
+    if (((teN ^ teW) | (teN ^ teNW)) > 0) {
+        return (s.pred + kWpRound) >> kWpExtraBits;
+    }
+    const int64_t mx = max(W, max(NE, N));
+    const int64_t mn = min(W, min(NE, N));
+    s.pred = max(mn, min(mx, s.pred));
+    return (s.pred + kWpRound) >> kWpExtraBits;
+}
+
+void wpUpdateErrors(inout WpState s, int64_t val, uint x, uint y) {
+    const uint xsize = s.xsize;
+    const uint curRow = (y & 1) != 0 ? 0 : (xsize + 2);
+    const uint prevRow = (y & 1) != 0 ? (xsize + 2) : 0;
+    const uint rowLen = (xsize + 2) * 2;
+    val = wpAddBits(val);
+    arena[s.error + curRow + x] = uint(int(s.pred - val));
+    for (uint i = 0; i < 4; ++i) {
+        const uint err = uint((abs(s.prediction[i] - val) + kWpRound) >> kWpExtraBits);
+        arena[s.predErrors + i * rowLen + curRow + x] = err;
+        arena[s.predErrors + i * rowLen + prevRow + x + 1] += err;
+    }
+}
+
+// --- predictors ------------------------------------------------------------------------
+
+int clampedGradient(int n, int w, int l) {
+    const int m = min(n, w);
+    const int M = max(n, w);
+    const int grad = int(uint(n) + uint(w) - uint(l));
+    const int gradClampM = (l < m) ? M : grad;
+    return (l > M) ? m : gradClampM;
+}
+
+int64_t selectPredictor(int64_t a, int64_t b, int64_t c) {
+    const int64_t p = a + b - c;
+    const int64_t pa = abs(p - a);
+    const int64_t pb = abs(p - b);
+    return pa < pb ? a : b;
+}
+
+int64_t predictOne(uint p, int64_t left, int64_t top, int64_t toptop, int64_t topleft, int64_t topright, int64_t leftleft,
+                   int64_t toprightright, int64_t wpPred) {
+    switch (p) {
+    case kPredZero: return 0;
+    case kPredLeft: return left;
+    case kPredTop: return top;
+    case kPredSelect: return selectPredictor(left, top, topleft);
+    case kPredWeighted: return wpPred;
+    case kPredGradient: return int64_t(clampedGradient(int(left), int(top), int(topleft)));
+    case kPredTopLeft: return topleft;
+    case kPredTopRight: return topright;
+    case kPredLeftLeft: return leftleft;
+    case kPredAverage0: return (left + top) / 2;
+    case kPredAverage1: return (left + topleft) / 2;
+    case kPredAverage2: return (topleft + top) / 2;
+    case kPredAverage3: return (top + topright) / 2;
+    case kPredAverage4: return (6 * top - 2 * toptop + 7 * left + 1 * leftleft + 1 * toprightright + 3 * topright + 8) / 16;
+    default: return 0;
+    }
+}
+
+// --- MA tree --------------------------------------------------------------------------
+
+struct Tree {
+    uint nodes;      // arena offset
+    uint numNodes;
+    uint numLeaves;
+    uint codeSet;    // the data histograms (one context per leaf)
+    bool usesWp;     // some leaf predicts Weighted or some node splits on the WP property
+};
+
+/// DecodeTree: its own histograms over 6 contexts, then the nodes.
+Tree decodeTree(inout Dec d, uint windowOff) {
+    Tree t;
+    t.numNodes = 0;
+    t.numLeaves = 0;
+    t.usesWp = false;
+    t.codeSet = 0;
+    const uint treeCode = decodeHistograms(d, 6, false, windowOff);
+    t.nodes = alloc(d, kMaxTreeNodes * kTreeWords);
+    if (d.error != kErrNone) return t;
+    SymReader r = makeSymReader(d, treeCode, windowOff, 0);
+    uint toDecode = 1;
+    uint leafId = 0;
+    while (toDecode > 0 && d.error == kErrNone) {
+        if (t.numNodes >= kMaxTreeNodes) { fail(d, kErrArena); return t; }
+        --toDecode;
+        const uint prop1 = readHybridUint(d, r, 1);
+        if (prop1 > 256) { fail(d, kErrCorrupt); return t; }
+        const uint n = t.nodes + t.numNodes * kTreeWords;
+        if (prop1 == 0) {
+            const uint predictor = readHybridUint(d, r, 2);
+            if (predictor >= 14) { fail(d, kErrCorrupt); return t; }
+            const int offset = unpackSignedInt(readHybridUint(d, r, 3));
+            const uint mulLog = readHybridUint(d, r, 4);
+            if (mulLog >= 31) { fail(d, kErrCorrupt); return t; }
+            const uint mulBits = readHybridUint(d, r, 5);
+            if (mulBits >= (1u << (31u - mulLog)) - 1u) { fail(d, kErrCorrupt); return t; }
+            arena[n + 0] = uint(-1);
+            arena[n + 1] = 0;
+            arena[n + 2] = leafId;
+            arena[n + 3] = 0;
+            arena[n + 4] = predictor;
+            arena[n + 5] = uint(offset);
+            arena[n + 6] = (mulBits + 1) << mulLog;
+            arena[n + 7] = leafId;
+            if (predictor == kPredWeighted) t.usesWp = true;
+            ++leafId;
+            ++t.numNodes;
+            continue;
+        }
+        const int splitval = unpackSignedInt(readHybridUint(d, r, 0));
+        arena[n + 0] = prop1 - 1;
+        arena[n + 1] = uint(splitval);
+        arena[n + 2] = t.numNodes + toDecode + 1;
+        arena[n + 3] = t.numNodes + toDecode + 2;
+        arena[n + 4] = kPredZero;
+        arena[n + 5] = 0;
+        arena[n + 6] = 1;
+        arena[n + 7] = 0;
+        if (prop1 - 1 == kWpProp) t.usesWp = true;
+        ++t.numNodes;
+        toDecode += 2;
+    }
+    t.numLeaves = leafId;
+    if (!checkFinalState(r)) fail(d, kErrCorrupt);
+    return t;
+}
+
+// --- transforms (fields) -------------------------------------------------------------
+
+static const uint kTransformWords = 12;
+static const uint kTrId = 0, kTrBeginC = 1, kTrRctType = 2, kTrNumC = 3, kTrNbColors = 4, kTrNbDeltas = 5, kTrPredictor = 6;
+static const uint kTrRct = 0, kTrPalette = 1, kTrSqueeze = 2;
+
+/// Transform::VisitFields. Squeeze parameters are not read (reported Unsupported).
+void readTransform(inout Dec d, uint off) {
+    const uint id = brU32(d.br, distrVal(0), distrVal(1), distrVal(2), distrVal(3));
+    arena[off + kTrId] = id;
+    if (id == 3) { fail(d, kErrCorrupt); return; }
+    if (id == kTrRct || id == kTrPalette) {
+        arena[off + kTrBeginC] = brU32(d.br, distrBitsOffset(3, 0), distrBitsOffset(6, 8), distrBitsOffset(10, 72), distrBitsOffset(13, 1096));
+    }
+    if (id == kTrRct) {
+        arena[off + kTrRctType] = brU32(d.br, distrVal(6), distrBitsOffset(2, 0), distrBitsOffset(4, 2), distrBitsOffset(6, 10));
+        if (arena[off + kTrRctType] >= 42) fail(d, kErrCorrupt);
+    }
+    if (id == kTrPalette) {
+        arena[off + kTrNumC] = brU32(d.br, distrVal(1), distrVal(3), distrVal(4), distrBitsOffset(13, 1));
+        arena[off + kTrNbColors] = brU32(d.br, distrBitsOffset(8, 0), distrBitsOffset(10, 256), distrBitsOffset(12, 1280), distrBitsOffset(16, 5376));
+        arena[off + kTrNbDeltas] = brU32(d.br, distrVal(0), distrBitsOffset(8, 1), distrBitsOffset(10, 257), distrBitsOffset(16, 1281));
+        arena[off + kTrPredictor] = brRead(d.br, 4);
+        if (arena[off + kTrPredictor] >= 14) fail(d, kErrCorrupt);
+    }
+    if (id == kTrSqueeze) {
+        fail(d, kErrUnsupported);   // modular transform Squeeze (M4)
+    }
+}
+
+/// The channel list after MetaApply of a transform.
+void metaApply(inout Dec d, uint off, uint chansOff, inout uint numChannels, inout uint nbMeta) {
+    const uint id = arena[off + kTrId];
+    if (id == kTrRct) {
+        const uint b = arena[off + kTrBeginC];
+        if (b + 2 >= numChannels) { fail(d, kErrCorrupt); return; }
+        const Channel c0 = loadChannel(chansOff, b);
+        for (uint i = 1; i < 3; ++i) {
+            const Channel ci = loadChannel(chansOff, b + i);
+            if (ci.w != c0.w || ci.h != c0.h || ci.hshift != c0.hshift || ci.vshift != c0.vshift) { fail(d, kErrCorrupt); return; }
+        }
+        return;
+    }
+    if (id == kTrPalette) {
+        const uint beginC = arena[off + kTrBeginC];
+        const uint numC = arena[off + kTrNumC];
+        const uint endC = beginC + numC - 1;
+        if (endC >= numChannels || numChannels + 1 > kMaxChannels) { fail(d, kErrCorrupt); return; }
+        const Channel c0 = loadChannel(chansOff, beginC);
+        for (uint i = beginC + 1; i <= endC; ++i) {
+            const Channel ci = loadChannel(chansOff, i);
+            if (ci.w != c0.w || ci.h != c0.h || ci.hshift != c0.hshift || ci.vshift != c0.vshift) { fail(d, kErrCorrupt); return; }
+        }
+        if (beginC >= nbMeta) {
+            nbMeta += 1;
+        } else {
+            if (endC >= nbMeta) { fail(d, kErrCorrupt); return; }
+            nbMeta += 2 - numC;
+        }
+        // Erase channels beginC+1 .. endC.
+        const uint erased = endC - beginC;
+        for (uint i = beginC + 1; i + erased < numChannels; ++i) {
+            storeChannel(chansOff, i, loadChannel(chansOff, i + erased));
+        }
+        numChannels -= erased;
+        // Insert the palette channel (nb_colors + nb_deltas) x numC at 0.
+        for (uint i = numChannels; i > 0; --i) {
+            storeChannel(chansOff, i, loadChannel(chansOff, i - 1));
+        }
+        const Channel pal = newChannel(d, arena[off + kTrNbColors] + arena[off + kTrNbDeltas], numC, -1, -1);
+        storeChannel(chansOff, 0, pal);
+        ++numChannels;
+    }
+}
+
+// --- channel decoding ------------------------------------------------------------------
+
+struct ChannelDecodeArgs {
+    uint chansOff;
+    uint numChannels;
+    uint chan;
+    uint streamId;
+};
+
+/// DecodeModularChannelMAANS in its general form.
+void decodeChannel(inout Dec d, inout SymReader r, Tree tree, WpHeader wpHeader, ChannelDecodeArgs a) {
+    const Channel ch = loadChannel(a.chansOff, a.chan);
+    if (ch.w == 0 || ch.h == 0) return;
+    const uint ctxMapOff = csField(tree.codeSet, kCsCtxMapOff);
+    // Reference channels: earlier ones with the same shape, nearest first.
+    uint refs[kMaxChannels];
+    uint numRefs = 0;
+    for (int j = int(a.chan) - 1; j >= 0; --j) {
+        const Channel cj = loadChannel(a.chansOff, uint(j));
+        if (cj.w == ch.w && cj.h == ch.h && cj.hshift == ch.hshift && cj.vshift == ch.vshift) {
+            refs[numRefs++] = uint(j);
+        }
+    }
+    // Which properties the tree reads, so the per-pixel work is only what it needs.
+    uint maxProp = 0;
+    for (uint n = 0; n < tree.numNodes; ++n) {
+        const int p = int(arena[tree.nodes + n * kTreeWords]);
+        if (p >= 0) maxProp = max(maxProp, uint(p) + 1);
+    }
+    const bool singleLeaf = tree.numNodes == 1;
+    WpState wp;
+    if (tree.usesWp) {
+        wp = wpCreate(d, wpHeader, ch.w);
+        if (d.error != kErrNone) return;
+    }
+    const uint propsOff = alloc(d, kMaxProperties);
+    if (d.error != kErrNone) return;
+    arena[propsOff + 0] = a.chan;
+    arena[propsOff + 1] = a.streamId;
+    for (uint y = 0; y < ch.h; ++y) {
+        arena[propsOff + 2] = y;
+        arena[propsOff + 9] = 0;
+        for (uint x = 0; x < ch.w; ++x) {
+            const int left = x > 0 ? px(ch, x - 1, y) : (y > 0 ? px(ch, x, y - 1) : 0);
+            const int top = y > 0 ? px(ch, x, y - 1) : left;
+            const int topleft = (x > 0 && y > 0) ? px(ch, x - 1, y - 1) : left;
+            const int topright = (x + 1 < ch.w && y > 0) ? px(ch, x + 1, y - 1) : top;
+            const int leftleft = x > 1 ? px(ch, x - 2, y) : left;
+            const int toptop = y > 1 ? px(ch, x, y - 2) : top;
+            const int toprightright = (x + 2 < ch.w && y > 0) ? px(ch, x + 2, y - 1) : topright;
+            if (!singleLeaf) {
+                arena[propsOff + 3] = x;
+                arena[propsOff + 4] = uint(abs(top));
+                arena[propsOff + 5] = uint(abs(left));
+                arena[propsOff + 6] = uint(top);
+                arena[propsOff + 7] = uint(left);
+                arena[propsOff + 8] = uint(left - int(arena[propsOff + 9]));
+                arena[propsOff + 9] = uint(left + top - topleft);
+                arena[propsOff + 10] = uint(left - topleft);
+                arena[propsOff + 11] = uint(topleft - top);
+                arena[propsOff + 12] = uint(top - topright);
+                arena[propsOff + 13] = uint(top - toptop);
+                arena[propsOff + 14] = uint(left - leftleft);
+            }
+            int64_t wpPred = 0;
+            if (tree.usesWp) {
+                int wpProp;
+                wpPred = wpPredict(wp, x, y, int64_t(top), int64_t(left), int64_t(topright), int64_t(topleft), int64_t(toptop), wpProp);
+                arena[propsOff + 15] = uint(wpProp);
+            }
+            if (!singleLeaf && maxProp > kNumNonrefProperties) {
+                uint off = kNumNonrefProperties;
+                for (uint k = 0; k < numRefs && off + 4 <= kMaxProperties; ++k) {
+                    const Channel cj = loadChannel(a.chansOff, refs[k]);
+                    const int v = px(cj, x, y);
+                    const int vleft = x > 0 ? px(cj, x - 1, y) : 0;
+                    const int vtop = y > 0 ? px(cj, x, y - 1) : vleft;
+                    const int vtopleft = (x > 0 && y > 0) ? px(cj, x - 1, y - 1) : vleft;
+                    const int vpred = clampedGradient(vleft, vtop, vtopleft);
+                    arena[propsOff + off + 0] = uint(abs(v));
+                    arena[propsOff + off + 1] = uint(v);
+                    arena[propsOff + off + 2] = uint(abs(v - vpred));
+                    arena[propsOff + off + 3] = uint(v - vpred);
+                    off += 4;
+                }
+            }
+            // Tree walk: property > splitval takes the left child.
+            uint node = 0;
+            for (;;) {
+                const uint n = tree.nodes + node * kTreeWords;
+                const int p = int(arena[n]);
+                if (p < 0) break;
+                const int v = uint(p) < kMaxProperties ? int(arena[propsOff + uint(p)]) : 0;
+                node = v > int(arena[n + 1]) ? arena[n + 2] : arena[n + 3];
+            }
+            const uint n = tree.nodes + node * kTreeWords;
+            const uint predictor = arena[n + 4];
+            const int offset = int(arena[n + 5]);
+            const int multiplier = int(arena[n + 6]);
+            const uint ctx = arena[n + 7];
+            const int64_t guess = int64_t(offset) + predictOne(predictor, int64_t(left), int64_t(top), int64_t(toptop), int64_t(topleft),
+                                                               int64_t(topright), int64_t(leftleft), int64_t(toprightright), wpPred);
+            const uint token = readHybridUint(d, r, ctx);
+            const int64_t value = int64_t(unpackSignedInt(token)) * int64_t(multiplier) + guess;
+            setPx(ch, x, y, int(value));
+            if (tree.usesWp) wpUpdateErrors(wp, value, x, y);
+            if (d.error != kErrNone) return;
+        }
+    }
+}
+
+// --- inverse transforms ----------------------------------------------------------------
+
+int pixelAdd(int a, int b) { return int(uint(a) + uint(b)); }
+
+void invRct(inout Dec d, uint off, uint chansOff) {
+    const uint m = arena[off + kTrBeginC];
+    const uint rctType = arena[off + kTrRctType];
+    if (rctType == 0) return;
+    const uint permutation = rctType / 7;
+    const uint custom = rctType % 7;
+    Channel c0 = loadChannel(chansOff, m);
+    Channel c1 = loadChannel(chansOff, m + 1);
+    Channel c2 = loadChannel(chansOff, m + 2);
+    if (custom != 0) {
+        const uint second = custom >> 1;
+        const uint third = custom & 1;
+        const uint n = c0.w * c0.h;
+        for (uint i = 0; i < n; ++i) {
+            if (custom == 6) {
+                const int Y = int(arena[c0.data + i]);
+                const int Co = int(arena[c1.data + i]);
+                const int Cg = int(arena[c2.data + i]);
+                const int tmp = pixelAdd(Y, -(Cg >> 1));
+                const int G = pixelAdd(Cg, tmp);
+                const int B = pixelAdd(tmp, -(Co >> 1));
+                const int R = pixelAdd(B, Co);
+                arena[c0.data + i] = uint(R);
+                arena[c1.data + i] = uint(G);
+                arena[c2.data + i] = uint(B);
+            } else {
+                const int first = int(arena[c0.data + i]);
+                int sec = int(arena[c1.data + i]);
+                int thr = int(arena[c2.data + i]);
+                if (third != 0) thr = pixelAdd(thr, first);
+                if (second == 1) sec = pixelAdd(sec, first);
+                else if (second == 2) sec = pixelAdd(sec, pixelAdd(first, thr) >> 1);
+                arena[c1.data + i] = uint(sec);
+                arena[c2.data + i] = uint(thr);
+            }
+        }
+    }
+    // Channel permutation.
+    storeChannel(chansOff, m + (permutation % 3), c0);
+    storeChannel(chansOff, m + ((permutation + 1 + permutation / 3) % 3), c1);
+    storeChannel(chansOff, m + ((permutation + 2 - permutation / 3) % 3), c2);
+}
+
+static const int kDeltaPalette[72][3] = {
+    {0, 0, 0},       {4, 4, 4},       {11, 0, 0},      {0, 0, -13},     {0, -12, 0},     {-10, -10, -10}, {-18, -18, -18},
+    {-27, -27, -27}, {-18, -18, 0},   {0, 0, -32},     {-32, 0, 0},     {-37, -37, -37}, {0, -32, -32},   {24, 24, 45},
+    {50, 50, 50},    {-45, -24, -24}, {-24, -45, -45}, {0, -24, -24},   {-34, -34, 0},   {-24, 0, -24},   {-45, -45, -24},
+    {64, 64, 64},    {-32, 0, -32},   {0, -32, 0},     {-32, 0, 32},    {-24, -45, -24}, {45, 24, 45},    {24, -24, -45},
+    {-45, -24, 24},  {80, 80, 80},    {64, 0, 0},      {0, 0, -64},     {0, -64, -64},   {-24, -24, 45},  {96, 96, 96},
+    {64, 64, 0},     {45, -24, -24},  {34, -34, 0},    {112, 112, 112}, {24, -45, -45},  {45, 45, -24},   {0, -32, 32},
+    {24, -24, 45},   {0, 96, 96},     {45, -24, 24},   {24, -45, -24},  {-24, -45, 24},  {0, -64, 0},     {96, 0, 0},
+    {128, 128, 128}, {64, 0, 64},     {144, 144, 144}, {96, 96, 0},     {-36, -36, 36},  {45, -24, -45},  {45, -45, -24},
+    {0, 0, -96},     {0, 128, 128},   {0, 96, 0},      {45, 24, -45},   {-128, 0, 0},    {24, -45, 24},   {-45, 24, -45},
+    {64, 0, -64},    {64, -64, -64},  {96, 0, 96},     {45, -45, 24},   {24, 45, -45},   {64, 64, -64},   {128, 128, 0},
+    {0, 0, -128},    {-24, 45, -45}};
+
+int paletteScale(uint value, uint bitDepth) {
+    // (value * ((1 << bit_depth) - 1)) >> 2
+    return int((uint64_t(value) * uint64_t((1u << bitDepth) - 1)) >> 2);
+}
+
+/// palette_internal::GetPaletteValue: explicit, implicit cube and delta entries.
+int paletteValue(Channel palette, int index, uint c, int paletteSize, uint bitDepth) {
+    const int kLargeCubeOffset = 4 * 4 * 4;
+    if (index < 0) {
+        if (c >= 3) return 0;
+        index = -(index + 1);
+        index %= 1 + 2 * (72 - 1);
+        int result = kDeltaPalette[(index + 1) >> 1][c] * ((index & 1) != 0 ? 1 : -1);
+        if (bitDepth > 8) result *= 1 << (bitDepth - 8);
+        return result;
+    } else if (paletteSize <= index && index < paletteSize + kLargeCubeOffset) {
+        if (c >= 3) return 0;
+        index -= paletteSize;
+        index >>= c * 2;
+        return paletteScale(uint(index % 4), bitDepth) + (1 << max(0, int(bitDepth) - 3));
+    } else if (paletteSize + kLargeCubeOffset <= index) {
+        if (c >= 3) return 0;
+        index -= paletteSize + kLargeCubeOffset;
+        if (c == 1) index /= 5;
+        else if (c == 2) index /= 25;
+        return paletteScale(uint(index % 5), bitDepth);
+    }
+    return px(palette, uint(index), c);
+}
+
+void invPalette(inout Dec d, uint off, uint chansOff, inout uint numChannels, inout uint nbMeta, WpHeader wpHeader, uint bitDepth) {
+    const uint beginC = arena[off + kTrBeginC];
+    const uint nbDeltas = arena[off + kTrNbDeltas];
+    const uint predictor = arena[off + kTrPredictor];
+    if (nbMeta < 1) { fail(d, kErrCorrupt); return; }
+    const Channel palette = loadChannel(chansOff, 0);
+    const uint nb = palette.h;
+    const uint c0 = beginC + 1;
+    if (c0 >= numChannels || nb < 1 || numChannels + nb - 1 > kMaxChannels) { fail(d, kErrCorrupt); return; }
+    const Channel indices = loadChannel(chansOff, c0);
+    const uint w = indices.w;
+    const uint h = indices.h;
+    // Insert nb - 1 channels after c0.
+    for (uint i = numChannels; i > c0 + 1; --i) {
+        storeChannel(chansOff, i + nb - 2, loadChannel(chansOff, i - 1));
+    }
+    for (uint i = 1; i < nb; ++i) {
+        storeChannel(chansOff, c0 + i, newChannel(d, w, h, indices.hshift, indices.vshift));
+    }
+    numChannels += nb - 1;
+    if (d.error != kErrNone) return;
+    const int paletteSize = int(palette.w);
+    if (w == 0) {
+    } else if (nbDeltas == 0 && predictor == kPredZero) {
+        // Indices become values; channel 0 of the group is overwritten last.
+        for (uint c = nb; c > 0; --c) {
+            const Channel out = loadChannel(chansOff, c0 + c - 1);
+            for (uint y = 0; y < h; ++y) {
+                for (uint x = 0; x < w; ++x) {
+                    int index = px(indices, x, y);
+                    if (nb == 1) index = clamp(index, 0, paletteSize - 1);
+                    setPx(out, x, y, paletteValue(palette, index, c - 1, paletteSize, bitDepth));
+                }
+            }
+        }
+    } else {
+        // Delta palette: indices kept aside, each channel predicted.
+        const Channel idx = newChannel(d, w, h, 0, 0);
+        if (d.error != kErrNone) return;
+        for (uint i = 0; i < w * h; ++i) arena[idx.data + i] = arena[indices.data + i];
+        for (uint c = 0; c < nb; ++c) {
+            const Channel channel = loadChannel(chansOff, c0 + c);
+            WpState wp;
+            if (predictor == kPredWeighted) {
+                wp = wpCreate(d, wpHeader, w);
+                if (d.error != kErrNone) return;
+            }
+            for (uint y = 0; y < h; ++y) {
+                for (uint x = 0; x < w; ++x) {
+                    const int index = px(idx, x, y);
+                    const int entry = paletteValue(palette, index, c, paletteSize, bitDepth);
+                    const int left = x > 0 ? px(channel, x - 1, y) : (y > 0 ? px(channel, x, y - 1) : 0);
+                    const int top = y > 0 ? px(channel, x, y - 1) : left;
+                    const int topleft = (x > 0 && y > 0) ? px(channel, x - 1, y - 1) : left;
+                    const int topright = (x + 1 < w && y > 0) ? px(channel, x + 1, y - 1) : top;
+                    const int leftleft = x > 1 ? px(channel, x - 2, y) : left;
+                    const int toptop = y > 1 ? px(channel, x, y - 2) : top;
+                    const int toprightright = (x + 2 < w && y > 0) ? px(channel, x + 2, y - 1) : topright;
+                    int64_t wpPred = 0;
+                    if (predictor == kPredWeighted) {
+                        int unused;
+                        wpPred = wpPredict(wp, x, y, int64_t(top), int64_t(left), int64_t(topright), int64_t(topleft), int64_t(toptop), unused);
+                    }
+                    int64_t val = entry;
+                    if (index < int(nbDeltas)) {
+                        val += predictOne(predictor, int64_t(left), int64_t(top), int64_t(toptop), int64_t(topleft), int64_t(topright),
+                                          int64_t(leftleft), int64_t(toprightright), wpPred);
+                    }
+                    setPx(channel, x, y, int(val));
+                    if (predictor == kPredWeighted) wpUpdateErrors(wp, val, x, y);
+                }
+            }
+        }
+    }
+    if (c0 >= nbMeta) {
+        nbMeta -= 1;
+    } else {
+        nbMeta -= 2 - nb;
+    }
+    // Erase the palette channel.
+    for (uint i = 0; i + 1 < numChannels; ++i) {
+        storeChannel(chansOff, i, loadChannel(chansOff, i + 1));
+    }
+    --numChannels;
+}
+
+// --- a whole modular stream --------------------------------------------------------------
+
+struct GlobalTree {
+    bool present;
+    Tree tree;
+};
+
+/// ModularGenericDecompress with undo_transforms: GroupHeader, transforms,
+/// local or global tree, every channel, inverse transforms. The channel
+/// descriptors at chansOff (numChannels entries, each with storage) are the
+/// image; on return they hold the decoded channels (the count may change).
+void decodeModularStream(inout Dec d, uint chansOff, inout uint numChannels, uint streamId, GlobalTree global,
+                         uint windowOff, uint bitDepth) {
+    if (numChannels == 0) return;
+    // GroupHeader
+    const uint useGlobalTree = brRead(d.br, 1);
+    const WpHeader wpHeader = readWpHeader(d);
+    const uint numTransforms = brU32(d.br, distrVal(0), distrVal(1), distrBitsOffset(4, 2), distrBitsOffset(8, 18));
+    const uint transformsOff = alloc(d, max(numTransforms, 1u) * kTransformWords);
+    if (d.error != kErrNone) return;
+    uint nbMeta = 0;
+    for (uint i = 0; i < numTransforms; ++i) {
+        readTransform(d, transformsOff + i * kTransformWords);
+        if (d.error != kErrNone) return;
+        metaApply(d, transformsOff + i * kTransformWords, chansOff, numChannels, nbMeta);
+        if (d.error != kErrNone) return;
+    }
+    uint distanceMultiplier = 0;
+    uint numChans = 0;
+    for (uint i = 0; i < numChannels; ++i) {
+        const Channel c = loadChannel(chansOff, i);
+        if (c.w == 0 || c.h == 0) continue;
+        distanceMultiplier = max(distanceMultiplier, c.w);
+        ++numChans;
+    }
+    if (numChans == 0) return;
+    Tree tree;
+    if (useGlobalTree == 0) {
+        tree = decodeTree(d, windowOff);
+        if (d.error != kErrNone) return;
+        tree.codeSet = decodeHistograms(d, (tree.numNodes + 1) / 2, false, windowOff);
+        if (d.error != kErrNone) return;
+    } else {
+        if (!global.present) { fail(d, kErrCorrupt); return; }
+        tree = global.tree;
+    }
+    SymReader r = makeSymReader(d, tree.codeSet, windowOff, distanceMultiplier);
+    if (d.error != kErrNone) return;
+    for (uint i = 0; i < numChannels; ++i) {
+        ChannelDecodeArgs a;
+        a.chansOff = chansOff;
+        a.numChannels = numChannels;
+        a.chan = i;
+        a.streamId = streamId;
+        decodeChannel(d, r, tree, wpHeader, a);
+        if (d.error != kErrNone) return;
+    }
+    if (!checkFinalState(r)) { fail(d, kErrCorrupt); return; }
+    for (uint i = numTransforms; i > 0; --i) {
+        const uint off = transformsOff + (i - 1) * kTransformWords;
+        const uint id = arena[off + kTrId];
+        if (id == kTrRct) invRct(d, off, chansOff);
+        else if (id == kTrPalette) invPalette(d, off, chansOff, numChannels, nbMeta, wpHeader, bitDepth);
+        if (d.error != kErrNone) return;
+    }
+}

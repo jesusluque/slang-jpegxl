@@ -7,6 +7,9 @@
 #include "sjxl/codestream/Headers.h"
 #include "sjxl/codestream/Tables.h"
 #include "sjxl/core/Log.h"
+#include "sjxl/core/Platform.h"
+#include <format>
+#include <cstdlib>
 #include "sjxl/gpu/CommandBatch.h"
 
 namespace sjxl::enc {
@@ -214,6 +217,25 @@ Result<std::vector<uint8_t>> Encoder::encode(const image::Rgb8& image, const Opt
     };
     layout_.dispatch(batch, {1, 1, 1}, [&](rhi::ShaderCursor c) { bindLayout(c, dummy_); });
     SJXL_TRY(batch.submit(true));
+    if (!platform::env("SJXL_DEBUG").empty()) {
+        SJXL_ASSIGN(const auto xybHost, xyb.readAll<float>(dev));
+        SJXL_ASSIGN(const auto dcHost, dcQuant.readAll<int32_t>(dev));
+        SJXL_ASSIGN(const auto acHost, acQuant.readAll<int32_t>(dev));
+        log::info("enc debug: xyb(0,0) = {} {} {}; dcQuant block0 = {} {} {}; qp gs={} qdc={} qf={}", xybHost[0], xybHost[planePixels],
+                  xybHost[2 * planePixels], dcHost[0], dcHost[nblocks], dcHost[2 * nblocks], qp.globalScale, qp.quantDc, qp.quantField);
+        const uint32_t dbgBlock = static_cast<uint32_t>(std::atoi(platform::env("SJXL_DEBUG_BLOCK").c_str()));
+        for (uint32_t ch = 0; ch < 3; ++ch) {
+            std::string ac;
+            for (int k = 0; k < 64; ++k) ac += std::format("{} ", acHost[(ch * nblocks + dbgBlock) * 64 + k]);
+            log::info("enc debug: acQuant c{} block{} = {}", ch, dbgBlock, ac);
+        }
+        log::info("enc debug: dcQuant block{} = {} {} {}", dbgBlock, dcHost[dbgBlock], dcHost[nblocks + dbgBlock], dcHost[2 * nblocks + dbgBlock]);
+        std::string row;
+        for (int k = 0; k < 10; ++k) row += std::format("({:.3f},{:.3f},{:.3f}) ", xybHost[k], xybHost[planePixels + k], xybHost[2 * planePixels + k]);
+        log::info("enc debug: xyb row0[0..10) = {}", row);
+        SJXL_ASSIGN(const auto rgbHost, rgb.readAll<uint32_t>(dev));
+        log::info("enc debug: rgb words = {:08x} {:08x} {:08x}; dims {}x{} padded {}x{}", rgbHost[0], rgbHost[1], rgbHost[2], image.width, image.height, dim.xsizePadded, dim.ysizePadded);
+    }
 
     SJXL_ASSIGN(const std::vector<uint32_t> totalsHost, totals.readAll<uint32_t>(dev));
     SJXL_ASSIGN(std::vector<uint32_t> sizes, sectionBytes.readAll<uint32_t>(dev));

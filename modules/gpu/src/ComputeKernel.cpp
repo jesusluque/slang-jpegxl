@@ -40,6 +40,11 @@ void ComputeKernel::dispatchGroups(CommandBatch& batch, std::array<uint32_t, 3> 
     }
     pass->dispatchCompute(groups[0], groups[1], groups[2]);
     pass->end();
+    // slang-rhi's resources are untracked (Metal MTLHazardTrackingModeUntracked,
+    // and the same contract elsewhere): what one dispatch wrote is visible to
+    // the next only after a barrier. Every kernel here feeds the next, so the
+    // barrier is part of a dispatch.
+    batch.encoder()->globalBarrier();
     batch.dirty_ = true;
 }
 

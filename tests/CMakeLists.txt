@@ -30,9 +30,13 @@ sjxl_test(sjxl_gpu_tests
     LIBS sjxl::gpu)
 
 sjxl_test(sjxl_codestream_tests
-    SOURCES codestream/test_tables.cpp
-    LIBS sjxl::codestream)
+    SOURCES codestream/test_tables.cpp codestream/test_parse.cpp
+    LIBS sjxl::codestream sjxl::image)
 
 sjxl_test(sjxl_encoder_tests
     SOURCES encoder/test_encode.cpp
     LIBS sjxl::encoder)
+
+sjxl_test(sjxl_decoder_tests
+    SOURCES decoder/test_decode.cpp
+    LIBS sjxl::decoder sjxl::encoder)

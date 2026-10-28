@@ -1,0 +1,143 @@
+// Copyright (c) 2026 jesus luque.
+//
+// One DC group section: VarDCT DC (a modular image of three channels),
+// DequantDC, the ModularDC group (nothing without extra channels), and
+// AcMetadata (chroma-from-luma per tile, AC strategies, quant field, EPF
+// sharpness) with its raster placement. libjxl dec_modular.cc DecodeVarDCTDC /
+// DecodeAcMetadata and compressed_dc.cc DequantDC.
+//
+// Requires frame.slangh. The including module declares the outputs:
+//   RWStructuredBuffer<float> dc;           // 3 planes of nblocks (dequantised DC)
+//   RWStructuredBuffer<uint>  quantDcBucket; // nblocks
+//   RWStructuredBuffer<uint>  acs;          // nblocks: strategy << 1 | first; 0xFF invalid
+//   RWStructuredBuffer<uint>  qf;           // nblocks
+//   RWStructuredBuffer<uint>  epfSharp;     // nblocks
+//   RWStructuredBuffer<int>   ytox;         // tiles (64 px)
+//   RWStructuredBuffer<int>   ytob;
+//   RWStructuredBuffer<uint>  firstBlock;   // nblocks
+#pragma once
+
+struct DcGroupGeom {
+    uint x0, y0, w, h;   // blocks
+    uint blocksX;        // image width in blocks
+    uint tilesX;         // image width in tiles
+    uint numDcGroups;
+    uint group;
+};
+
+void decodeDcGroup(inout Dec d, DcGroupGeom g, uint windowOff) {
+    const GlobalTree global = globalTree();
+    // VarDCT DC: extra precision, three channels in Y, X, B order.
+    const uint extraPrecision = brRead(d.br, 2);
+    const float mul = 1.0f / float(1u << extraPrecision);
+    const uint chansOff = alloc(d, kMaxChannels * kChanWords);
+    if (d.error != kErrNone) return;
+    uint numChannels = 3;
+    for (uint i = 0; i < 3; ++i) storeChannel(chansOff, i, newChannel(d, g.w, g.h, 0, 0));
+    if (d.error != kErrNone) return;
+    decodeModularStream(d, chansOff, numChannels, 1 + g.group, global, windowOff, 8);
+    if (d.error != kErrNone) return;
+    if (numChannels != 3) { fail(d, kErrCorrupt); return; }
+    // DequantDC: channel 0 is Y (physical 1), 1 is X (0), 2 is B (2).
+    const Channel chY = loadChannel(chansOff, 0);
+    const Channel chX = loadChannel(chansOff, 1);
+    const Channel chB = loadChannel(chansOff, 2);
+    const float facX = gsF(kGsMulDc + 0) * mul;
+    const float facY = gsF(kGsMulDc + 1) * mul;
+    const float facB = gsF(kGsMulDc + 2) * mul;
+    const float cflX = gsF(kGsCflDcFactorX);
+    const float cflB = gsF(kGsCflDcFactorB);
+    const uint nblocks = g.blocksX * 0 + arena[kGsHeaderSize - 1];   // see decodeDcGroup caller: nblocks stored there
+    const uint numDcCtxs = arena[kGsBctxNumDcCtxs];
+    for (uint y = 0; y < g.h; ++y) {
+        for (uint x = 0; x < g.w; ++x) {
+            const uint block = (g.y0 + y) * g.blocksX + g.x0 + x;
+            const int qx = px(chX, x, y);
+            const int qy = px(chY, x, y);
+            const int qb = px(chB, x, y);
+            const float fy = float(qy) * facY;
+            dc[1 * nblocks + block] = fy;
+            dc[0 * nblocks + block] = float(qx) * facX + fy * cflX;
+            dc[2 * nblocks + block] = float(qb) * facB + fy * cflB;
+            uint bucket = 0;
+            if (numDcCtxs > 1) {
+                uint bx = 0, by = 0, bb = 0;
+                const uint nX = arena[kGsBctxDcCount + 0], nY = arena[kGsBctxDcCount + 1], nB = arena[kGsBctxDcCount + 2];
+                for (uint t = 0; t < nX; ++t) if (qx > int(arena[arena[kGsBctxDcOff + 0] + t])) ++bx;
+                for (uint t = 0; t < nY; ++t) if (qy > int(arena[arena[kGsBctxDcOff + 1] + t])) ++by;
+                for (uint t = 0; t < nB; ++t) if (qb > int(arena[arena[kGsBctxDcOff + 2] + t])) ++bb;
+                bucket = bx;
+                bucket = bucket * (nB + 1) + bb;
+                bucket = bucket * (nY + 1) + by;
+            }
+            quantDcBucket[block] = bucket;
+        }
+    }
+    // ModularDC group: no channels without extra channels, nothing to read.
+
+    // AcMetadata.
+    const uint upperBound = g.w * g.h;
+    const uint count = brRead(d.br, ceilLog2Nonzero(upperBound)) + 1;
+    const uint tw = (g.w + 7) >> 3;
+    const uint th = (g.h + 7) >> 3;
+    numChannels = 4;
+    storeChannel(chansOff, 0, newChannel(d, tw, th, 3, 3));
+    storeChannel(chansOff, 1, newChannel(d, tw, th, 3, 3));
+    storeChannel(chansOff, 2, newChannel(d, count, 2, 0, 0));
+    storeChannel(chansOff, 3, newChannel(d, g.w, g.h, 0, 0));
+    if (d.error != kErrNone) return;
+    decodeModularStream(d, chansOff, numChannels, 1 + 2 * g.numDcGroups + g.group, global, windowOff, 8);
+    if (d.error != kErrNone) return;
+    if (numChannels != 4) { fail(d, kErrCorrupt); return; }
+    const Channel cYtoX = loadChannel(chansOff, 0);
+    const Channel cYtoB = loadChannel(chansOff, 1);
+    const Channel cAcs = loadChannel(chansOff, 2);
+    const Channel cEpf = loadChannel(chansOff, 3);
+    for (uint ty = 0; ty < th; ++ty) {
+        for (uint tx = 0; tx < tw; ++tx) {
+            const uint tile = ((g.y0 >> 3) + ty) * g.tilesX + (g.x0 >> 3) + tx;
+            ytox[tile] = clamp(px(cYtoX, tx, ty), -128, 127);
+            ytob[tile] = clamp(px(cYtoB, tx, ty), -128, 127);
+        }
+    }
+    uint num = 0;
+    uint usedAcs = 0;
+    for (uint iy = 0; iy < g.h; ++iy) {
+        const uint y = g.y0 + iy;
+        for (uint ix = 0; ix < g.w; ++ix) {
+            const uint x = g.x0 + ix;
+            const uint block = y * g.blocksX + x;
+            const int sharpness = px(cEpf, ix, iy);
+            if (sharpness < 0 || sharpness >= 8) { fail(d, kErrCorrupt); return; }
+            epfSharp[block] = uint(sharpness);
+            if (acs[block] != 0xFFu) continue;
+            if (num >= count) { fail(d, kErrCorrupt); return; }
+            const int raw = px(cAcs, num, 0);
+            const int qfv = px(cAcs, num, 1);
+            if (raw < 0 || raw >= int(kNumStrategies)) { fail(d, kErrCorrupt); return; }
+            const uint strategy = uint(raw);
+            usedAcs |= 1u << strategy;
+            const uint cx = kCoveredX[strategy];
+            const uint cy = kCoveredY[strategy];
+            const uint nextXGroup = (x / 32 + 1) * 32;
+            const uint nextYGroup = (y / 32 + 1) * 32;
+            if (x + cx > nextXGroup || x + cx > g.x0 + g.w || y + cy > nextYGroup || y + cy > g.y0 + g.h) {
+                fail(d, kErrCorrupt);
+                return;
+            }
+            const uint qfStored = 1 + uint(clamp(qfv, 0, 255));
+            for (uint by = 0; by < cy; ++by) {
+                for (uint bx = 0; bx < cx; ++bx) {
+                    const uint b = (y + by) * g.blocksX + x + bx;
+                    if (acs[b] != 0xFFu) { fail(d, kErrCorrupt); return; }
+                    acs[b] = (strategy << 1) | ((bx | by) == 0 ? 1u : 0u);
+                    qf[b] = qfStored;
+                    firstBlock[b] = block;
+                }
+            }
+            ++num;
+        }
+    }
+    uint before;
+    InterlockedOr(arena[kGsUsedAcs], usedAcs, before);
+}

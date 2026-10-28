@@ -3,5 +3,6 @@ sjxl_add_module(codestream
     SOURCES
         src/Headers.cpp
         src/Tables.cpp
+        src/Parse.cpp
     PUBLIC_LIBS
         sjxl::core)

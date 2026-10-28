@@ -8,6 +8,7 @@
 #include <string_view>
 
 #include "sjxl/core/Log.h"
+#include "sjxl/decoder/Decoder.h"
 #include "sjxl/encoder/Encoder.h"
 #include "sjxl/gpu/Device.h"
 #include "sjxl/image/Image.h"
@@ -20,8 +21,10 @@ int usage() {
                  "usage:\n"
                  "  sjxl info                                   open the GPU device and describe it\n"
                  "  sjxl encode in.png out.jxl [--distance d]   lossy VarDCT (default distance 1.0)\n"
-                 "  sjxl decode in.jxl out.png                  (M2)\n"
-                 "  sjxl compare a.png b.png                    PSNR and largest difference, measured on the GPU\n");
+                 "  sjxl decode in.jxl out.png                  VarDCT frames\n"
+                 "  sjxl compare a.png b.png                    PSNR and largest difference, measured on the GPU\n"
+                 "  sjxl pixel a.png x y                        one pixel's RGB\n"
+                 "  sjxl convert in.png out.png                 re-save as 8-bit RGB (drops alpha)\n");
     return 2;
 }
 
@@ -68,6 +71,44 @@ int encode(int argc, char** argv) {
     return 0;
 }
 
+int decode(int argc, char** argv) {
+    if (argc < 4) return usage();
+    auto bytes = sjxl::image::readFile(argv[2]);
+    if (!bytes) return fail(bytes.error());
+    auto device = sjxl::gpu::Device::create();
+    if (!device) return fail(device.error());
+    auto library = std::make_shared<sjxl::gpu::ShaderLibrary>(*device);
+    auto decoder = sjxl::dec::Decoder::create(library);
+    if (!decoder) return fail(decoder.error());
+    const auto start = std::chrono::steady_clock::now();
+    auto image = (*decoder)->decode(*bytes);
+    if (!image) return fail(image.error());
+    const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    if (auto written = sjxl::image::writePng(argv[3], *image); !written) return fail(written.error());
+    std::printf("%zu bytes -> %ux%u in %.1f ms\n", bytes->size(), image->width, image->height, ms);
+    return 0;
+}
+
+int pixel(int argc, char** argv) {
+    if (argc < 5) return usage();
+    auto a = sjxl::image::readRgb8(argv[2]);
+    if (!a) return fail(a.error());
+    const unsigned x = static_cast<unsigned>(std::atoi(argv[3]));
+    const unsigned y = static_cast<unsigned>(std::atoi(argv[4]));
+    if (x >= a->width || y >= a->height) return usage();
+    const size_t i = (size_t{y} * a->width + x) * 3;
+    std::printf("%u %u %u\n", a->pixels[i], a->pixels[i + 1], a->pixels[i + 2]);
+    return 0;
+}
+
+int convert(int argc, char** argv) {
+    if (argc < 4) return usage();
+    auto a = sjxl::image::readRgb8(argv[2]);
+    if (!a) return fail(a.error());
+    if (auto written = sjxl::image::writePng(argv[3], *a); !written) return fail(written.error());
+    return 0;
+}
+
 int compare(int argc, char** argv) {
     if (argc < 4) return usage();
     auto a = sjxl::image::readRgb8(argv[2]);
@@ -92,9 +133,8 @@ int main(int argc, char** argv) {
     if (command == "info") return info();
     if (command == "encode") return encode(argc, argv);
     if (command == "compare") return compare(argc, argv);
-    if (command == "decode") {
-        std::fprintf(stderr, "sjxl: decode is not implemented yet (M2)\n");
-        return 1;
-    }
+    if (command == "pixel") return pixel(argc, argv);
+    if (command == "convert") return convert(argc, argv);
+    if (command == "decode") return decode(argc, argv);
     return usage();
 }

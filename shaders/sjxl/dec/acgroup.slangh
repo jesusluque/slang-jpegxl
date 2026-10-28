@@ -1,0 +1,128 @@
+// Copyright (c) 2026 jesus luque.
+//
+// One AC group section for one pass: the histogram selector, then every
+// varblock in raster order, channels Y, X, B, its non-zero count and its
+// coefficients in coefficient order. libjxl dec_group.cc DecodeGroupImpl /
+// DecodeACVarBlock.
+//
+// Coefficient k of a varblock whose first block is B with cx covered columns
+// is stored at coeffs[(c * nblocks + block(B, k / 64)) * 64 + k % 64], where
+// block(B, q) is the covered block q in raster order. The dequantisation
+// kernel reads it back the same way.
+//
+// Requires frame.slangh. The including module declares:
+//   RWStructuredBuffer<int> coeffs;   // 3 * nblocks * 64, zero on entry
+// and reads acs, qf, quantDcBucket from the DC stage.
+#pragma once
+
+static const uint kCoeffFreqContext[64] = {
+    0xBAD, 0,  1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15, 15, 16, 16, 17, 17,
+    18,    18, 19, 19, 20, 20, 21, 21, 22, 22, 23, 23, 23, 23, 24, 24, 24, 24, 25, 25, 25, 25,
+    26,    26, 26, 26, 27, 27, 27, 27, 28, 28, 28, 28, 29, 29, 29, 29, 30, 30, 30, 30};
+static const uint kCoeffNumNonzeroContext[64] = {
+    0xBAD, 0,   31,  62,  62,  93,  93,  93,  93,  123, 123, 123, 123, 152, 152, 152,
+    152,   152, 152, 152, 152, 180, 180, 180, 180, 180, 180, 180, 180, 180, 180, 180,
+    180,   206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206,
+    206,   206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206};
+
+uint zeroDensityContext(uint nonzerosLeft, uint k, uint coveredBlocks, uint log2Covered, uint prev) {
+    nonzerosLeft = (nonzerosLeft + coveredBlocks - 1) >> log2Covered;
+    k >>= log2Covered;
+    return (kCoeffNumNonzeroContext[nonzerosLeft] + kCoeffFreqContext[k]) * 2 + prev;
+}
+
+uint nonZeroContext(uint nonZeros, uint blockCtx) {
+    if (nonZeros >= 64) nonZeros = 64;
+    const uint ctx = nonZeros < 8 ? nonZeros : 4 + nonZeros / 2;
+    return ctx * arena[kGsBctxNumCtxs] + blockCtx;
+}
+
+struct AcGroupGeom {
+    uint x0, y0, w, h;   // blocks
+    uint blocksX;
+    uint nblocks;
+    uint group;
+};
+
+void decodeAcGroup(inout Dec d, AcGroupGeom g, uint windowOff) {
+    const uint numHistograms = arena[kGsNumHistograms];
+    const uint numCtxs = arena[kGsBctxNumCtxs];
+    const uint acContexts = numCtxs * (kNonZeroBuckets + kZeroDensityContextCount);
+    uint ctxOffset = 0;
+    const uint selectorBits = ceilLog2Nonzero(numHistograms);
+    if (selectorBits != 0) {
+        const uint histo = brRead(d.br, selectorBits);
+        if (histo >= numHistograms) { fail(d, kErrCorrupt); return; }
+        ctxOffset = histo * acContexts;
+    }
+    SymReader r = makeSymReader(d, arena[kGsAcCodeSet], windowOff, 0);
+    if (d.error != kErrNone) return;
+    const uint ordersOff = arena[kGsOrdersOff];
+    // Group-local non-zero counts per channel, this row and the one above.
+    const uint nzOff = alloc(d, 3 * 2 * 32);
+    if (d.error != kErrNone) return;
+    for (uint i = 0; i < 3 * 2 * 32; ++i) arena[nzOff + i] = 0;
+    const uint physical[3] = {1, 0, 2};
+    for (uint by = 0; by < g.h; ++by) {
+        const uint curRow = by & 1;
+        const uint topRow = curRow ^ 1;
+        for (uint bx = 0; bx < g.w;) {
+            const uint block = (g.y0 + by) * g.blocksX + g.x0 + bx;
+            const uint acsEntry = acs[block];
+            const uint strategy = acsEntry >> 1;
+            if (acsEntry == 0xFFu || strategy >= kNumStrategies) { fail(d, kErrCorrupt); return; }
+            const uint cx = kCoveredX[strategy];
+            if ((acsEntry & 1) == 0) {
+                bx += cx;
+                continue;
+            }
+            const uint cy = kCoveredY[strategy];
+            const uint log2Covered = kLog2Covered[strategy];
+            const uint covered = 1u << log2Covered;
+            const uint size = covered * 64;
+            const uint ord = kStrategyOrder[strategy];
+            const uint qfv = qf[block];
+            const uint dcIdx = quantDcBucket[block];
+            for (uint ci = 0; ci < 3; ++ci) {
+                const uint c = physical[ci];
+                // PredictFromTopAndLeft over the group-local grid, default 32.
+                const uint rowCur = nzOff + (c * 2 + curRow) * 32;
+                const uint rowTop = nzOff + (c * 2 + topRow) * 32;
+                uint predicted;
+                if (bx == 0) predicted = by == 0 ? 32 : arena[rowTop + bx];
+                else if (by == 0) predicted = arena[rowCur + bx - 1];
+                else predicted = (arena[rowTop + bx] + arena[rowCur + bx - 1] + 1) / 2;
+                const uint blockCtx = blockContext(dcIdx, qfv, ord, c);
+                const uint nzeroCtx = nonZeroContext(predicted, blockCtx) + ctxOffset;
+                uint nzeros = readHybridUint(d, r, nzeroCtx);
+                if (nzeros > size - covered) { fail(d, kErrCorrupt); return; }
+                const uint normalized = (nzeros + covered - 1) >> log2Covered;
+                for (uint y = 0; y < cy; ++y) {
+                    for (uint x = 0; x < cx; ++x) {
+                        // rows below this one take the top-row slot when by+y is odd relative to by
+                        const uint rowIdx = nzOff + (c * 2 + ((by + y) & 1)) * 32;
+                        arena[rowIdx + bx + x] = normalized;
+                    }
+                }
+                const uint histoOffset = ctxOffset + numCtxs * kNonZeroBuckets + kZeroDensityContextCount * blockCtx;
+                const uint orderOff = ordersOff + coeffOrderOffset(ord, c);
+                uint prev = nzeros > size / 16 ? 0 : 1;
+                for (uint k = covered; k < size && nzeros != 0; ++k) {
+                    const uint ctx = histoOffset + zeroDensityContext(nzeros, k, covered, log2Covered, prev);
+                    const uint u = readHybridUint(d, r, ctx);
+                    const int coeff = unpackSignedInt(u);
+                    const uint idx = arena[orderOff + k];
+                    const uint q = idx >> 6;
+                    const uint target = (g.y0 + by + q / cx) * g.blocksX + g.x0 + bx + q % cx;
+                    coeffs[(c * g.nblocks + target) * 64 + (idx & 63)] += coeff;
+                    prev = u != 0 ? 1 : 0;
+                    nzeros -= prev;
+                }
+                if (nzeros != 0) { fail(d, kErrCorrupt); return; }
+                if (d.error != kErrNone) return;
+            }
+            bx += cx;
+        }
+    }
+    if (!checkFinalState(r)) fail(d, kErrCorrupt);
+}

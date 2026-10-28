@@ -1,0 +1,527 @@
+// Copyright (c) 2026 jesus luque.
+//
+// The frame's global state as the device holds it, and the DcGlobal /
+// AcGlobal section decoding that fills it: quantizer, block context map,
+// chroma-from-luma, DC dequant, the global MA tree, dequant matrix encodings,
+// coefficient orders and the AC histograms. One `arena` buffer serves the
+// whole decode: words [0, kGsHeaderSize) are this header, the globals thread's
+// scratch follows, then every other thread's region. Offsets are global, so a
+// code set decoded here is read by the AC group threads where it lies.
+//
+// Requires entropy.slangh and modular.slangh included first.
+#pragma once
+
+static const uint kGsError = 0;
+static const uint kGsGlobalScale = 1;
+static const uint kGsQuantDc = 2;
+static const uint kGsInvGlobalScale = 3;   // float bits
+static const uint kGsGlobalScaleF = 4;
+static const uint kGsInvQuantDc = 5;
+static const uint kGsDcQuant = 6;          // 3 floats: DequantMatrices::DCQuant(c)
+static const uint kGsMulDc = 9;            // 3 floats: Quantizer::GetDcStep(c)
+static const uint kGsCflColorFactor = 12;
+static const uint kGsCflBaseX = 13;
+static const uint kGsCflBaseB = 14;
+static const uint kGsCflYtoxDc = 15;       // int
+static const uint kGsCflYtobDc = 16;
+static const uint kGsCflDcFactorX = 17;    // float: base_x + ytox_dc / color_factor
+static const uint kGsCflDcFactorB = 18;
+static const uint kGsCflColorScale = 19;   // float: 1 / color_factor
+static const uint kGsBctxNumCtxs = 20;
+static const uint kGsBctxNumDcCtxs = 21;
+static const uint kGsBctxNumQf = 22;
+static const uint kGsBctxQfOff = 23;
+static const uint kGsBctxDcCount = 24;     // 3
+static const uint kGsBctxDcOff = 27;       // 3
+static const uint kGsBctxMapOff = 30;
+static const uint kGsTreePresent = 31;
+static const uint kGsTreeNodes = 32;
+static const uint kGsTreeNumNodes = 33;
+static const uint kGsTreeNumLeaves = 34;
+static const uint kGsTreeCodeSet = 35;
+static const uint kGsTreeUsesWp = 36;
+static const uint kGsNumHistograms = 40;
+static const uint kGsAcCodeSet = 41;
+static const uint kGsUsedOrders = 42;
+static const uint kGsOrdersOff = 43;       // kCoeffOrderLimit * 64 words, libjxl's layout
+static const uint kGsQuantEncOff = 44;     // 17 * kQeWords
+static const uint kGsDcGlobalBits = 45;
+static const uint kGsAcGlobalBits = 46;
+static const uint kGsUsedAcs = 47;         // bit per strategy, ORed by DC groups
+static const uint kGsHeaderSize = 64;
+
+static const uint kNumOrders = 13;
+static const uint kNumStrategies = 27;
+static const uint kCoeffOrderLimit = 6156;
+static const uint kNonZeroBuckets = 37;
+static const uint kZeroDensityContextCount = 458;
+static const uint kNumQuantTables = 17;
+
+static const uint kStrategyOrder[27] = {0, 1, 1, 1, 2, 3, 4, 4, 5, 5, 6, 6, 1, 1, 1, 1, 1, 1, 7, 8, 8, 9, 10, 10, 11, 12, 12};
+static const uint kCoveredX[27] = {1, 1, 1, 1, 2, 4, 1, 2, 1, 4, 2, 4, 1, 1, 1, 1, 1, 1, 8, 4, 8, 16, 8, 16, 32, 16, 32};
+static const uint kCoveredY[27] = {1, 1, 1, 1, 2, 4, 2, 1, 4, 1, 4, 2, 1, 1, 1, 1, 1, 1, 8, 8, 4, 16, 16, 8, 32, 32, 16};
+static const uint kLog2Covered[27] = {0, 0, 0, 0, 2, 4, 1, 1, 2, 2, 3, 3, 0, 0, 0, 0, 0, 0, 6, 5, 5, 8, 7, 7, 10, 9, 9};
+static const uint kCoeffOrderOffset[40] = {0, 1, 2, 3, 4, 5, 6, 10, 14, 18, 34, 50, 66, 68, 70, 72, 76, 80, 84, 92, 100, 108, 172, 236, 300,
+                                           332, 364, 396, 652, 908, 1164, 1292, 1420, 1548, 2572, 3596, 4620, 5132, 5644, 6156};
+/// ac strategy -> quant table kind (kAcStrategyToQuantTableMap).
+static const uint kStrategyToTable[27] = {0, 1, 2, 3, 4, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 10, 10, 11, 12, 12, 13, 14, 14, 15, 16, 16};
+static const uint kTableSizeX[17] = {1, 1, 1, 1, 2, 4, 1, 1, 2, 1, 1, 8, 4, 16, 8, 32, 16};   // required_size_x
+static const uint kTableSizeY[17] = {1, 1, 1, 1, 2, 4, 2, 4, 4, 1, 1, 8, 8, 16, 16, 32, 32};  // required_size_y
+
+/// Quant encodings as decoded, kQeWords each: mode, bands, special weights.
+static const uint kQeWords = 176;
+static const uint kQeMode = 0;              // 0 library, 1 ID, 2 DCT2, 3 DCT4, 4 DCT4X8, 5 AFV, 6 DCT, 7 RAW
+static const uint kQeNumBands = 1;
+static const uint kQeBands = 2;             // [3][17] floats
+static const uint kQeNumBandsAfv = 53;
+static const uint kQeBandsAfv = 54;         // [3][17]
+static const uint kQeIdWeights = 105;       // [3][3]
+static const uint kQeDct2Weights = 114;     // [3][6]
+static const uint kQeDct4x8Mul = 132;       // [3]
+static const uint kQeDct4Mul = 135;         // [3][2]
+static const uint kQeAfvWeights = 141;      // [3][9]
+static const uint kQeRawOff = 168;
+static const uint kQeRawDen = 169;
+
+uint coeffOrderOffset(uint ord, uint c) { return kCoeffOrderOffset[3 * ord + c] * 64; }
+
+float gsF(uint field) { return asfloat(arena[field]); }
+void gsSetF(uint field, float v) { arena[field] = asuint(v); }
+
+// --- DcGlobal ---------------------------------------------------------------------------
+
+/// DequantMatrices::DecodeDC.
+void readDequantDc(inout Dec d) {
+    const float kDcQuant[3] = {1.0f / 4096.0f, 1.0f / 512.0f, 1.0f / 256.0f};
+    for (uint c = 0; c < 3; ++c) gsSetF(kGsDcQuant + c, kDcQuant[c]);
+    if (brRead(d.br, 1) != 0) return;
+    for (uint c = 0; c < 3; ++c) {
+        const float v = brF16(d.br) * (1.0f / 128.0f);
+        if (v < 1e-8f) { fail(d, kErrCorrupt); return; }
+        gsSetF(kGsDcQuant + c, v);
+    }
+}
+
+/// Quantizer::Decode and the derived steps.
+void readQuantizer(inout Dec d) {
+    const uint globalScale = brU32(d.br, distrBitsOffset(11, 1), distrBitsOffset(11, 2049), distrBitsOffset(12, 4097), distrBitsOffset(16, 8193));
+    const uint quantDc = brU32(d.br, distrVal(16), distrBitsOffset(5, 1), distrBitsOffset(8, 1), distrBitsOffset(16, 1));
+    arena[kGsGlobalScale] = globalScale;
+    arena[kGsQuantDc] = quantDc;
+    const float invGlobalScale = 65536.0f / float(globalScale);
+    gsSetF(kGsInvGlobalScale, invGlobalScale);
+    gsSetF(kGsGlobalScaleF, float(globalScale) / 65536.0f);
+    const float invQuantDc = invGlobalScale / float(quantDc);
+    gsSetF(kGsInvQuantDc, invQuantDc);
+    for (uint c = 0; c < 3; ++c) gsSetF(kGsMulDc + c, invQuantDc * gsF(kGsDcQuant + c));
+}
+
+/// DecodeContextMap on its own (the block context map uses it without histograms).
+uint decodeContextMapStandalone(inout Dec d, uint mapOff, uint numContexts, uint windowOff) {
+    for (uint i = 0; i < numContexts; ++i) arena[mapOff + i] = 0;
+    const uint isSimple = brRead(d.br, 1);
+    if (isSimple != 0) {
+        const uint bitsPerEntry = brRead(d.br, 2);
+        if (bitsPerEntry != 0) {
+            for (uint i = 0; i < numContexts; ++i) arena[mapOff + i] = brRead(d.br, bitsPerEntry);
+        }
+    } else {
+        const uint useMtf = brRead(d.br, 1);
+        const uint inner = decodeHistograms(d, 1, numContexts <= 2, windowOff);
+        if (d.error != kErrNone) return 1;
+        SymReader r = makeSymReader(d, inner, windowOff, 0);
+        uint maxSym = 0;
+        for (uint i = 0; i < numContexts; ++i) {
+            const uint sym = readHybridUint(d, r, 0);
+            maxSym = max(maxSym, sym);
+            arena[mapOff + i] = sym;
+        }
+        if (maxSym >= 256 || !checkFinalState(r)) { fail(d, kErrCorrupt); return 1; }
+        if (useMtf != 0) inverseMtf(d, mapOff, numContexts);
+    }
+    uint maxEntry = 0;
+    for (uint i = 0; i < numContexts; ++i) maxEntry = max(maxEntry, arena[mapOff + i]);
+    const uint numClusters = maxEntry + 1;
+    const uint seenOff = alloc(d, numClusters);
+    if (d.error != kErrNone) return 1;
+    for (uint c = 0; c < numClusters; ++c) arena[seenOff + c] = 0;
+    for (uint i = 0; i < numContexts; ++i) arena[seenOff + arena[mapOff + i]] = 1;
+    for (uint c = 0; c < numClusters; ++c) {
+        if (arena[seenOff + c] == 0) { fail(d, kErrCorrupt); return 1; }
+    }
+    return numClusters;
+}
+
+/// DecodeBlockCtxMap.
+void readBlockCtxMap(inout Dec d, uint windowOff) {
+    const uint kDefaultCtxMap[39] = {0, 1, 2, 2, 3, 3, 4, 5, 6, 6, 6, 6, 6, 7, 8, 9, 9, 10, 11, 12, 13, 14, 14, 14, 14, 14,
+                                     7, 8, 9, 9, 10, 11, 12, 13, 14, 14, 14, 14, 14};
+    if (brRead(d.br, 1) != 0) {
+        const uint mapOff = alloc(d, 39);
+        if (d.error != kErrNone) return;
+        for (uint i = 0; i < 39; ++i) arena[mapOff + i] = kDefaultCtxMap[i];
+        arena[kGsBctxMapOff] = mapOff;
+        arena[kGsBctxNumCtxs] = 15;
+        arena[kGsBctxNumDcCtxs] = 1;
+        arena[kGsBctxNumQf] = 0;
+        for (uint j = 0; j < 3; ++j) arena[kGsBctxDcCount + j] = 0;
+        return;
+    }
+    uint numDcCtxs = 1;
+    for (uint j = 0; j < 3; ++j) {
+        const uint n = brRead(d.br, 4);
+        arena[kGsBctxDcCount + j] = n;
+        numDcCtxs *= n + 1;
+        const uint off = alloc(d, max(n, 1u));
+        arena[kGsBctxDcOff + j] = off;
+        for (uint i = 0; i < n; ++i) {
+            arena[off + i] = unpackSigned(brU32(d.br, distrBitsOffset(4, 0), distrBitsOffset(8, 16), distrBitsOffset(16, 272), distrBitsOffset(32, 65808)));
+        }
+    }
+    const uint nqf = brRead(d.br, 4);
+    arena[kGsBctxNumQf] = nqf;
+    const uint qfOff = alloc(d, max(nqf, 1u));
+    arena[kGsBctxQfOff] = qfOff;
+    for (uint i = 0; i < nqf; ++i) {
+        arena[qfOff + i] = brU32(d.br, distrBitsOffset(2, 0), distrBitsOffset(3, 4), distrBitsOffset(5, 12), distrBitsOffset(8, 44)) + 1;
+    }
+    if (numDcCtxs * (nqf + 1) > 64) { fail(d, kErrCorrupt); return; }
+    arena[kGsBctxNumDcCtxs] = numDcCtxs;
+    const uint n = 3 * kNumOrders * numDcCtxs * (nqf + 1);
+    const uint mapOff = alloc(d, n);
+    arena[kGsBctxMapOff] = mapOff;
+    if (d.error != kErrNone) return;
+    const uint numCtxs = decodeContextMapStandalone(d, mapOff, n, windowOff);
+    if (numCtxs > 16) { fail(d, kErrCorrupt); return; }
+    arena[kGsBctxNumCtxs] = numCtxs;
+}
+
+/// BlockCtxMap::Context.
+uint blockContext(uint dcIdx, uint qf, uint ord, uint c) {
+    uint qfIdx = 0;
+    const uint nqf = arena[kGsBctxNumQf];
+    for (uint t = 0; t < nqf; ++t) {
+        if (qf > arena[arena[kGsBctxQfOff] + t]) ++qfIdx;
+    }
+    uint idx = c < 2 ? (c ^ 1) : 2;
+    idx = idx * kNumOrders + ord;
+    idx = idx * (nqf + 1) + qfIdx;
+    idx = idx * arena[kGsBctxNumDcCtxs] + dcIdx;
+    return arena[arena[kGsBctxMapOff] + idx];
+}
+
+/// ColorCorrelation::DecodeDC.
+void readColorCorrelationDc(inout Dec d) {
+    uint colorFactor = 84;
+    float baseX = 0.0f, baseB = 1.0f;
+    int ytoxDc = 0, ytobDc = 0;
+    if (brRead(d.br, 1) == 0) {
+        colorFactor = brU32(d.br, distrVal(84), distrVal(256), distrBitsOffset(8, 2), distrBitsOffset(16, 258));
+        baseX = brF16(d.br);
+        baseB = brF16(d.br);
+        if (abs(baseX) > 4.0f || abs(baseB) > 4.0f) { fail(d, kErrCorrupt); return; }
+        ytoxDc = int(brRead(d.br, 8)) - 128;
+        ytobDc = int(brRead(d.br, 8)) - 128;
+    }
+    const float colorScale = 1.0f / float(colorFactor);
+    arena[kGsCflColorFactor] = colorFactor;
+    gsSetF(kGsCflBaseX, baseX);
+    gsSetF(kGsCflBaseB, baseB);
+    arena[kGsCflYtoxDc] = uint(ytoxDc);
+    arena[kGsCflYtobDc] = uint(ytobDc);
+    gsSetF(kGsCflColorScale, colorScale);
+    gsSetF(kGsCflDcFactorX, baseX + float(ytoxDc) * colorScale);
+    gsSetF(kGsCflDcFactorB, baseB + float(ytobDc) * colorScale);
+}
+
+/// ModularFrameDecoder::DecodeGlobalInfo for a VarDCT frame without extra
+/// channels: the optional global tree; the global image has no channels.
+void readGlobalModular(inout Dec d, uint windowOff) {
+    const uint hasTree = brRead(d.br, 1);
+    arena[kGsTreePresent] = hasTree;
+    if (hasTree == 0) return;
+    Tree t = decodeTree(d, windowOff);
+    if (d.error != kErrNone) return;
+    t.codeSet = decodeHistograms(d, (t.numNodes + 1) / 2, false, windowOff);
+    if (d.error != kErrNone) return;
+    arena[kGsTreeNodes] = t.nodes;
+    arena[kGsTreeNumNodes] = t.numNodes;
+    arena[kGsTreeNumLeaves] = t.numLeaves;
+    arena[kGsTreeCodeSet] = t.codeSet;
+    arena[kGsTreeUsesWp] = t.usesWp ? 1 : 0;
+    // The global modular image: GroupHeader is read only when it has channels;
+    // a VarDCT frame without extra channels has none, so nothing follows.
+}
+
+GlobalTree globalTree() {
+    GlobalTree g;
+    g.present = arena[kGsTreePresent] != 0;
+    g.tree.nodes = arena[kGsTreeNodes];
+    g.tree.numNodes = arena[kGsTreeNumNodes];
+    g.tree.numLeaves = arena[kGsTreeNumLeaves];
+    g.tree.codeSet = arena[kGsTreeCodeSet];
+    g.tree.usesWp = arena[kGsTreeUsesWp] != 0;
+    return g;
+}
+
+/// The whole DcGlobal section (no patches, splines or noise: the parser
+/// rejected those flags).
+void decodeDcGlobal(inout Dec d, uint windowOff) {
+    readDequantDc(d);
+    if (d.error != kErrNone) return;
+    readQuantizer(d);
+    readBlockCtxMap(d, windowOff);
+    if (d.error != kErrNone) return;
+    readColorCorrelationDc(d);
+    if (d.error != kErrNone) return;
+    readGlobalModular(d, windowOff);
+}
+
+// --- AcGlobal ---------------------------------------------------------------------------
+
+void readDctParams(inout Dec d, uint qe, uint numBandsField, uint bandsField) {
+    const uint numBands = brRead(d.br, 4) + 1;
+    arena[qe + numBandsField] = numBands;
+    for (uint c = 0; c < 3; ++c) {
+        for (uint i = 0; i < numBands; ++i) {
+            arena[qe + bandsField + c * 17 + i] = asuint(brF16(d.br));
+        }
+        float first = asfloat(arena[qe + bandsField + c * 17]);
+        if (first < 1e-8f) { fail(d, kErrCorrupt); return; }
+        arena[qe + bandsField + c * 17] = asuint(first * 64.0f);
+    }
+}
+
+/// jxl::Decode of one QuantEncoding.
+void readQuantEncoding(inout Dec d, uint qe, uint kind) {
+    const uint requiredSize = kTableSizeX[kind] * kTableSizeY[kind];
+    const uint mode = brRead(d.br, 3);
+    arena[qe + kQeMode] = mode;
+    switch (mode) {
+    case 0: {
+        const uint predefined = brRead(d.br, 0);   // kCeilLog2NumPredefinedTables = 0
+        if (predefined >= 1) fail(d, kErrCorrupt);
+        break;
+    }
+    case 1:
+        if (requiredSize != 1) { fail(d, kErrCorrupt); return; }
+        for (uint c = 0; c < 3; ++c) {
+            for (uint i = 0; i < 3; ++i) {
+                const float v = brF16(d.br);
+                if (abs(v) < 1e-8f) { fail(d, kErrCorrupt); return; }
+                arena[qe + kQeIdWeights + c * 3 + i] = asuint(v * 64.0f);
+            }
+        }
+        break;
+    case 2:
+        if (requiredSize != 1) { fail(d, kErrCorrupt); return; }
+        for (uint c = 0; c < 3; ++c) {
+            for (uint i = 0; i < 6; ++i) {
+                const float v = brF16(d.br);
+                if (abs(v) < 1e-8f) { fail(d, kErrCorrupt); return; }
+                arena[qe + kQeDct2Weights + c * 6 + i] = asuint(v * 64.0f);
+            }
+        }
+        break;
+    case 4:
+        if (requiredSize != 1) { fail(d, kErrCorrupt); return; }
+        for (uint c = 0; c < 3; ++c) {
+            const float v = brF16(d.br);
+            if (abs(v) < 1e-8f) { fail(d, kErrCorrupt); return; }
+            arena[qe + kQeDct4x8Mul + c] = asuint(v);
+        }
+        readDctParams(d, qe, kQeNumBands, kQeBands);
+        break;
+    case 3:
+        if (requiredSize != 1) { fail(d, kErrCorrupt); return; }
+        for (uint c = 0; c < 3; ++c) {
+            for (uint i = 0; i < 2; ++i) {
+                const float v = brF16(d.br);
+                if (abs(v) < 1e-8f) { fail(d, kErrCorrupt); return; }
+                arena[qe + kQeDct4Mul + c * 2 + i] = asuint(v);
+            }
+        }
+        readDctParams(d, qe, kQeNumBands, kQeBands);
+        break;
+    case 5:
+        if (requiredSize != 1) { fail(d, kErrCorrupt); return; }
+        for (uint c = 0; c < 3; ++c) {
+            for (uint i = 0; i < 9; ++i) {
+                float v = brF16(d.br);
+                if (i < 6) v *= 64.0f;
+                arena[qe + kQeAfvWeights + c * 9 + i] = asuint(v);
+            }
+        }
+        readDctParams(d, qe, kQeNumBands, kQeBands);
+        readDctParams(d, qe, kQeNumBandsAfv, kQeBandsAfv);
+        break;
+    case 6:
+        readDctParams(d, qe, kQeNumBands, kQeBands);
+        break;
+    case 7:
+        fail(d, kErrUnsupported);   // RAW quant tables (JPEG recompression, M4)
+        break;
+    default:
+        fail(d, kErrCorrupt);
+    }
+}
+
+/// DequantMatrices::Decode: 17 encodings (all library when all_default).
+void readDequantMatrices(inout Dec d) {
+    const uint encOff = alloc(d, kNumQuantTables * kQeWords);
+    arena[kGsQuantEncOff] = encOff;
+    if (d.error != kErrNone) return;
+    for (uint i = 0; i < kNumQuantTables * kQeWords; ++i) arena[encOff + i] = 0;
+    if (brRead(d.br, 1) != 0) return;   // all_default
+    for (uint i = 0; i < kNumQuantTables; ++i) {
+        readQuantEncoding(d, encOff + i * kQeWords, i);
+        if (d.error != kErrNone) return;
+    }
+}
+
+/// ac_strategy.cc CoeffOrderAndLut (the order, not the LUT) for a strategy
+/// with covered blocks cxIn x cyIn, written to `out` (64 * cx * cy entries).
+void naturalCoeffOrder(uint cxIn, uint cyIn, uint out) {
+    // CoefficientLayout: cx >= cy.
+    uint cx = max(cxIn, cyIn);
+    uint cy = min(cxIn, cyIn);
+    const uint xs = cx / cy;
+    const uint xsm = xs - 1;
+    const uint xss = ceilLog2Nonzero(xs);
+    uint cur = cx * cy;
+    const uint n = cx * 8;
+    for (uint i = 0; i < n; ++i) {
+        for (uint j = 0; j <= i; ++j) {
+            uint x = j;
+            uint y = i - j;
+            if ((i & 1) != 0) { const uint t = x; x = y; y = t; }
+            if ((y & xsm) != 0) continue;
+            y >>= xss;
+            uint val;
+            if (x < cx && y < cy) val = y * cx + x;
+            else val = cur++;
+            arena[out + val] = y * cx * 8 + x;
+        }
+    }
+    for (uint ip = n - 1; ip > 0; --ip) {
+        const uint i = ip - 1;
+        for (uint j = 0; j <= i; ++j) {
+            uint x = n - 1 - (i - j);
+            uint y = n - 1 - j;
+            if ((i & 1) != 0) { const uint t = x; x = y; y = t; }
+            if ((y & xsm) != 0) continue;
+            y >>= xss;
+            arena[out + cur] = y * cx * 8 + x;
+            ++cur;
+        }
+    }
+}
+
+uint coeffOrderContext(uint val) {
+    // HybridUintConfig(0, 0, 0): token = val < 1 ? val : 1 + floor(log2 val); capped at 7.
+    const uint token = val == 0 ? 0 : firstbithigh(val) + 1;
+    return min(token, 7u);
+}
+
+/// ReadPermutation (skip = llf) applied through the natural order into `dest`
+/// (or only consumed when dest == 0xFFFFFFFF).
+void readCoeffOrder(inout Dec d, inout SymReader r, uint llf, uint size, uint naturalOff, uint dest) {
+    const uint lehmerOff = alloc(d, size);
+    const uint tempOff = alloc(d, size * 2);
+    if (d.error != kErrNone) return;
+    const uint end = readHybridUint(d, r, coeffOrderContext(size)) + llf;
+    if (end > size) { fail(d, kErrCorrupt); return; }
+    for (uint i = 0; i < size; ++i) arena[lehmerOff + i] = 0;
+    uint last = 0;
+    for (uint i = llf; i < end; ++i) {
+        const uint v = readHybridUint(d, r, coeffOrderContext(last));
+        arena[lehmerOff + i] = v;
+        last = v;
+        if (v >= size - i) { fail(d, kErrCorrupt); return; }
+    }
+    if (dest == 0xFFFFFFFFu) return;
+    // DecodeLehmerCode into a permutation, then compose with the natural order.
+    const uint log2n = ceilLog2Nonzero(size);
+    const uint paddedN = 1u << log2n;
+    for (uint i = 0; i < paddedN; ++i) {
+        const uint i1 = i + 1;
+        arena[tempOff + i] = i1 & (0u - i1);   // lowest set bit value
+    }
+    for (uint i = 0; i < size; ++i) {
+        uint rank = arena[lehmerOff + i] + 1;
+        uint bit = paddedN;
+        uint next = 0;
+        for (uint b = 0; b <= log2n; ++b) {
+            const uint cand = next + bit;
+            bit >>= 1;
+            if (arena[tempOff + cand - 1] < rank) {
+                next = cand;
+                rank -= arena[tempOff + cand - 1];
+            }
+        }
+        arena[dest + i] = next;   // permutation index, mapped below
+        next += 1;
+        while (next <= paddedN) {
+            arena[tempOff + next - 1] -= 1;
+            next += next & (0u - next);
+        }
+    }
+    for (uint k = 0; k < size; ++k) arena[dest + k] = arena[naturalOff + arena[dest + k]];
+}
+
+/// DecodeCoeffOrders for one pass: used_orders and the orders of every bucket.
+void readCoeffOrders(inout Dec d, uint windowOff) {
+    const uint usedOrders = brU32(d.br, distrVal(0x5F), distrVal(0x13), distrVal(0), distrBitsOffset(13, 0));
+    arena[kGsUsedOrders] = usedOrders;
+    const uint ordersOff = alloc(d, kCoeffOrderLimit * 64);
+    arena[kGsOrdersOff] = ordersOff;
+    if (d.error != kErrNone) return;
+    uint codeSet = 0;
+    SymReader r;
+    if (usedOrders != 0) {
+        codeSet = decodeHistograms(d, 8, false, windowOff);
+        if (d.error != kErrNone) return;
+        r = makeSymReader(d, codeSet, windowOff, 0);
+    }
+    uint computed = 0;
+    for (uint o = 0; o < kNumStrategies; ++o) {
+        const uint ord = kStrategyOrder[o];
+        if ((computed & (1u << ord)) != 0) continue;
+        computed |= 1u << ord;
+        const uint cx = kCoveredX[o];
+        const uint cy = kCoveredY[o];
+        const uint llf = cx * cy;
+        const uint size = 64 * llf;
+        // Natural order into channel 0's slot, copied to the others.
+        const uint natural = ordersOff + coeffOrderOffset(ord, 0);
+        naturalCoeffOrder(cx, cy, natural);
+        if ((usedOrders & (1u << ord)) == 0) {
+            for (uint c = 1; c < 3; ++c) {
+                const uint dst = ordersOff + coeffOrderOffset(ord, c);
+                for (uint k = 0; k < size; ++k) arena[dst + k] = arena[natural + k];
+            }
+        } else {
+            // The natural order is needed while the three permutations are applied.
+            const uint keep = alloc(d, size);
+            if (d.error != kErrNone) return;
+            for (uint k = 0; k < size; ++k) arena[keep + k] = arena[natural + k];
+            for (uint c = 0; c < 3; ++c) {
+                readCoeffOrder(d, r, llf, size, keep, ordersOff + coeffOrderOffset(ord, c));
+                if (d.error != kErrNone) return;
+            }
+        }
+    }
+    if (usedOrders != 0 && !checkFinalState(r)) fail(d, kErrCorrupt);
+}
+
+/// The whole AcGlobal section for a single-pass frame.
+void decodeAcGlobal(inout Dec d, uint numGroups, uint windowOff) {
+    readDequantMatrices(d);
+    if (d.error != kErrNone) return;
+    const uint numHistograms = 1 + brRead(d.br, ceilLog2Nonzero(numGroups));
+    arena[kGsNumHistograms] = numHistograms;
+    readCoeffOrders(d, windowOff);
+    if (d.error != kErrNone) return;
+    const uint numContexts = numHistograms * arena[kGsBctxNumCtxs] * (kNonZeroBuckets + kZeroDensityContextCount);
+    arena[kGsAcCodeSet] = decodeHistograms(d, numContexts, false, windowOff);
+}
