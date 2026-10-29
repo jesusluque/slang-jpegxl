@@ -354,20 +354,27 @@ Result<void> readFrameHeader(BitReader& br, const ImageMetadata& m, FrameHeader&
         }
     }
     if (f.frameType == 0 || f.frameType == 3) {
-        // BlendingInfo for the colour channels, then one per extra channel.
-        const auto readBlending = [&](bool isColor) -> uint32_t {
-            const uint32_t mode = br.readU32(U32Enc{{Val(0), Val(1), Val(2), BitsOffset(2, 3)}});
-            const bool withAlpha = m.numExtraChannels > 0 && (mode == 2 || mode == 4);
-            if (withAlpha) (void)br.readU32(U32Enc{{Val(0), Val(1), Val(2), BitsOffset(3, 3)}});
-            if (withAlpha || mode == 3) (void)br.readBool();   // clamp
-            if (mode != 0 || isPartial) (void)br.readU32(U32Enc{{Val(0), Val(1), Val(2), Val(3)}});   // source
-            (void)isColor;
-            return mode;
+        // BlendingInfo for the colour channels, then one per extra channel
+        // (modes: 0 replace, 1 add, 2 blend, 3 alpha-weighted add, 4 multiply).
+        const auto readBlending = [&]() -> Result<BlendingInfo> {
+            BlendingInfo b;
+            b.mode = br.readU32(U32Enc{{Val(0), Val(1), Val(2), BitsOffset(2, 3)}});
+            if (b.mode > 4) return Error(ErrorCode::Corrupt, "blend mode");
+            const bool withAlpha = m.numExtraChannels > 0 && (b.mode == 2 || b.mode == 3);
+            if (withAlpha) {
+                b.alphaChannel = br.readU32(U32Enc{{Val(0), Val(1), Val(2), BitsOffset(3, 3)}});
+                if (b.alphaChannel >= m.numExtraChannels) return Error(ErrorCode::Corrupt, "blending alpha channel");
+            }
+            if (withAlpha || b.mode == 4) b.clamp = br.readBool();
+            if (b.mode != 0 || isPartial) b.source = br.readU32(U32Enc{{Val(0), Val(1), Val(2), Val(3)}});
+            return b;
         };
-        f.blendMode = readBlending(true);
-        for (uint32_t i = 0; i < m.numExtraChannels; ++i) (void)readBlending(false);
+        SJXL_ASSIGN(f.blending, readBlending());
+        f.blendMode = f.blending.mode;
+        f.ecBlending.resize(m.numExtraChannels);
+        for (BlendingInfo& b : f.ecBlending) { SJXL_ASSIGN(b, readBlending()); }
         if (m.haveAnimation) {
-            (void)br.readU32(U32Enc{{Val(0), Val(1), Bits(8), Bits(32)}});   // duration
+            f.duration = br.readU32(U32Enc{{Val(0), Val(1), Bits(8), Bits(32)}});
             if (m.haveTimecodes) (void)br.read(32);
         }
         f.isLast = br.readBool();
@@ -524,7 +531,7 @@ Result<void> parseFramesFrom(Parsed& p, size_t startByte) {
         for (uint32_t u : f.ecUpsampling) {
             if (u < f.upsampling || u > 8) return corrupt("extra channel upsampling");
         }
-        if (f.customSizeOrOrigin && !referenceOnly) return unsupported("frames with a custom size or origin");
+        if (f.customSizeOrOrigin && dcFrame) return corrupt("DC frame with a custom size");
         if (referenceOnly) {
             if (!f.saveBeforeColorTransform) return unsupported("reference frames saved after the colour transform");
             if (f.saveAsReference >= 4) return corrupt("reference slot");
@@ -532,8 +539,8 @@ Result<void> parseFramesFrom(Parsed& p, size_t startByte) {
         } else if (dcFrame) {
             if (f.dcLevel < 1 || f.dcLevel > 4) return corrupt("DC frame level");
             dcFrameSaved[f.dcLevel] = true;
-        } else if (!f.isLast) {
-            return unsupported("multiple displayed frames (animation or blending)");
+        } else if (!f.isLast && f.saveAsReference >= 4) {
+            return corrupt("reference slot");
         }
         if ((f.flags & FrameHeader::kPatches) && !referenceSaved[0] && !referenceSaved[1] && !referenceSaved[2] && !referenceSaved[3]) {
             return corrupt("patches without a reference frame");
@@ -566,9 +573,9 @@ Result<void> parseFramesFrom(Parsed& p, size_t startByte) {
             return ok();
         }
         SJXL_ASSIGN(const size_t end, readTocSizes(p, frame, fr.bitPosition(), {}));
-        const bool displayed = !referenceOnly && !dcFrame;
+        const bool last = f.isLast;
         p.frames.push_back(std::move(frame));
-        if (displayed) break;
+        if (last) break;
         frameStartByte = end;
     }
     p.frame = p.frames.back();
@@ -591,10 +598,10 @@ Result<void> finishToc(Parsed& p, std::span<const uint32_t> permutation, size_t 
     if (permutation.size() != frame.numSections) return Error(ErrorCode::Corrupt, "TOC permutation size");
     SJXL_ASSIGN(const size_t end, readTocSizes(p, frame, endBit, permutation));
     frame.tocPermuted = false;   // sections are final now
-    const bool displayed = frame.header.frameType != 1 && frame.header.frameType != 2;
+    const bool last = frame.header.isLast;
     p.incomplete = false;
     p.frame = frame;
-    if (displayed) return ok();
+    if (last) return ok();
     return parseFramesFrom(p, end);
 }
 
@@ -611,7 +618,6 @@ Result<Parsed> parse(std::span<const uint8_t> file) {
 
     // What M2 does not do yet.
     if (m.havePreview) return unsupported("preview frames");
-    if (m.haveAnimation) return unsupported("animation");
     if (m.orientation != 1) return unsupported("orientation other than identity");
     if (m.bitsPerSample > 16 || m.floatingPointSample) return unsupported("floating point or >16-bit samples");
     if (!m.tfHaveGamma && m.transferFunction != 13 && m.transferFunction != 8 && m.transferFunction != 17) {

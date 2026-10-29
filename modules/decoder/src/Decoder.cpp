@@ -69,6 +69,8 @@ Result<std::unique_ptr<Decoder>> Decoder::create(std::shared_ptr<gpu::ShaderLibr
     SJXL_ASSIGN(dec->ecToPlanes_, gpu::ComputeKernel::create(lib, "sjxl/dec/modular_out", "ecToPlanes"));
     SJXL_ASSIGN(dec->tocPermutation_, gpu::ComputeKernel::create(lib, "sjxl/dec/toc", "decodeTocPermutation"));
     SJXL_ASSIGN(dec->icc_, gpu::ComputeKernel::create(lib, "sjxl/dec/toc", "decodeIcc"));
+    SJXL_ASSIGN(dec->toOutputPlanes_, gpu::ComputeKernel::create(lib, "sjxl/dec/output", "toOutputPlanes"));
+    SJXL_ASSIGN(dec->blendCanvas_, gpu::ComputeKernel::create(lib, "sjxl/dec/blend", "blendCanvas"));
     SJXL_ASSIGN(dec->upsample_, gpu::ComputeKernel::create(lib, "sjxl/dec/upsample", "upsample"));
     SJXL_ASSIGN(dec->chromaUpsample_, gpu::ComputeKernel::create(lib, "sjxl/dec/filters", "chromaUpsample"));
     SJXL_ASSIGN(dec->noiseRandom_, gpu::ComputeKernel::create(lib, "sjxl/dec/noise", "noiseRandom"));
@@ -120,26 +122,6 @@ Result<size_t> Decoder::decodeIccEnd(const codestream::Parsed& parsed) {
     return size_t{words[1]};
 }
 
-Result<image::Rgb8> Decoder::decode(std::span<const uint8_t> file) {
-    SJXL_ASSIGN(const codestream::Parsed parsed, parseAll(file));
-    std::array<RefFrame, 4> refs;
-    std::array<RefFrame, 5> dcFrames;
-    image::Rgb8 image;
-    FrameIndices indices;
-    for (const codestream::ParsedFrame& frame : parsed.frames) {
-        // dec_frame.cc: a displayed frame bumps the visible index and resets the other.
-        if (frame.header.frameType == 0 && frame.header.isLast) { ++indices.visible; indices.nonvisible = 0; }
-        else ++indices.nonvisible;
-        auto result = run(parsed, frame, false, refs, dcFrames, indices);
-        if (!result && result.error().code() == ErrorCode::Unsupported && result.error().message() == "LZ77 window") {
-            result = run(parsed, frame, true, refs, dcFrames, indices);
-        }
-        if (!result) return result.error();
-        image = std::move(*result);
-    }
-    return image;
-}
-
 Result<Decoder::TocPermutation> Decoder::decodeTocPermutation(const codestream::Parsed& parsed, const codestream::ParsedFrame& frame) {
     gpu::Device& dev = *device_;
     std::vector<uint32_t> csWords((parsed.codestream.size() + 3) / 4 + 2, 0);
@@ -166,7 +148,34 @@ Result<Decoder::TocPermutation> Decoder::decodeTocPermutation(const codestream::
     return perm;
 }
 
-Result<image::Rgb8> Decoder::run(const codestream::Parsed& parsed, const codestream::ParsedFrame& frame, bool withLz77Windows,
+Result<std::vector<Frame>> Decoder::decodeAll(std::span<const uint8_t> file) {
+    SJXL_ASSIGN(const codestream::Parsed parsed, parseAll(file));
+    std::array<RefFrame, 4> refs;
+    std::array<RefFrame, 5> dcFrames;
+    std::vector<Frame> frames;
+    FrameIndices indices;
+    for (const codestream::ParsedFrame& frame : parsed.frames) {
+        // dec_frame.cc: a displayed frame bumps the visible index and resets the other.
+        const bool displayed = frame.header.frameType == 0 || frame.header.frameType == 3;
+        if (displayed && (frame.header.isLast || frame.header.duration > 0)) { ++indices.visible; indices.nonvisible = 0; }
+        else ++indices.nonvisible;
+        auto result = run(parsed, frame, false, refs, dcFrames, indices);
+        if (!result && result.error().code() == ErrorCode::Unsupported && result.error().message() == "LZ77 window") {
+            result = run(parsed, frame, true, refs, dcFrames, indices);
+        }
+        if (!result) return result.error();
+        if (result->emitted) frames.push_back(Frame{std::move(result->image), frame.header.duration});
+    }
+    if (frames.empty()) return Error(ErrorCode::Corrupt, "no displayed frame");
+    return frames;
+}
+
+Result<image::Rgb8> Decoder::decode(std::span<const uint8_t> file) {
+    SJXL_ASSIGN(std::vector<Frame> frames, decodeAll(file));
+    return std::move(frames.front().image);
+}
+
+Result<Decoder::FrameOutput> Decoder::run(const codestream::Parsed& parsed, const codestream::ParsedFrame& frame, bool withLz77Windows,
                                  std::array<RefFrame, 4>& refs, std::array<RefFrame, 5>& dcFrames, FrameIndices indices) {
     gpu::Device& dev = *device_;
     const codestream::ImageMetadata& m = parsed.metadata;
@@ -269,9 +278,27 @@ Result<image::Rgb8> Decoder::run(const codestream::Parsed& parsed, const codestr
         for (size_t c = 0; c < 3; ++c) { hshift[c] = frame.header.hshift[c]; vshift[c] = frame.header.vshift[c]; }
     }
     const uint32_t outDepth = m.bitsPerSample > 8 ? 16u : 8u;   // djxl writes 16-bit files for deeper images
-    const uint32_t outBytes = outWidth * outHeight * outChannels * (outDepth / 8);
+    // Displayed frames compose onto a canvas of the image's size (frames may be partial).
+    const bool displayed = frame.header.frameType == 0 || frame.header.frameType == 3;
+    const uint32_t canvasW = m.xsize, canvasH = m.ysize;
+    const uint32_t outBytes = canvasW * canvasH * outChannels * (outDepth / 8);
+    const codestream::BlendingInfo& blending = frame.header.blending;
+    const RefFrame* bgCanvas = nullptr;
+    if (displayed) {
+        const RefFrame& src0 = refs[blending.source];
+        const bool full = !frame.header.customSizeOrOrigin && outWidth == canvasW && outHeight == canvasH;
+        bool needsBg = blending.mode != 0 || !full;
+        for (const codestream::BlendingInfo& eb : frame.header.ecBlending) needsBg = needsBg || eb.mode != 0;
+        if (needsBg && src0.planes && !src0.inXyb) bgCanvas = &src0;
+        if (needsBg && src0.planes && src0.inXyb) return Error(ErrorCode::Corrupt, "blending onto a reference frame saved before the colour transform");
+    }
     SJXL_ASSIGN(auto rgb8, gpu::Buffer::ofType<uint32_t>(dev, (outBytes + 3) / 4, "dec.rgb8"));
     SJXL_ASSIGN(auto dummy, gpu::Buffer::ofType<float>(dev, 4, "dec.dummy"));   // stands in for absent optional inputs
+    std::optional<gpu::Buffer> frameOut, canvas;   // displayed frames: output-encoding planes, then the composited canvas
+    if (displayed) {
+        SJXL_ASSIGN(frameOut, gpu::Buffer::ofType<float>(dev, uint64_t{3} * outWidth * outHeight, "dec.frameOut"));
+        SJXL_ASSIGN(canvas, gpu::Buffer::ofType<float>(dev, uint64_t{3 + numEc} * canvasW * canvasH, "dec.canvas"));
+    }
     std::optional<gpu::Buffer> weightsKeep, ecWeightsKeep;   // upsampling weights live until the batch ran
 
     gpu::CommandBatch batch(dev);
@@ -347,8 +374,10 @@ Result<image::Rgb8> Decoder::run(const codestream::Parsed& parsed, const codestr
             c["params"]["passMaxB"].setData(quad(maxShift, 4));
             c["params"]["passMaxC"].setData(quad(maxShift, 8));
         }
-        c["params"]["refW"].setData(std::array<uint32_t, 4>{refs[0].width, refs[1].width, refs[2].width, refs[3].width});
-        c["params"]["refH"].setData(std::array<uint32_t, 4>{refs[0].height, refs[1].height, refs[2].height, refs[3].height});
+        std::array<uint32_t, 4> rw{}, rh{};
+        for (size_t i = 0; i < 4; ++i) if (refs[i].planes && refs[i].inXyb) { rw[i] = refs[i].width; rh[i] = refs[i].height; }
+        c["params"]["refW"].setData(rw);
+        c["params"]["refH"].setData(rh);
     };
     if (modular) {
         modularGlobals_.dispatch(batch, {1, 1, 1}, bindSections);
@@ -609,9 +638,10 @@ Result<image::Rgb8> Decoder::run(const codestream::Parsed& parsed, const codestr
             const char* names[4] = {"ref0", "ref1", "ref2", "ref3"};
             std::array<uint32_t, 4> pw{}, ph{};
             for (size_t i = 0; i < 4; ++i) {
-                c[names[i]].setBinding(refs[i].planes ? refs[i].planes->rhi() : dummy.rhi());
-                pw[i] = refs[i].paddedWidth;
-                ph[i] = refs[i].paddedHeight;
+                const bool usable = refs[i].planes && refs[i].inXyb;
+                c[names[i]].setBinding(usable ? refs[i].planes->rhi() : dummy.rhi());
+                pw[i] = usable ? refs[i].paddedWidth : 0u;
+                ph[i] = usable ? refs[i].paddedHeight : 0u;
             }
             c["params"]["width"].setData(outWidth);
             c["params"]["height"].setData(outHeight);
@@ -647,13 +677,14 @@ Result<image::Rgb8> Decoder::run(const codestream::Parsed& parsed, const codestr
         noiseConvolve_.dispatch(batch, {outWidth, outHeight, 1}, bindNoise);
         noiseAdd_.dispatch(batch, {outWidth, outHeight, 1}, bindNoise);
     }
-    if (!referenceOnly && !dcFrame) output_.dispatch(batch, {(outBytes + 3) / 4, 1, 1}, [&](rhi::ShaderCursor c) {
-        c["xyb"].setBinding(src->rhi());
+    const auto bindOutput = [&](rhi::ShaderCursor c, bool fromCanvas) {
+        c["xyb"].setBinding(fromCanvas ? canvas->rhi() : src->rhi());
         c["rgb8"].setBinding(rgb8.rhi());
-        c["params"]["width"].setData(outWidth);
-        c["params"]["height"].setData(outHeight);
-        c["params"]["paddedWidth"].setData(outPaddedWidth);
-        c["params"]["paddedHeight"].setData(outPaddedHeight);
+        c["outPlanes"].setBinding(frameOut ? frameOut->rhi() : dummy.rhi());
+        c["params"]["width"].setData(fromCanvas ? canvasW : outWidth);
+        c["params"]["height"].setData(fromCanvas ? canvasH : outHeight);
+        c["params"]["paddedWidth"].setData(fromCanvas ? canvasW : outPaddedWidth);
+        c["params"]["paddedHeight"].setData(fromCanvas ? canvasH : outPaddedHeight);
         const float scale = 255.0f / m.intensityTarget;
         for (int r = 0; r < 3; ++r) {
             for (int k = 0; k < 3; ++k) c["params"]["inverseMatrix"][r * 4 + k].setData(m.opsinInverseMatrix[static_cast<size_t>(r * 3 + k)] * scale);
@@ -679,12 +710,43 @@ Result<image::Rgb8> Decoder::run(const codestream::Parsed& parsed, const codestr
         }
         c["params"]["transfer"].setData(transfer);
         c["params"]["gamma"].setData(gamma);
-        c["params"]["mode"].setData(uint32_t{ycbcr ? 2u : (modular && !modularXyb) ? 1u : 0u});
+        c["params"]["mode"].setData(uint32_t{fromCanvas ? 1u : ycbcr ? 2u : (modular && !modularXyb) ? 1u : 0u});
         c["params"]["channels"].setData(outChannels);
-        c["params"]["alphaPlane"].setData(alphaIndex < numEc ? alphaIndex : 0u);
+        c["params"]["alphaPlane"].setData(fromCanvas ? (alphaIndex < numEc ? 3 + alphaIndex : 0u) : (alphaIndex < numEc ? alphaIndex : 0u));
         c["params"]["bytesPerSample"].setData(outDepth / 8);
-        c["alpha"].setBinding(ecOut ? ecOut->rhi() : dummy.rhi());
-    });
+        c["alpha"].setBinding(fromCanvas ? canvas->rhi() : ecOut ? ecOut->rhi() : dummy.rhi());
+    };
+    const bool emitted = displayed && (frame.header.isLast || frame.header.duration > 0);
+    if (displayed) {
+        // The frame in the output encoding, composed onto the canvas (stage_blending.cc), then packed.
+        toOutputPlanes_.dispatch(batch, {outWidth * outHeight, 1, 1}, [&](rhi::ShaderCursor c) { bindOutput(c, false); });
+        blendCanvas_.dispatch(batch, {canvasW * canvasH, 1, 1}, [&](rhi::ShaderCursor c) {
+            c["fg"].setBinding(frameOut->rhi());
+            c["fgEc"].setBinding(ecOut ? ecOut->rhi() : dummy.rhi());
+            c["bg"].setBinding(bgCanvas ? bgCanvas->planes->rhi() : dummy.rhi());
+            c["canvas"].setBinding(canvas->rhi());
+            c["params"]["width"].setData(canvasW);
+            c["params"]["height"].setData(canvasH);
+            c["params"]["fw"].setData(outWidth);
+            c["params"]["fh"].setData(outHeight);
+            c["params"]["x0"].setData(frame.header.customSizeOrOrigin ? frame.header.x0 : 0);
+            c["params"]["y0"].setData(frame.header.customSizeOrOrigin ? frame.header.y0 : 0);
+            c["params"]["fgPaddedWidth"].setData(outPaddedWidth);
+            c["params"]["fgPaddedHeight"].setData(outPaddedHeight);
+            c["params"]["numEc"].setData(numEc);
+            c["params"]["hasBg"].setData(uint32_t{bgCanvas ? 1u : 0u});
+            c["params"]["alphaIndex"].setData(alphaIndex < numEc ? blending.alphaChannel : numEc);
+            c["params"]["alphaPremultiplied"].setData(uint32_t{alphaIndex < numEc && m.extraChannels[blending.alphaChannel].alphaAssociated ? 1u : 0u});
+            c["params"]["modes"].setData(std::array<uint32_t, 4>{blending.mode, blending.clamp ? 1u : 0u, 0u, 0u});
+            std::array<uint32_t, 4> ecModes{};
+            for (uint32_t e = 0; e < numEc; ++e) {
+                const codestream::BlendingInfo& eb = frame.header.ecBlending[e];
+                ecModes[e] = eb.mode | (eb.clamp ? 1u << 8 : 0u) | (eb.alphaChannel << 16);
+            }
+            c["params"]["ecModes"].setData(ecModes);
+        });
+        if (emitted) output_.dispatch(batch, {(outBytes + 3) / 4, 1, 1}, [&](rhi::ShaderCursor c) { bindOutput(c, true); });
+    }
     SJXL_TRY(batch.submit(true));
 
     SJXL_ASSIGN(const std::vector<uint32_t> statusHost, status.readAll<uint32_t>(dev));
@@ -716,8 +778,31 @@ Result<image::Rgb8> Decoder::run(const codestream::Parsed& parsed, const codestr
         ref.paddedHeight = outPaddedHeight;
         ref.width = outWidth;
         ref.height = outHeight;
-        return image::Rgb8{};
+        ref.inXyb = true;
+        return FrameOutput{};
     }
+    // CanBeReferenced: not last, and a duration-0 frame or an explicit slot keeps its canvas.
+    if (!frame.header.isLast && (frame.header.duration == 0 || frame.header.saveAsReference != 0)) {
+        RefFrame& ref = refs[frame.header.saveAsReference];
+        ref.planes.emplace(std::move(*canvas));
+        ref.paddedWidth = canvasW;
+        ref.paddedHeight = canvasH;
+        ref.width = canvasW;
+        ref.height = canvasH;
+        ref.inXyb = false;
+        if (!emitted) return FrameOutput{};
+        SJXL_ASSIGN(const std::vector<uint32_t> wordsOut, rgb8.readAll<uint32_t>(dev));
+        FrameOutput fo;
+        fo.emitted = true;
+        fo.image.width = canvasW;
+        fo.image.height = canvasH;
+        fo.image.channels = outChannels;
+        fo.image.bitDepth = outDepth;
+        fo.image.pixels.resize(outBytes);
+        std::memcpy(fo.image.pixels.data(), wordsOut.data(), outBytes);
+        return fo;
+    }
+    if (!emitted) return FrameOutput{};
 
     if (!platform::env("SJXL_DEBUG").empty() && (frame.header.flags & codestream::FrameHeader::kPatches)) {
         log::info("dec debug: patches: {} reference positions, {} positions; frame {}x{}", header[56], header[58], dim.xsize, dim.ysize);
@@ -804,14 +889,15 @@ Result<image::Rgb8> Decoder::run(const codestream::Parsed& parsed, const codestr
         log::info("dec debug: dequant DCT16 X[0,1] = {} {}; AFV X[0..4] = {} {} {} {}", tabHost[768], tabHost[769], tabHost[7488], tabHost[7489], tabHost[7490], tabHost[7491]);
     }
     SJXL_ASSIGN(const std::vector<uint32_t> words, rgb8.readAll<uint32_t>(dev));
-    image::Rgb8 out;
-    out.width = outWidth;
-    out.height = outHeight;
-    out.channels = outChannels;
-    out.bitDepth = outDepth;
-    out.pixels.resize(outBytes);
-    std::memcpy(out.pixels.data(), words.data(), outBytes);
-    return out;
+    FrameOutput fo;
+    fo.emitted = true;
+    fo.image.width = canvasW;
+    fo.image.height = canvasH;
+    fo.image.channels = outChannels;
+    fo.image.bitDepth = outDepth;
+    fo.image.pixels.resize(outBytes);
+    std::memcpy(fo.image.pixels.data(), words.data(), outBytes);
+    return fo;
 }
 
 }   // namespace sjxl::dec

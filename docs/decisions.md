@@ -54,10 +54,10 @@ per subsystem or milestone, appended to as the work goes. Dates are absolute.
 - **M3 encoder quality**: inverse Gaborish + default LoopFilter, EPF sharpness,
   CfL per tile, adaptive quant field, DCT16/32 strategy search, context
   clustering (≤ 32, fixed-point costs as cujpegxl), ANS for AC.
-- **M4 decoder completeness**: splines, animation, grey JPEG transcodes,
-  loop filters on YCbCr frames, extra channel blending in patches,
-  premultiplied alpha handling, writing the ICC profile into the output
-  file, float samples. (16-bit output: done.) (64–256 px
+- **M4 decoder completeness**: splines, grey JPEG transcodes, loop filters
+  on YCbCr frames, extra channel blending in patches, writing the ICC
+  profile into the output file, float samples. (16-bit output, animation
+  with blending and partial frames: done.) (64–256 px
   transforms, Modular frames with RCT/palette/Squeeze, lossy modular,
   patches, progressive passes, DC frames, permuted TOCs, upsampling, noise,
   extra channels with alpha output, JPEG recompression: done.)
@@ -466,3 +466,34 @@ reports PSNR on the images' own scale.
 Measured (`[depth16]` test, berlin_200 as 16-bit with informative low bytes):
 lossless and responsive lossless bit-exact; VarDCT at distance 1 within 3 /
 65535 (108 dB), lossy modular within 1 / 65535.
+
+## Animation, blending and partial frames (2026-10-29)
+
+Every displayed frame now composes onto a *canvas* of the image's size
+(`blend.slang blendCanvas`, one thread per canvas pixel): the frame, converted
+to the output encoding (`output.slang toOutputPlanes`), is placed at its
+origin over the canvas saved in its blending source slot (zeros when none)
+with the frame's blending mode (replace, add, multiply, alpha blend,
+alpha-weighted add; extra channels have their own modes and are blended first,
+so the colour uses the pre-blend alpha; premultiplied alpha follows
+alpha.cc). Outside the frame's rectangle the background shows through. The
+canvas is then packed to bytes, and kept in a reference slot when the frame
+`CanBeReferenced()` (not last, and duration 0 or an explicit slot) with
+`inXyb = false`: patches use slots saved before the colour transform,
+blending slots saved after, and a mismatch is an error, as in libjxl. A frame
+is emitted when it is last or has a duration; `Decoder::decodeAll` returns
+them with durations, `decode()` the first, and `sjxl decode` writes
+`out_000.png, out_001.png, …` for animations.
+
+Two facts this exposed: libjxl keeps out-of-range values through the transfer
+function (the sRGB curve applies to the magnitude with the sign restored,
+gamma gives 0 below zero) and clamps only when packing bytes — clamping before
+blending gave a blue of 20 instead of 0 where a lossy frame's ringing went
+negative under a translucent edge; and the alpha blend is computed in floats
+on both sides, so blended frames of a *lossless* animation can still differ
+by one 8-bit step from djxl (236 of 18432 pixels did).
+
+Measured (`[animation]` test, 4-frame RGBA APNGs made by
+`tests/support/apng_make.py`, djxl's APNG split by `apng_split.py`): full
+frames lossless bit-exact, VarDCT and lossy modular within 1; partial frames
+blended over with alpha within 1 in all three encodings.

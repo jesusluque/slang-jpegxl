@@ -489,3 +489,50 @@ TEST_CASE("the decoder matches djxl on 16-bit images", "[decoder][conformance][c
     // Lossless must be exact; lossy goes through floats on both sides, so a few 16-bit steps may differ.
     CHECK(metrics->maxAbsDiff <= (options.find("-d 0") != std::string::npos ? 0u : 8u));
 }
+
+TEST_CASE("the decoder matches djxl on animations", "[decoder][conformance][cjxl][animation]") {
+    const std::filesystem::path djxl = test::findTool("djxl");
+    const std::filesystem::path cjxl = test::findTool("cjxl");
+    const std::filesystem::path python = test::findTool("python3");
+    if (djxl.empty() || cjxl.empty()) SKIP("cjxl/djxl are not installed");
+    if (python.empty()) SKIP("python3 is needed to make and split APNGs");
+    const std::filesystem::path support = std::filesystem::path(SJXL_TEST_DATA_DIR) / ".." / "support";
+    // "full": every frame a whole canvas (replace); "partial": frames 1.. are sub-rectangles blended over with alpha.
+    const std::string layout = GENERATE(std::string("full"), std::string("partial"));
+    const std::filesystem::path apng = test::scratchDir() / std::format("anim_source_{}.png", layout);
+    REQUIRE(test::run(std::format("\"{}\" -I \"{}\" \"{}\" 4 96 64 {}", python.string(), (support / "apng_make.py").string(), apng.string(), layout)));
+    const std::string options = GENERATE(std::string("-d 0 -e 3"), std::string("-d 1 -e 5"), std::string("-m 1 -d 1 -e 7"));
+    CAPTURE(layout, options);
+    std::string tag = layout + options;
+    for (char& ch : tag) if (ch == ' ' || ch == '-' || ch == '=') ch = '_';
+    const std::filesystem::path jxl = test::scratchDir() / std::format("dec_anim{}.jxl", tag);
+    const std::filesystem::path out = test::scratchDir() / std::format("dec_anim{}.djxl.png", tag);
+    const std::filesystem::path prefix = test::scratchDir() / std::format("dec_anim{}_djxl", tag);
+    REQUIRE(test::run(std::format("\"{}\" \"{}\" \"{}\" {} >/dev/null 2>&1", cjxl.string(), apng.string(), jxl.string(), options)));
+    REQUIRE(test::run(std::format("\"{}\" \"{}\" \"{}\" >/dev/null 2>&1", djxl.string(), jxl.string(), out.string())));
+    REQUIRE(test::run(std::format("\"{}\" -I \"{}\" \"{}\" \"{}\" >/dev/null", python.string(), (support / "apng_split.py").string(), out.string(), prefix.string())));
+    auto bytes = image::readFile(jxl);
+    REQUIRE(bytes);
+    auto parsed = dec::Decoder::info(*bytes);
+    REQUIRE(parsed);
+    REQUIRE(parsed->metadata.haveAnimation);
+    auto ours = decoder().decodeAll(*bytes);
+    if (!ours && ours.error().code() == ErrorCode::Unsupported) {
+        WARN(std::format("animation {}: unsupported: {}", options, ours.error().message()));
+        SUCCEED();
+        return;
+    }
+    REQUIRE(ours);
+    REQUIRE(ours->size() == 4);
+    for (size_t i = 0; i < ours->size(); ++i) {
+        auto reference = image::readImage(std::format("{}_{:03}.png", prefix.string(), i));
+        REQUIRE(reference);
+        auto metrics = test::compare(*reference, (*ours)[i].image);
+        REQUIRE(metrics);
+        WARN(std::format("animation {} {} frame {} (duration {}): vs djxl PSNR {:.2f} dB, max diff {}", layout, options, i, (*ours)[i].duration,
+                         metrics->psnr, metrics->maxAbsDiff));
+        // Lossless full frames are exact; alpha blending runs in floats on both sides, so a blended frame may differ by one.
+        const bool exact = options.find("-d 0") != std::string::npos && (layout == "full" || i == 0);
+        CHECK(metrics->maxAbsDiff <= (exact ? 0u : 1u));
+    }
+}

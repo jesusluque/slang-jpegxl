@@ -7,6 +7,7 @@ module dec_output;
 StructuredBuffer<float>  xyb;     // 3 planes, paddedWidth * paddedHeight
 StructuredBuffer<float>  alpha;   // the alpha plane (channels == 4), same layout, at plane `alphaPlane`
 RWStructuredBuffer<uint> rgb8;    // width * height * channels bytes, packed
+RWStructuredBuffer<float> outPlanes;   // toOutputPlanes: 3 planes, width * height, the output encoding in [0, 1]
 
 struct OutputParams {
     uint  width;
@@ -26,11 +27,45 @@ struct OutputParams {
 };
 ConstantBuffer<OutputParams> params;
 
+/// stage_from_linear.cc: out-of-range values are kept (blending happens after this, the
+/// clamp comes with the 8/16-bit packing). sRGB is applied to the magnitude with the
+/// sign restored (TF_SRGB::EncodedFromDisplay); gamma gives 0 for non-positive input.
 float encodeFromLinear(float v) {
-    v = clamp(v, 0.0f, 1.0f);
     if (params.transfer == 1) return v;
-    if (params.transfer == 2) return pow(v, params.gamma);
-    return v <= 0.0031308f ? 12.92f * v : 1.055f * pow(v, 1.0f / 2.4f) - 0.055f;
+    if (params.transfer == 2) return v <= 0.0f ? 0.0f : pow(v, params.gamma);
+    const float a = abs(v);
+    const float e = a <= 0.0031308f ? 12.92f * a : 1.055f * pow(a, 1.0f / 2.4f) - 0.055f;
+    return v < 0.0f ? -e : e;
+}
+
+/// Colour channel c of pixel (x, y) in the output encoding, [0, 1] (not yet clamped for mode 0).
+float outputValue(uint c, uint x, uint y) {
+    const uint plane = params.paddedWidth * params.paddedHeight;
+    const uint at = y * params.paddedWidth + x;
+    if (params.mode == 1) return xyb[c * plane + at];
+    if (params.mode == 2) {   // stage_ycbcr.cc
+        const float yv = xyb[plane + at] + 128.0f / 255.0f, cb = xyb[at], cr = xyb[2 * plane + at];
+        return c == 0 ? yv + 1.402f * cr : c == 1 ? yv + (-0.114f * 1.772f / 0.587f) * cb + (-0.299f * 1.402f / 0.587f) * cr : yv + 1.772f * cb;
+    }
+    const float ox = xyb[at], oy = xyb[plane + at], ob = xyb[2 * plane + at];
+    float gr = oy + ox - params.negBiasCbrt[0];
+    float gg = oy - ox - params.negBiasCbrt[1];
+    float gb = ob - params.negBiasCbrt[2];
+    const float mr = gr * gr * gr + params.negBias[0];
+    const float mg = gg * gg * gg + params.negBias[1];
+    const float mb = gb * gb * gb + params.negBias[2];
+    const float lin = params.inverseMatrix[c * 4 + 0] * mr + params.inverseMatrix[c * 4 + 1] * mg + params.inverseMatrix[c * 4 + 2] * mb;
+    return encodeFromLinear(lin);
+}
+
+/// One thread per pixel: the three output-encoding planes (for blending and canvases).
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void toOutputPlanes(uint3 tid: SV_DispatchThreadID) {
+    const uint n = params.width * params.height;
+    if (tid.x >= n) return;
+    const uint x = tid.x % params.width, y = tid.x / params.width;
+    for (uint c = 0; c < 3; ++c) outPlanes[c * n + tid.x] = outputValue(c, x, y);
 }
 
 /// Sample `index` (pixel * channels + channel) as an integer on the output scale.
@@ -43,21 +78,7 @@ uint sampleFor(uint index) {
     const uint plane = params.paddedWidth * params.paddedHeight;
     const uint at = y * params.paddedWidth + x;
     if (c == 3) return uint(round(clamp(alpha[params.alphaPlane * plane + at], 0.0f, 1.0f) * peak));
-    if (params.mode == 1) return uint(round(clamp(xyb[c * plane + at], 0.0f, 1.0f) * peak));
-    if (params.mode == 2) {   // stage_ycbcr.cc
-        const float yv = xyb[plane + at] + 128.0f / 255.0f, cb = xyb[at], cr = xyb[2 * plane + at];
-        const float v = c == 0 ? yv + 1.402f * cr : c == 1 ? yv + (-0.114f * 1.772f / 0.587f) * cb + (-0.299f * 1.402f / 0.587f) * cr : yv + 1.772f * cb;
-        return uint(round(clamp(v, 0.0f, 1.0f) * peak));
-    }
-    const float ox = xyb[at], oy = xyb[plane + at], ob = xyb[2 * plane + at];
-    float gr = oy + ox - params.negBiasCbrt[0];
-    float gg = oy - ox - params.negBiasCbrt[1];
-    float gb = ob - params.negBiasCbrt[2];
-    const float mr = gr * gr * gr + params.negBias[0];
-    const float mg = gg * gg * gg + params.negBias[1];
-    const float mb = gb * gb * gb + params.negBias[2];
-    const float lin = params.inverseMatrix[c * 4 + 0] * mr + params.inverseMatrix[c * 4 + 1] * mg + params.inverseMatrix[c * 4 + 2] * mb;
-    return uint(round(encodeFromLinear(lin) * peak));
+    return uint(round(clamp(outputValue(c, x, y), 0.0f, 1.0f) * peak));
 }
 
 uint byteFor(uint index) {

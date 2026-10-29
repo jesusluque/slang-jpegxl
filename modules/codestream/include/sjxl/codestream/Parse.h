@@ -107,6 +107,14 @@ struct LoopFilter {
     float    epfSigmaForModular = 1.0f;
 };
 
+/// BlendingInfo (frame_header.h): how a displayed frame composes onto a reference canvas.
+struct BlendingInfo {
+    uint32_t mode = 0;           // 0 replace, 1 add, 2 blend (alpha), 3 alpha-weighted add, 4 multiply
+    uint32_t alphaChannel = 0;   // extra channel index for modes 2 and 3
+    bool     clamp = false;
+    uint32_t source = 0;         // reference slot of the background
+};
+
 struct FrameHeader {
     uint32_t frameType = 0;      // 0 regular, 1 DC, 2 reference only, 3 skip progressive
     bool     isModular = false;
@@ -127,7 +135,10 @@ struct FrameHeader {
     bool     customSizeOrOrigin = false;
     int32_t  x0 = 0, y0 = 0;
     uint32_t frameXsize = 0, frameYsize = 0;   // 0: the image size
-    uint32_t blendMode = 0;
+    uint32_t blendMode = 0;      // = blending.mode
+    BlendingInfo blending;
+    std::vector<BlendingInfo> ecBlending;   // one per extra channel
+    uint32_t duration = 0;       // animation ticks (0: not displayed on its own unless last)
     bool     isLast = true;
     uint32_t saveAsReference = 0;
     bool     saveBeforeColorTransform = false;

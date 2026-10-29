@@ -18,7 +18,7 @@ build/macos-arm64-debug/bin/sjxl_gpu_tests "prefix sum*"    # one Catch2 case by
 cmake --build build/macos-arm64-debug --target sjxl_gpu_tests   # one binary
 build/macos-arm64-debug/bin/sjxl info [in.jxl]              # device info, or a file's headers and frame list
 build/macos-arm64-debug/bin/sjxl encode in.png out.jxl --distance 1.0   # M1
-build/macos-arm64-debug/bin/sjxl decode in.jxl out.png                  # VarDCT, every stage on the GPU
+build/macos-arm64-debug/bin/sjxl decode in.jxl out.png                  # every stage on the GPU; animations write out_000.png, ...
 build/macos-arm64-debug/bin/sjxl compare a.png b.png                    # PSNR + largest diff, on the GPU
 build/macos-arm64-debug/bin/sjxl pixel a.png x y ; sjxl convert in.png out.png   # one pixel; re-save as RGB8
 SJXL_DEBUG=1 SJXL_DEBUG_BLOCK=57 build/macos-arm64-debug/bin/sjxl decode ...    # dumps one block's coefficients, DC, orders
@@ -144,6 +144,9 @@ planes, the output stage writes RGBA when there is alpha).
 Upsampling (`upsample.slang`) runs after the filters at the output size, then
 patches, then noise (`noise.slang`: per-tile xorshift128+, 5×5 convolution,
 strength LUT), then the colour transform.
+Displayed frames compose onto a canvas (`output.slang toOutputPlanes` then
+`blend.slang`, blending modes incl. alpha) kept in a reference slot when the
+frame can be referenced; `Decoder::decodeAll` returns the emitted frames.
 Progressive: passes add shifted coefficients per AC group thread; a permuted
 TOC is decoded by `toc.slang` and the parser resumes (`Decoder::parseAll`); a
 DC frame's planes become the next frame's DC (`dcFromFrame`).

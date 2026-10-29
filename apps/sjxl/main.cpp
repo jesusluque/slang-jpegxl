@@ -4,6 +4,8 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
+#include <format>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -22,7 +24,7 @@ int usage() {
                  "usage:\n"
                  "  sjxl info [in.jxl]                          describe the GPU device, or a file's headers and frames\n"
                  "  sjxl encode in.png out.jxl [--distance d]   lossy VarDCT (default distance 1.0)\n"
-                 "  sjxl decode in.jxl out.png                  VarDCT frames\n"
+                 "  sjxl decode in.jxl out.png                  any frame type; animations write out_000.png, out_001.png, ...\n"
                  "  sjxl compare a.png b.png                    PSNR and largest difference, measured on the GPU\n"
                  "  sjxl pixel a.png x y                        one pixel's RGB\n"
                  "  sjxl convert in.png out.png                 re-save as 8-bit RGB (drops alpha)\n");
@@ -65,6 +67,12 @@ int info(int argc, char** argv) {
                         h.frameType == 2 ? (h.saveBeforeColorTransform ? ", saved before the colour transform" : ", saved after the colour transform")
                                          : h.frameType == 1 ? ", DC frame" : (h.flags & sjxl::codestream::FrameHeader::kUseDcFrame) ? ", DC from a DC frame" : "",
                         h.loopFilter.gab ? 1 : 0, h.loopFilter.epfIters, h.isLast ? ", last" : "");
+            if (h.duration != 0 || h.customSizeOrOrigin || h.blending.mode != 0) {
+                const char* modes[5] = {"replace", "add", "blend", "alpha-weighted add", "multiply"};
+                std::printf("          duration %u ticks, origin (%d,%d), blend %s from slot %u%s\n", h.duration, h.x0, h.y0,
+                            modes[h.blending.mode < 5 ? h.blending.mode : 0], h.blending.source,
+                            (!h.isLast && (h.duration == 0 || h.saveAsReference != 0)) ? std::format(", saved as reference {}", h.saveAsReference).c_str() : "");
+            }
         }
         return 0;
     }
@@ -115,11 +123,22 @@ int decode(int argc, char** argv) {
     auto decoder = sjxl::dec::Decoder::create(library);
     if (!decoder) return fail(decoder.error());
     const auto start = std::chrono::steady_clock::now();
-    auto image = (*decoder)->decode(*bytes);
-    if (!image) return fail(image.error());
+    auto frames = (*decoder)->decodeAll(*bytes);
+    if (!frames) return fail(frames.error());
     const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
-    if (auto written = sjxl::image::writePng(argv[3], *image); !written) return fail(written.error());
-    std::printf("%zu bytes -> %ux%u in %.1f ms\n", bytes->size(), image->width, image->height, ms);
+    const auto& first = frames->front().image;
+    if (frames->size() == 1) {
+        if (auto written = sjxl::image::writePng(argv[3], first); !written) return fail(written.error());
+    } else {
+        // An animation: one PNG per displayed frame, out.png -> out_000.png, out_001.png, ...
+        const std::filesystem::path out(argv[3]);
+        for (size_t i = 0; i < frames->size(); ++i) {
+            std::filesystem::path path = out.parent_path() / (out.stem().string() + std::format("_{:03}", i) + out.extension().string());
+            if (auto written = sjxl::image::writePng(path, (*frames)[i].image); !written) return fail(written.error());
+        }
+    }
+    std::printf("%zu bytes -> %ux%u, %zu frame%s in %.1f ms\n", bytes->size(), first.width, first.height, frames->size(),
+                frames->size() == 1 ? "" : "s", ms);
     return 0;
 }
 
