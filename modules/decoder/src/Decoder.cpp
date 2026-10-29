@@ -103,7 +103,7 @@ Result<size_t> Decoder::decodeIccEnd(const codestream::Parsed& parsed) {
     std::vector<uint32_t> csWords((parsed.codestream.size() + 3) / 4 + 2, 0);
     std::memcpy(csWords.data(), parsed.codestream.data(), parsed.codestream.size());
     SJXL_ASSIGN(auto cs, gpu::Buffer::fromSpan<uint32_t>(dev, csWords, "dec.icc.cs"));
-    constexpr uint32_t kIccArenaWords = 1u << 20;
+    constexpr uint32_t kIccArenaWords = (1u << 20) + kLz77WindowWords;
     SJXL_ASSIGN(auto arena, gpu::Buffer::ofType<uint32_t>(dev, kIccArenaWords, "dec.icc.arena"));
     SJXL_ASSIGN(auto out, gpu::Buffer::ofType<uint32_t>(dev, 4, "dec.icc.out"));
     gpu::CommandBatch batch(dev);
@@ -127,7 +127,7 @@ Result<Decoder::TocPermutation> Decoder::decodeTocPermutation(const codestream::
     std::vector<uint32_t> csWords((parsed.codestream.size() + 3) / 4 + 2, 0);
     std::memcpy(csWords.data(), parsed.codestream.data(), parsed.codestream.size());
     SJXL_ASSIGN(auto cs, gpu::Buffer::fromSpan<uint32_t>(dev, csWords, "dec.toc.cs"));
-    constexpr uint32_t kTocArenaWords = 1u << 20;
+    constexpr uint32_t kTocArenaWords = (1u << 20) + kLz77WindowWords;
     SJXL_ASSIGN(auto arena, gpu::Buffer::ofType<uint32_t>(dev, kTocArenaWords, "dec.toc.arena"));
     SJXL_ASSIGN(auto out, gpu::Buffer::ofType<uint32_t>(dev, 2 + frame.numSections, "dec.toc.out"));
     gpu::CommandBatch batch(dev);

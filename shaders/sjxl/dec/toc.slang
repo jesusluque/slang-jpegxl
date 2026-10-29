@@ -32,10 +32,10 @@ void decodeTocPermutation(uint3 tid: SV_DispatchThreadID) {
     d.br.end = 0xFFFFFFFFu;
     d.base = kGsHeaderSize;
     d.top = d.base;
-    d.cap = params.arenaCap;
+    d.cap = params.arenaCap - kLz77WindowSize;   // an LZ77 window at the top of the arena
     d.error = kErrNone;
     const uint dest = alloc(d, params.tocEntries);
-    const uint endBit = readTocPermutation(d, params.tocEntries, dest);
+    const uint endBit = readTocPermutation(d, params.tocEntries, dest, d.cap);
     tocOut[0] = d.error;
     tocOut[1] = endBit;
     for (uint i = 0; i < params.tocEntries; ++i) tocOut[2 + i] = d.error == kErrNone ? arena[dest + i] : i;
@@ -74,14 +74,15 @@ void decodeIcc(uint3 tid: SV_DispatchThreadID) {
     d.br.end = 0xFFFFFFFFu;
     d.base = kGsHeaderSize;
     d.top = d.base;
-    d.cap = params.arenaCap;
+    d.cap = params.arenaCap - kLz77WindowSize;   // an LZ77 window at the top of the arena
     d.error = kErrNone;
+    const uint window = d.cap;
     const uint64_t encSize64 = brU64Low(d.br);
     if (encSize64 > 268435456ull) { tocOut[0] = kErrCorrupt; return; }
     const uint encSize = uint(encSize64);
-    const uint codeSet = decodeHistograms(d, 41, false, 0xFFFFFFFFu);
+    const uint codeSet = decodeHistograms(d, 41, false, window);
     if (d.error == kErrNone) {
-        SymReader r = makeSymReader(d, codeSet, 0xFFFFFFFFu, 0);
+        SymReader r = makeSymReader(d, codeSet, window, 0);
         uint b1 = 0, b2 = 0;
         for (uint i = 0; i < encSize && d.error == kErrNone; ++i) {
             const uint b = readHybridUint(d, r, iccContext(i, b1, b2)) & 0xFFu;

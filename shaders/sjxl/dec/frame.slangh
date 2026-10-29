@@ -641,10 +641,10 @@ uint readCoeffOrders(inout Dec d, uint windowOff, out uint usedOrdersOut) {
 
 /// DecodePermutation(skip 0) for the TOC: its own histograms over 8 contexts, the
 /// Lehmer code, the permutation into dest[0..size). Returns the bit position after it.
-uint readTocPermutation(inout Dec d, uint size, uint dest) {
-    const uint codeSet = decodeHistograms(d, 8, false, 0xFFFFFFFFu);
+uint readTocPermutation(inout Dec d, uint size, uint dest, uint windowOff) {
+    const uint codeSet = decodeHistograms(d, 8, false, windowOff);
     if (d.error != kErrNone) return d.br.pos;
-    SymReader r = makeSymReader(d, codeSet, 0xFFFFFFFFu, 0);
+    SymReader r = makeSymReader(d, codeSet, windowOff, 0);
     if (d.error != kErrNone) return d.br.pos;
     const uint natural = alloc(d, size);
     if (d.error != kErrNone) return d.br.pos;

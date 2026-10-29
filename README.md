@@ -7,8 +7,16 @@ headers, the table of contents and files; transforms, quantisation, tokens,
 histograms, code tables, bit emission and symbol decoding run on the GPU,
 entropy coding included.
 
-Status: early. `docs/decisions.md` holds the design, what each milestone
-measured and the roadmap; `CLAUDE.md` the short version a build needs.
+Status: the decoder reproduces djxl's output on everything `cjxl` emits on
+the test images, lossy and lossless: VarDCT with every transform size, Modular
+with RCT, palettes and Squeeze, chroma-from-luma, adaptive quantisation,
+Gaborish and EPF, noise, upsampling, patches, progressive passes and DC frames,
+permuted TOCs, extra channels with alpha, 16-bit output, ICC-tagged images,
+JPEG recompression and animation with blending. Pixels match within one 8-bit
+step (lossless bit-exact); the conformance tests in `tests/decoder` are the
+record. The encoder is a minimal VarDCT profile (M1). `docs/decisions.md`
+holds the design, what each milestone measured and the roadmap; `CLAUDE.md`
+the short version a build needs.
 
 ## Build
 
