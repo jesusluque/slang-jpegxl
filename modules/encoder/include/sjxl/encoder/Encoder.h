@@ -9,6 +9,7 @@
 #include <memory>
 #include <vector>
 
+#include "sjxl/codestream/Headers.h"
 #include "sjxl/core/Result.h"
 #include "sjxl/gpu/Buffer.h"
 #include "sjxl/gpu/ComputeKernel.h"
@@ -61,11 +62,18 @@ public:
     [[nodiscard]] static Result<std::unique_ptr<Encoder>> create(std::shared_ptr<gpu::ShaderLibrary> library);
 
     [[nodiscard]] Result<std::vector<uint8_t>> encode(const image::Rgb8& image, const Options& options);
+    /// An animation: every frame a full canvas replacing the previous one, shown
+    /// for `durations[i]` ticks at `ticksPerSecond`; all frames share the first
+    /// one's size, channels and depth. `numLoops` 0 repeats forever.
+    [[nodiscard]] Result<std::vector<uint8_t>> encodeAnimation(const std::vector<image::Rgb8>& frames, const std::vector<uint32_t>& durations,
+                                                               uint32_t ticksPerSecond, uint32_t numLoops, const Options& options);
     [[nodiscard]] const Stats& stats() const noexcept { return stats_; }
 
 private:
     Encoder() = default;
-    [[nodiscard]] Result<std::vector<uint8_t>> encodeLossless(const image::Rgb8& image, const Options& options);
+    /// One frame's bytes (frame header, TOC, body), byte-aligned, without the codestream header.
+    [[nodiscard]] Result<std::vector<uint8_t>> encodeFrame(const image::Rgb8& image, const Options& options, const codestream::FrameInfo& info);
+    [[nodiscard]] Result<std::vector<uint8_t>> encodeLossless(const image::Rgb8& image, const Options& options, const codestream::FrameInfo& info);
 
     std::shared_ptr<gpu::ShaderLibrary> library_;
     gpu::Device*                        device_ = nullptr;

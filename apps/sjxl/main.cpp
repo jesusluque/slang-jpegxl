@@ -25,6 +25,7 @@ int usage() {
                  "  sjxl info [in.jxl]                          describe the GPU device, or a file's headers and frames\n"
                  "  sjxl encode in.png out.jxl [--distance d] [--lossless] [--no-aq] [--no-cfl] [--no-filters] [--no-acs] [--no-specials] [--lambda x] [--clusters n]\n"
                  "                                              lossy VarDCT (default distance 1.0)\n"
+                 "  sjxl animate out.jxl [--fps n] [--loops n] [--lossless] [-d d] frame1.png frame2.png ...\n"
                  "  sjxl decode in.jxl out.png                  any frame type; animations write out_000.png, out_001.png, ...\n"
                  "  sjxl compare a.png b.png                    PSNR and largest difference, measured on the GPU\n"
                  "  sjxl pixel a.png x y                        one pixel's RGB\n"
@@ -146,6 +147,40 @@ int encode(int argc, char** argv) {
     return 0;
 }
 
+int animate(int argc, char** argv) {
+    // sjxl animate out.jxl [--fps n] [--loops n] [--lossless] [--distance d] frame1.png frame2.png ...
+    if (argc < 4) return usage();
+    sjxl::enc::Options options;
+    uint32_t fps = 10, loops = 0;
+    std::vector<std::string> inputs;
+    for (int i = 3; i < argc; ++i) {
+        const std::string_view arg = argv[i];
+        if (arg == "--fps" && i + 1 < argc) fps = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 10));
+        else if (arg == "--loops" && i + 1 < argc) loops = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 10));
+        else if (arg == "--lossless") options.lossless = true;
+        else if ((arg == "--distance" || arg == "-d") && i + 1 < argc) options.distance = std::strtof(argv[++i], nullptr);
+        else inputs.emplace_back(arg);
+    }
+    if (inputs.empty() || fps == 0) return usage();
+    std::vector<sjxl::image::Rgb8> frames;
+    for (const std::string& path : inputs) {
+        auto image = sjxl::image::readImage(path);
+        if (!image) return fail(image.error());
+        frames.push_back(std::move(*image));
+    }
+    const std::vector<uint32_t> durations(frames.size(), 1);
+    auto device = sjxl::gpu::Device::create();
+    if (!device) return fail(device.error());
+    auto library = std::make_shared<sjxl::gpu::ShaderLibrary>(*device);
+    auto encoder = sjxl::enc::Encoder::create(library);
+    if (!encoder) return fail(encoder.error());
+    auto bytes = (*encoder)->encodeAnimation(frames, durations, fps, loops, options);
+    if (!bytes) return fail(bytes.error());
+    if (auto written = sjxl::image::writeFile(argv[2], *bytes); !written) return fail(written.error());
+    std::printf("%zu frames %ux%u at %u fps -> %zu bytes\n", frames.size(), frames[0].width, frames[0].height, fps, bytes->size());
+    return 0;
+}
+
 int decode(int argc, char** argv) {
     if (argc < 4) return usage();
     auto bytes = sjxl::image::readFile(argv[2]);
@@ -218,6 +253,7 @@ int main(int argc, char** argv) {
     const std::string_view command = argv[1];
     if (command == "info") return info(argc, argv);
     if (command == "encode") return encode(argc, argv);
+    if (command == "animate") return animate(argc, argv);
     if (command == "compare") return compare(argc, argv);
     if (command == "pixel") return pixel(argc, argv);
     if (command == "convert") return convert(argc, argv);

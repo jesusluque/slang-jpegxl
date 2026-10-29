@@ -568,3 +568,47 @@ TEST_CASE("the decoder matches djxl across modular group sizes", "[decoder][conf
     WARN(std::format("groups {} {}: vs djxl PSNR {:.2f} dB, max diff {}", name, options, metrics->psnr, metrics->maxAbsDiff));
     CHECK(metrics->maxAbsDiff <= (options.find("-d 0") != std::string::npos ? 0u : 1u));
 }
+
+TEST_CASE("the encoder's animations round-trip and djxl reads them", "[encoder][decoder][conformance][animation]") {
+    const std::filesystem::path djxl = test::findTool("djxl");
+    if (djxl.empty()) SKIP("djxl is not installed");
+    const bool lossless = GENERATE(false, true);
+    CAPTURE(lossless);
+    auto base = image::readRgb8(test::testData("berlin_200.png"));
+    REQUIRE(base);
+    // Three frames: the image and two channel rotations of it (the frames must differ to tell them apart).
+    std::vector<image::Rgb8> frames;
+    for (uint32_t r = 0; r < 3; ++r) {
+        image::Rgb8 f = *base;
+        for (size_t p = 0; p + 2 < f.pixels.size(); p += 3) {
+            for (uint32_t c = 0; c < 3; ++c) f.pixels[p + c] = base->pixels[p + (c + r) % 3];
+        }
+        frames.push_back(std::move(f));
+    }
+    const std::vector<uint32_t> durations{1, 2, 3};
+    enc::Options options;
+    options.lossless = lossless;
+    options.distance = 1.0f;
+    auto encoded = encoder().encodeAnimation(frames, durations, 10, 0, options);
+    REQUIRE(encoded);
+    const std::filesystem::path jxl = test::scratchDir() / std::format("enc_anim_{}.jxl", lossless);
+    const std::filesystem::path out = test::scratchDir() / std::format("enc_anim_{}.djxl.png", lossless);
+    REQUIRE(image::writeFile(jxl, *encoded));
+    REQUIRE(test::run(std::format("\"{}\" \"{}\" \"{}\" >/dev/null 2>&1", djxl.string(), jxl.string(), out.string())));
+    auto parsed = dec::Decoder::info(*encoded);
+    REQUIRE(parsed);
+    REQUIRE(parsed->metadata.haveAnimation);
+    REQUIRE(parsed->frames.size() == 3);
+    auto ours = decoder().decodeAll(*encoded);
+    REQUIRE(ours);
+    REQUIRE(ours->size() == 3);
+    for (size_t i = 0; i < 3; ++i) {
+        CHECK((*ours)[i].duration == durations[i]);
+        auto metrics = test::compare(frames[i], (*ours)[i].image);
+        REQUIRE(metrics);
+        WARN(std::format("animation lossless {} frame {}: {} bytes total, PSNR {:.2f} dB, max diff {}", lossless, i, encoded->size(),
+                         metrics->psnr, metrics->maxAbsDiff));
+        if (lossless) CHECK(metrics->maxAbsDiff == 0);
+        else CHECK(metrics->psnr >= 30.0);
+    }
+}

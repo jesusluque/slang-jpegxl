@@ -60,10 +60,11 @@ per subsystem or milestone, appended to as the work goes. Dates are absolute.
   transform selection DCT8..64x64 with libjxl's entropy model and the 8x8
   specials; PNG colour chunks; DC and AcMetadata with the weighted predictor,
   libjxl's fixed trees and ANS; lossless with the weighted predictor and
-  the per-channel predictor choice; alpha and 16-bit in the lossy path.)
+  the per-channel predictor choice; alpha and 16-bit in the lossy path;
+  animations of full frames.)
   Next: three-channel strategy costs, transforms (palette, Squeeze) and a
-  learned tree for lossless, animation and progressive encoding, encoder
-  speed (the serial ANS and WP passes).
+  learned tree for lossless, progressive encoding, frames that reference the
+  previous one in animations, encoder speed (the serial ANS and WP passes).
 - **M4 decoder completeness**: splines, grey JPEG transcodes, loop filters
   on YCbCr frames, extra channel blending in patches, writing the ICC
   profile into the output file, float samples. (16-bit output, animation
@@ -1020,3 +1021,31 @@ Measured (`[animation]` test, 4-frame RGBA APNGs made by
 `tests/support/apng_make.py`, djxl's APNG split by `apng_split.py`): full
 frames lossless bit-exact, VarDCT and lossy modular within 1; partial frames
 blended over with alpha within 1 in all three encodings.
+
+## Encoding animations (2026-10-29)
+
+`Encoder::encodeAnimation(frames, durations, ticksPerSecond, numLoops, options)`
+writes one codestream header with the animation fields (ImageMetadata
+`extra_fields`: orientation 1, have_animation, tps numerator/denominator,
+num_loops, no timecodes; ToneMapping all_default) and then one frame per
+image, each lossy (VarDCT) or lossless (Modular) exactly as a still would be
+encoded: `encode` and `encodeAnimation` both go through `encodeFrame`, which
+returns the frame header, TOC and body of one frame byte-aligned. The frame
+header gets `duration` (U32 0/1/8/32 bits), `is_last` and, for a frame that
+is not last, `save_as_reference 0`; every frame is a full canvas with blend
+mode kReplace, so the decoder's reference slot bookkeeping is trivial and no
+frame depends on the previous one. All frames share the first one's size,
+channels and depth (checked on the host; the per-frame pipelines are
+unchanged). `sjxl animate out.jxl [--fps n] [--loops n] [--lossless] [-d d]
+f1.png f2.png …` is the CLI; every frame lasts one tick at `fps` ticks per
+second.
+
+Measured: the round-trip test (`[animation]` in `sjxl_decoder_tests`) encodes
+three 200×200 frames lossy and lossless; djxl and jxlinfo read the files
+(three frames of the given durations, looping), our decoder returns three
+frames with the durations and the lossless frames are bit-exact.
+
+Not done: frames that code only what changed (a sub-rectangle blended over
+the previous frame, or a frame referencing a saved one through patches), which
+is where animation compression comes from; per-frame distances; APNG/GIF
+input (the CLI takes one PNG per frame).

@@ -20,17 +20,35 @@ constexpr uint32_t kColorTileDimBlocks = 8;   ///< chroma-from-luma tile: 64 px
 
 /// Signature + SizeHeader + ImageMetadata (all_default: 8-bit sRGB, xyb) +
 /// transform_data (all_default). Byte-aligned on exit.
+/// ImageMetadata animation: ticks per second as a fraction, loops (0: forever).
+struct Animation {
+    uint32_t tpsNumerator = 10;
+    uint32_t tpsDenominator = 1;
+    uint32_t numLoops = 0;
+};
+
+/// A frame's place in the codestream: whether it is the last one and, in an
+/// animation, its duration in ticks.
+struct FrameInfo {
+    bool     isLast = true;
+    bool     animated = false;   ///< the ImageMetadata has an animation: the duration field is written
+    uint32_t duration = 0;
+};
+
 /// `gamma` 0: the all_default sRGB encoding; else a gamma transfer (e.g. 0.45455)
-/// over sRGB primaries and D65.
-void writeCodestreamHeaders(BitWriter& w, uint32_t xsize, uint32_t ysize, float gamma = 0.0f, uint32_t bitDepth = 8, bool alpha = false);
+/// over sRGB primaries and D65. With `animation` the metadata carries the
+/// animation header (extra_fields).
+void writeCodestreamHeaders(BitWriter& w, uint32_t xsize, uint32_t ysize, float gamma = 0.0f, uint32_t bitDepth = 8, bool alpha = false,
+                            const Animation* animation = nullptr);
 /// Signature, SizeHeader and the ImageMetadata of an 8- or 16-bit sRGB image
 /// that is not XYB encoded (a lossless Modular frame), with an unassociated
 /// alpha channel of the same depth when `alpha`. Byte-aligned on exit.
-void writeCodestreamHeadersRgb(BitWriter& w, uint32_t xsize, uint32_t ysize, uint32_t bitDepth, bool alpha, float gamma = 0.0f);
+void writeCodestreamHeadersRgb(BitWriter& w, uint32_t xsize, uint32_t ysize, uint32_t bitDepth, bool alpha, float gamma = 0.0f,
+                               const Animation* animation = nullptr);
 /// A single-pass, full-frame, last Modular frame in RGB (no colour transform,
 /// group_size_shift 1, LoopFilter off) with `numExtraChannels` unsampled extra
 /// channels. Not byte-aligned on exit.
-void writeModularFrameHeader(BitWriter& w, uint32_t numExtraChannels);
+void writeModularFrameHeader(BitWriter& w, uint32_t numExtraChannels, const FrameInfo& info = FrameInfo{});
 
 struct FrameParams {
     bool     gaborish = true;      ///< LoopFilter.gab
@@ -40,7 +58,7 @@ struct FrameParams {
 };
 
 /// A single-pass, full-frame, last VarDCT frame in XYB. Not byte-aligned on exit.
-void writeFrameHeader(BitWriter& w, const FrameParams& params, uint32_t numExtraChannels = 0);
+void writeFrameHeader(BitWriter& w, const FrameParams& params, uint32_t numExtraChannels = 0, const FrameInfo& info = FrameInfo{});
 
 /// The TOC (no permutation) for `sectionBytes`, one entry per section, or one
 /// entry when the frame has a single group and pass. Byte-aligned on entry and exit.

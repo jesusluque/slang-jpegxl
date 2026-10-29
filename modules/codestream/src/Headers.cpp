@@ -133,10 +133,20 @@ void writeColorEncoding(BitWriter& w, float gamma) {
 /// ImageMetadata without extra_fields: bit depth, the extra channels (an
 /// unassociated alpha of the same depth when `alpha`), xyb_encoded and the
 /// colour encoding.
-void writeImageMetadata(BitWriter& w, uint32_t bitDepth, bool alpha, bool xyb, float gamma) {
+void writeImageMetadata(BitWriter& w, uint32_t bitDepth, bool alpha, bool xyb, float gamma, const Animation* animation) {
     const U32Enc kBitsEnc{{Val(8), Val(10), Val(12), BitsOffset(6, 1)}};
     w.writeBool(false);   // all_default
-    w.writeBool(false);   // extra_fields
+    w.writeBool(animation != nullptr);   // extra_fields
+    if (animation != nullptr) {
+        w.write(3, 0);        // orientation 1
+        w.writeBool(false);   // have_intrinsic_size
+        w.writeBool(false);   // have_preview
+        w.writeBool(true);    // have_animation
+        writeU32(w, U32Enc{{Val(100), Val(1000), BitsOffset(10, 1), BitsOffset(30, 1)}}, animation->tpsNumerator);
+        writeU32(w, U32Enc{{Val(1), Val(1001), BitsOffset(8, 1), BitsOffset(10, 1)}}, animation->tpsDenominator);
+        writeU32(w, U32Enc{{Val(0), Bits(3), Bits(16), Bits(32)}}, animation->numLoops);
+        w.writeBool(false);   // have_timecodes
+    }
     w.writeBool(false);   // bit_depth.floating_point_sample
     writeU32(w, kBitsEnc, bitDepth);
     w.writeBool(bitDepth <= 8);   // modular_16_bit_buffer_sufficient
@@ -156,33 +166,50 @@ void writeImageMetadata(BitWriter& w, uint32_t bitDepth, bool alpha, bool xyb, f
     }
     w.writeBool(xyb);
     writeColorEncoding(w, gamma);
+    if (animation != nullptr) {
+        w.writeBool(true);   // ToneMapping all_default (extra_fields)
+    }
     writeU64(w, 0);   // extensions
 }
 
-void writeCodestreamHeaders(BitWriter& w, uint32_t xsize, uint32_t ysize, float gamma, uint32_t bitDepth, bool alpha) {
+void writeCodestreamHeaders(BitWriter& w, uint32_t xsize, uint32_t ysize, float gamma, uint32_t bitDepth, bool alpha,
+                            const Animation* animation) {
     w.write(8, 0xFF);
     w.write(8, 0x0A);
     writeSizeHeader(w, xsize, ysize);
-    if (gamma <= 0.0f && bitDepth == 8 && !alpha) {
+    if (gamma <= 0.0f && bitDepth == 8 && !alpha && animation == nullptr) {
         w.writeBool(true);   // ImageMetadata all_default: 8-bit, xyb_encoded, sRGB
     } else {
-        writeImageMetadata(w, bitDepth, alpha, true, gamma);
+        writeImageMetadata(w, bitDepth, alpha, true, gamma, animation);
     }
     w.writeBool(true);   // transform_data all_default
     // The decoder jumps to a byte boundary before the frame header.
     w.zeroPadToByte();
 }
 
-void writeCodestreamHeadersRgb(BitWriter& w, uint32_t xsize, uint32_t ysize, uint32_t bitDepth, bool alpha, float gamma) {
+void writeCodestreamHeadersRgb(BitWriter& w, uint32_t xsize, uint32_t ysize, uint32_t bitDepth, bool alpha, float gamma,
+                               const Animation* animation) {
     w.write(8, 0xFF);
     w.write(8, 0x0A);
     writeSizeHeader(w, xsize, ysize);
-    writeImageMetadata(w, bitDepth, alpha, false, gamma);
+    writeImageMetadata(w, bitDepth, alpha, false, gamma, animation);
     w.writeBool(true);    // transform_data all_default
     w.zeroPadToByte();
 }
 
-void writeModularFrameHeader(BitWriter& w, uint32_t numExtraChannels) {
+/// After the blending fields: the duration (animations), is_last and, for a
+/// frame that is not last, save_as_reference 0.
+void writeFrameEnd(BitWriter& w, const FrameInfo& info) {
+    if (info.animated) {
+        writeU32(w, U32Enc{{Val(0), Val(1), Bits(8), Bits(32)}}, info.duration);
+    }
+    w.writeBool(info.isLast);
+    if (!info.isLast) {
+        writeU32(w, U32Enc{{Val(0), Val(1), Val(2), Val(3)}}, 0);   // save_as_reference
+    }
+}
+
+void writeModularFrameHeader(BitWriter& w, uint32_t numExtraChannels, const FrameInfo& info) {
     w.writeBool(false);                                            // all_default
     writeU32(w, U32Enc{{Val(0), Val(1), Val(2), Val(3)}}, 0);      // frame_type = kRegularFrame
     w.writeBool(true);                                             // encoding = kModular
@@ -199,7 +226,7 @@ void writeModularFrameHeader(BitWriter& w, uint32_t numExtraChannels) {
     for (uint32_t i = 0; i < numExtraChannels; ++i) {
         writeU32(w, U32Enc{{Val(0), Val(1), Val(2), BitsOffset(2, 3)}}, 0);   // the extra channel's BlendingInfo: kReplace
     }
-    w.writeBool(true);                                             // is_last
+    writeFrameEnd(w, info);
     writeU32(w, U32Enc{{Val(0), Bits(4), BitsOffset(5, 16), BitsOffset(10, 48)}}, 0);   // name length
     w.writeBool(false);                                            // LoopFilter all_default
     w.writeBool(false);                                            // gab
@@ -208,7 +235,7 @@ void writeModularFrameHeader(BitWriter& w, uint32_t numExtraChannels) {
     writeU64(w, 0);                                                // FrameHeader extensions
 }
 
-void writeFrameHeader(BitWriter& w, const FrameParams& params, uint32_t numExtraChannels) {
+void writeFrameHeader(BitWriter& w, const FrameParams& params, uint32_t numExtraChannels, const FrameInfo& info) {
     w.writeBool(false);                                            // all_default
     writeU32(w, U32Enc{{Val(0), Val(1), Val(2), Val(3)}}, 0);      // frame_type = kRegularFrame
     w.writeBool(false);                                            // encoding = kVarDCT
@@ -226,7 +253,7 @@ void writeFrameHeader(BitWriter& w, const FrameParams& params, uint32_t numExtra
     for (uint32_t i = 0; i < numExtraChannels; ++i) {
         writeU32(w, U32Enc{{Val(0), Val(1), Val(2), BitsOffset(2, 3)}}, 0);   // the extra channel's BlendingInfo: kReplace
     }
-    w.writeBool(true);                                             // is_last
+    writeFrameEnd(w, info);
     writeU32(w, U32Enc{{Val(0), Bits(4), BitsOffset(5, 16), BitsOffset(10, 48)}}, 0);   // name length
     // LoopFilter (loop_filter.cc VisitFields).
     const bool loopFilterDefault = params.gaborish && params.epfIters == 2;

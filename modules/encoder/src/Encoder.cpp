@@ -161,14 +161,71 @@ Result<std::unique_ptr<Encoder>> Encoder::create(std::shared_ptr<gpu::ShaderLibr
     return enc;
 }
 
-Result<std::vector<uint8_t>> Encoder::encode(const image::Rgb8& image, const Options& options) {
+namespace {
+
+Result<void> checkImage(const image::Rgb8& image) {
     if (image.width == 0 || image.height == 0 || (image.channels != 3 && image.channels != 4) ||
         (image.bitDepth != 8 && image.bitDepth != 16) ||
         image.pixels.size() != size_t{image.width} * image.height * image.channels * (image.bitDepth / 8)) {
         return Error(ErrorCode::InvalidArgument, "empty image or pixel count does not match its size");
     }
+    return ok();
+}
+
+}   // namespace
+
+Result<std::vector<uint8_t>> Encoder::encode(const image::Rgb8& image, const Options& options) {
+    SJXL_TRY(checkImage(image));
+    codestream::BitWriter head;
     if (options.lossless) {
-        return encodeLossless(image, options);
+        codestream::writeCodestreamHeadersRgb(head, image.width, image.height, image.bitDepth, image.channels == 4, image.gamma);
+    } else {
+        codestream::writeCodestreamHeaders(head, image.width, image.height, image.gamma, image.bitDepth, image.channels == 4);
+    }
+    std::vector<uint8_t> out = head.take();
+    SJXL_ASSIGN(const std::vector<uint8_t> frame, encodeFrame(image, options, codestream::FrameInfo{}));
+    stats_.headBytes += static_cast<uint32_t>(out.size());
+    out.insert(out.end(), frame.begin(), frame.end());
+    return out;
+}
+
+Result<std::vector<uint8_t>> Encoder::encodeAnimation(const std::vector<image::Rgb8>& frames, const std::vector<uint32_t>& durations,
+                                                      uint32_t ticksPerSecond, uint32_t numLoops, const Options& options) {
+    if (frames.empty() || durations.size() != frames.size()) {
+        return Error(ErrorCode::InvalidArgument, "an animation needs frames and one duration per frame");
+    }
+    const image::Rgb8& first = frames.front();
+    SJXL_TRY(checkImage(first));
+    for (const image::Rgb8& f : frames) {
+        if (f.width != first.width || f.height != first.height || f.channels != first.channels || f.bitDepth != first.bitDepth) {
+            return Error(ErrorCode::InvalidArgument, "every frame of an animation must have the first frame's size, channels and depth");
+        }
+    }
+    codestream::Animation animation;
+    animation.tpsNumerator = ticksPerSecond;
+    animation.tpsDenominator = 1;
+    animation.numLoops = numLoops;
+    codestream::BitWriter head;
+    if (options.lossless) {
+        codestream::writeCodestreamHeadersRgb(head, first.width, first.height, first.bitDepth, first.channels == 4, first.gamma, &animation);
+    } else {
+        codestream::writeCodestreamHeaders(head, first.width, first.height, first.gamma, first.bitDepth, first.channels == 4, &animation);
+    }
+    std::vector<uint8_t> out = head.take();
+    for (size_t i = 0; i < frames.size(); ++i) {
+        codestream::FrameInfo info;
+        info.animated = true;
+        info.isLast = i + 1 == frames.size();
+        info.duration = durations[i];
+        SJXL_ASSIGN(const std::vector<uint8_t> frame, encodeFrame(frames[i], options, info));
+        out.insert(out.end(), frame.begin(), frame.end());
+    }
+    return out;
+}
+
+Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, const Options& options, const codestream::FrameInfo& info) {
+    if (options.lossless) {
+        return encodeLossless(image, options, info);
     }
     if (!(options.distance > 0.0f) || options.distance > 25.0f) {
         return Error::make(ErrorCode::InvalidArgument, "distance {} is not in (0, 25]", options.distance);
@@ -773,10 +830,9 @@ Result<std::vector<uint8_t>> Encoder::encode(const image::Rgb8& image, const Opt
     SJXL_TRY(batch.submit(true));
     SJXL_ASSIGN(const std::vector<uint32_t> bodyWords, body.readAll<uint32_t>(dev));
 
-    // Headers and TOC on the CPU, then the body.
+    // The frame header and TOC on the CPU, then the body.
     codestream::BitWriter head;
-    codestream::writeCodestreamHeaders(head, image.width, image.height, image.gamma, image.bitDepth, hasAlpha);
-    codestream::writeFrameHeader(head, frame, hasAlpha ? 1u : 0u);
+    codestream::writeFrameHeader(head, frame, hasAlpha ? 1u : 0u, info);
     if (dim.singleSection()) {
         sizes.assign(1, bodyBytes);
     }
@@ -972,7 +1028,7 @@ std::vector<uint32_t> acMetaTree(uint32_t& numLeaves) {
 
 }   // namespace
 
-Result<std::vector<uint8_t>> Encoder::encodeLossless(const image::Rgb8& image, const Options& options) {
+Result<std::vector<uint8_t>> Encoder::encodeLossless(const image::Rgb8& image, const Options& options, const codestream::FrameInfo& info) {
     gpu::Device& dev = *device_;
     const FrameDim dim = codestream::frameDim(image.width, image.height);
     const uint32_t numGroups = dim.numGroups();
@@ -1201,8 +1257,7 @@ Result<std::vector<uint8_t>> Encoder::encodeLossless(const image::Rgb8& image, c
     SJXL_ASSIGN(const std::vector<uint32_t> clusterInfoHost, clusterInfo.readAll<uint32_t>(dev));
 
     codestream::BitWriter head;
-    codestream::writeCodestreamHeadersRgb(head, image.width, image.height, image.bitDepth, channels == 4, image.gamma);
-    codestream::writeModularFrameHeader(head, channels == 4 ? 1 : 0);
+    codestream::writeModularFrameHeader(head, channels == 4 ? 1 : 0, info);
     codestream::writeToc(head, sizes);
     std::vector<uint8_t> out = head.take();
     stats_ = Stats{};
