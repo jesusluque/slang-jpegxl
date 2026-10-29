@@ -98,7 +98,7 @@ private:
         std::array<float, 3> dcQuant{};
     };
     [[nodiscard]] Result<std::vector<uint8_t>> encodeModularFrame(const ModularSpec& spec, const gpu::Buffer& planes, const Options& options,
-                                                                  const codestream::FrameInfo& info);
+                                                                  const codestream::FrameInfo& info, const gpu::Buffer* groupRct = nullptr);
 
     std::shared_ptr<gpu::ShaderLibrary> library_;
     gpu::Device*                        device_ = nullptr;
@@ -107,7 +107,7 @@ private:
     gpu::ComputeKernel                  tables_, buildOrders_, selectStrategies_, largeQf_, largeRows_, largeCols_, mergeLarge_, adjustQuantField_, dctRows_, dctCols_, dcFromLlf_, specialTransform_, passNonZeroCount_, acTokenize_;
     gpu::ComputeKernel                  dcTokenize_, metaTokenize_, dcGroupSections_, clusterContexts_, accumulateClusters_, acSections_;
     gpu::ComputeKernel                  propStats_, propThresholds_, treeHistograms_, treeSplit_, treeAssign_, modSamples_, modTokenizeTree_;
-    gpu::ComputeKernel                  rctYCoCg_, dcFramePlanes_, modTokenize_, extractAlpha_, channelEntropy_, remapTokens_, modGroupSections_, modularGlobalBlob_;
+    gpu::ComputeKernel                  rctCost_, rctApply_, dcFramePlanes_, modTokenize_, extractAlpha_, channelEntropy_, remapTokens_, modGroupSections_, modularGlobalBlob_;
     gpu::ComputeKernel                  dcGroupBlobs_, globalBlobs_, layout_, blobEmit_;
     gpu::PrefixSum                      prefixSum_;
     gpu::Buffer                         dequantAll_;   // every quant table kind, 3 channels each (kTableBase layout)

@@ -63,10 +63,10 @@ per subsystem or milestone, appended to as the work goes. Dates are absolute.
   the per-channel predictor choice; alpha and 16-bit in the lossy path;
   animations of full frames; progressive AC passes and DC frames; a learned
   MA tree and libjxl's histogram precision search for lossless.)
-  Next: per-group RCT choice and per-cluster hybrid-uint configurations for
-  lossless, palette and Squeeze, three-channel strategy costs, frames that
-  reference the previous one in animations, encoder speed (the serial ANS
-  and WP passes).
+  The RCT is chosen per group among libjxl's four hare-tier candidates.)
+  Next: per-cluster hybrid-uint configurations, palette and Squeeze,
+  three-channel strategy costs, frames that reference the previous one in
+  animations, encoder speed (the serial ANS and WP passes).
 - **M4 decoder completeness**: splines, grey JPEG transcodes, loop filters
   on YCbCr frames, extra channel blending in patches, writing the ICC
   profile into the output file, float samples. (16-bit output, animation
@@ -1184,3 +1184,26 @@ nodes where libjxl's have 129 on the two-group file (389 single-group);
 `SJXL_TREE_THRESHOLD` overrides the node threshold for experiments and the
 decoder prints the global tree's node count under `SJXL_DEBUG`. The
 remaining gap on berlin_200 is where libjxl tries four RCTs per group.
+
+## The RCT per group (2026-10-29)
+
+libjxl's hare tier tries four reversible colour transforms per modular
+stream (none, YCoCg, type 5 = (R, G − (R + B) / 2, B − R), type 10 =
+(G, B − G, R − G)) and keeps the one whose gradient residuals estimate
+cheapest (`EstimateCost`: the Shannon entropy of the ClampedGradient residual
+tokens in 18 contexts by the spread of the three neighbours, plus the raw
+bits, per channel). `rctCost` (modular.slang, one thread-group per group and
+candidate, the transform applied on the fly to the pixel and its neighbours)
+computes that estimate and `rctApply` writes every group's pixels under its
+cheapest candidate (ties to libjxl's order) into the planes, recording the
+choice in `groupRct`. The transform goes into the stream that holds the
+pixels: the global stream's GroupHeader when the image fits a group, each
+group's own header otherwise (the global header then has no transforms, since
+its transforms would apply to the whole image on top of the groups'; the
+first version wrote both and decoded wrongly on two-group images). `rct_type`
+is written as its U32 (Val(6), Bits(2), BitsOffset(4, 2), BitsOffset(6, 10)).
+
+Measured: the test images keep YCoCg nearly everywhere (sizes within a byte
+or two), the 4K photo as RGB encodes to 5338472 B against cjxl's 5579965
+(−4.3 %), bit-exact in djxl and our decoder, in 2.0 s on the M5 Pro (cjxl
+-e 5: about 1 s).

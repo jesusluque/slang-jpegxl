@@ -83,6 +83,7 @@ StructuredBuffer<uint>     acs;        // per block: strategy << 1 | first
 StructuredBuffer<uint>     hist;
 StructuredBuffer<uint>     quantizer;  // [0] global_scale, [1] quant_dc
 StructuredBuffer<uint>     ctxMap;     // AC context -> cluster
+StructuredBuffer<uint>     groupRct;   // modular frames: the RCT type of each group (rct != 0)
 StructuredBuffer<uint>     clusterInfo;   // [0] number of AC clusters
 RWStructuredBuffer<uint>   ctxMapMtf;  // scratch: the context map after the move-to-front transform
 RWStructuredBuffer<uint>   ansInfo;    // ANS symbol info per code region (the context map's code is region kAcClusters)
@@ -803,12 +804,17 @@ void buildModularGlobalBlob(uint3 gid: SV_GroupID) {
     // GroupHeader of the global stream.
     serialWrite(blobs, dc, 1, 1);        // use_global_tree
     serialWrite(blobs, dc, 1, 1);        // weighted::Header all_default
-    if (params.rct != 0) {
+    // The global stream's transforms apply to the whole image: the RCT goes here
+    // only when the image is the global stream (it fits a group); otherwise every
+    // group's own header carries its RCT.
+    const bool imageInGlobal = params.width <= params.groupDim && params.height <= params.groupDim;
+    const uint rctType = (params.rct != 0 && imageInGlobal) ? groupRct[0] : 0;
+    if (rctType != 0) {
         serialWrite(blobs, dc, 2, 1);    // num_transforms: U32 Val(1)
         serialWrite(blobs, dc, 2, 0);    // Transform id: RCT
         serialWrite(blobs, dc, 2, 0);    // begin_c: BitsOffset(3, 0) ...
         serialWrite(blobs, dc, 3, 0);    // ... = 0
-        serialWrite(blobs, dc, 2, 0);    // rct_type: Val(6), YCoCg
+        serialWriteU32(blobs, dc, distrVal(6), distrBitsOffset(2, 0), distrBitsOffset(4, 2), distrBitsOffset(6, 10), rctType);
     } else {
         serialWrite(blobs, dc, 2, 0);    // num_transforms: U32 Val(0)
     }

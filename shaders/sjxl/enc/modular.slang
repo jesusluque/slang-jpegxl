@@ -36,6 +36,7 @@ struct ModParams {
     float sampleFraction;
     uint  sampleCapacity;
     uint  streamBase;     // stream id of group 0 (property 1)
+    uint  rct;            // modGroupSections: 1 when the groups carry their RCT (groupRct)
     uint4 propIds;
 };
 
@@ -43,6 +44,8 @@ StructuredBuffer<uint>     rgb8;          // width * height * numChannels sample
 StructuredBuffer<int>      thresholds;    // modSamples: [16][64] per property, count at 16 * 64 + property
 RWStructuredBuffer<uint2>  samples;       // modSamples output
 RWStructuredBuffer<uint>   sampleCount;   // [0]
+RWStructuredBuffer<float>  rctCosts;      // rctCost: [group][candidate] estimated bits
+RWStructuredBuffer<uint>   groupRct;      // rctApply: the RCT type chosen per group
 StructuredBuffer<float>    dcValue;       // dcFramePlanes: the VarDCT frame's DC image, [c][block], channels X, Y, B
 RWStructuredBuffer<int>    planes;        // numChannels * width * height: Y, Co, Cg[, alpha] (written by rctYCoCg)
 StructuredBuffer<int>      planesIn;      // the same buffer, read by the token kernels
@@ -76,24 +79,156 @@ int sampleAt(uint index) {
     return int(byteAt(2 * index) | (byteAt(2 * index + 1) << 8));
 }
 
+// --- the RCT per group ------------------------------------------------------------------
+
+/// libjxl tries four RCTs per group at its hare tier (enc_modular.cc): none,
+/// YCoCg, type 5 (R, G - (R + B) / 2, B - R) and type 10 (G, B - G, R - G).
+static const uint kRctCandidates = 4;
+static const uint kRctTypes[kRctCandidates] = {0, 6, 5, 10};
+
+/// FwdRct: the three channels of a pixel under `rctType` (permutation * 7 + transform).
+int3 forwardRct(int r, int g, int b, uint rctType) {
+    const uint permutation = rctType / 7;
+    const uint transform = rctType % 7;
+    int3 in = int3(r, g, b);
+    // RctPermute: inputs {in[p % 3], in[(p + 1 + p / 3) % 3], in[(p + 2 - p / 3) % 3]}.
+    const int c[3] = {r, g, b};
+    const int first = c[permutation % 3];
+    int second = c[(permutation + 1 + permutation / 3) % 3];
+    int third = c[(permutation + 2 - permutation / 3) % 3];
+    if (transform == 6) {
+        const int o1 = first - third;
+        const int tmp = third + (o1 >> 1);
+        const int o2 = second - tmp;
+        return int3(tmp + (o2 >> 1), o1, o2);
+    }
+    const uint sec = transform >> 1;
+    if (sec == 1) second = second - first;
+    else if (sec == 2) second = second - ((first + third) >> 1);
+    if ((transform & 1) != 0) third = third - first;
+    return int3(first, second, third);
+}
+
+int3 rctSampleAt(uint x, uint y, uint rctType) {
+    const uint i = (y * params.width + x) * params.numChannels;
+    return forwardRct(sampleAt(i), sampleAt(i + 1), sampleAt(i + 2), rctType);
+}
+
+static const uint kRctContexts = 18;
+static const uint kRctTokens = 64;
+static const uint kRctThreads = 64;
+groupshared uint gRctHist[kRctContexts * kRctTokens];
+groupshared uint gRctExtra;
+
+/// EstimateCost (enc_modular_simd.cc): one thread-group per (group, candidate):
+/// per channel, the Shannon entropy of the ClampedGradient residual tokens in
+/// 18 contexts by the neighbours' spread, plus the raw bits.
+[shader("compute")]
+[numthreads(kRctThreads, 1, 1)]
+void rctCost(uint3 gid: SV_GroupID, uint3 ltid: SV_GroupThreadID) {
+    const uint g = gid.x / kRctCandidates;
+    const uint cand = gid.x % kRctCandidates;
+    if (g >= params.numGroups) return;
+    const uint tid = ltid.x;
+    const uint rctType = kRctTypes[cand];
+    const uint x0 = (g % params.groupsX) * params.groupDim;
+    const uint y0 = (g / params.groupsX) * params.groupDim;
+    const uint w = min(params.groupDim, params.width - x0);
+    const uint h = min(params.groupDim, params.height - y0);
+    const uint cutoffs[17] = {0, 1, 3, 5, 7, 11, 15, 23, 31, 47, 63, 95, 127, 191, 255, 392, 500};
+    float cost = 0.0f;
+    for (uint c = 0; c < 3; ++c) {
+        for (uint i = tid; i < kRctContexts * kRctTokens; i += kRctThreads) gRctHist[i] = 0;
+        if (tid == 0) gRctExtra = 0;
+        GroupMemoryBarrierWithGroupSync();
+        for (uint p = tid; p < w * h; p += kRctThreads) {
+            const uint lx = p % w, ly = p / w;
+            const uint x = x0 + lx, y = y0 + ly;
+            const int v = rctSampleAt(x, y, rctType)[c];
+            const int left = lx > 0 ? rctSampleAt(x - 1, y, rctType)[c] : (ly > 0 ? rctSampleAt(x, y - 1, rctType)[c] : 0);
+            const int top = ly > 0 ? rctSampleAt(x, y - 1, rctType)[c] : left;
+            const int topleft = (lx > 0 && ly > 0) ? rctSampleAt(x - 1, y - 1, rctType)[c] : left;
+            const uint maxDiff = uint(max(max(left, top), topleft) - min(min(left, top), topleft));
+            uint ctx = 0;
+            for (uint k = 0; k < 17; ++k) ctx += maxDiff < cutoffs[k] ? 1 : 0;
+            uint tok, nbits, raw;
+            hybridEncode(packSigned(v - modClampedGradient(left, top, topleft)), tok, nbits, raw);
+            uint before;
+            InterlockedAdd(gRctHist[ctx * kRctTokens + min(tok, kRctTokens - 1)], 1u, before);
+            if (nbits != 0) InterlockedAdd(gRctExtra, nbits, before);
+        }
+        GroupMemoryBarrierWithGroupSync();
+        if (tid == 0) {
+            for (uint ctx = 0; ctx < kRctContexts; ++ctx) {
+                float total = 0.0f;
+                for (uint t = 0; t < kRctTokens; ++t) total += float(gRctHist[ctx * kRctTokens + t]);
+                if (total == 0.0f) continue;
+                for (uint t = 0; t < kRctTokens; ++t) {
+                    const float n = float(gRctHist[ctx * kRctTokens + t]);
+                    if (n > 0.0f) cost += n * log2(total / n);
+                }
+            }
+            cost += float(gRctExtra);
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (tid == 0) rctCosts[g * kRctCandidates + cand] = cost;
+}
+
+/// One thread per pixel: the planes under the group's cheapest RCT (ties to
+/// the first candidate, libjxl's order); alpha copied. The first pixel of a
+/// group records the choice for the group's header.
 [shader("compute")]
 [numthreads(16, 16, 1)]
-void rctYCoCg(uint3 tid: SV_DispatchThreadID) {
+void rctApply(uint3 tid: SV_DispatchThreadID) {
     if (tid.x >= params.width || tid.y >= params.height) return;
+    const uint g = (tid.y / params.groupDim) * params.groupsX + tid.x / params.groupDim;
+    uint best = 0;
+    for (uint k = 1; k < kRctCandidates; ++k) {
+        if (rctCosts[g * kRctCandidates + k] < rctCosts[g * kRctCandidates + best]) best = k;
+    }
+    const uint rctType = kRctTypes[best];
     const uint i = tid.y * params.width + tid.x;
     const uint nc = params.numChannels;
-    const int r = sampleAt(i * nc + 0);
-    const int g = sampleAt(i * nc + 1);
-    const int b = sampleAt(i * nc + 2);
-    // enc_rct.cc FwdRctRow<6>
-    const int co = r - b;
-    const int tmp = b + (co >> 1);
-    const int cg = g - tmp;
+    const int3 t = forwardRct(sampleAt(i * nc + 0), sampleAt(i * nc + 1), sampleAt(i * nc + 2), rctType);
     const uint plane = params.width * params.height;
-    planes[0 * plane + i] = tmp + (cg >> 1);
-    planes[1 * plane + i] = co;
-    planes[2 * plane + i] = cg;
+    planes[0 * plane + i] = t.x;
+    planes[1 * plane + i] = t.y;
+    planes[2 * plane + i] = t.z;
     if (nc > 3) planes[3 * plane + i] = sampleAt(i * nc + 3);
+    if (tid.x % params.groupDim == 0 && tid.y % params.groupDim == 0) groupRct[g] = rctType;
+}
+
+/// The GroupHeader of a modular stream: use_global_tree, the default WP header
+/// and its RCT (if any) over channels 0..2: num_transforms, id kRCT, begin_c 0
+/// and rct_type as U32(Val(6), Bits(2), BitsOffset(4, 2), BitsOffset(6, 10)).
+uint groupHeaderBits(uint rctType) {
+    if (rctType == 0) return 4;
+    const uint typeBits = rctType == 6 ? 2 : rctType < 4 ? 4 : rctType < 18 ? 6 : 8;
+    return 2 + 2 + 2 + 5 + typeBits;
+}
+
+void emitGroupHeader(RWStructuredBuffer<uint> body, uint pos, uint rctType) {
+    emitAtomic(body, pos, 2, 0x3u);   // use_global_tree, wp all_default
+    if (rctType == 0) {
+        emitAtomic(body, pos + 2, 2, 0);   // num_transforms = 0
+        return;
+    }
+    emitAtomic(body, pos + 2, 2, 1);   // num_transforms = 1 (U32 selector 1: Val(1))
+    emitAtomic(body, pos + 4, 2, 0);   // Transform id: RCT
+    emitAtomic(body, pos + 6, 5, 0);   // begin_c: selector 0 (Bits(3)) = 0
+    if (rctType == 6) {
+        emitAtomic(body, pos + 11, 2, 0);
+    } else if (rctType < 4) {
+        emitAtomic(body, pos + 11, 2, 1);
+        emitAtomic(body, pos + 13, 2, rctType);
+    } else if (rctType < 18) {
+        emitAtomic(body, pos + 11, 2, 2);
+        emitAtomic(body, pos + 13, 4, rctType - 2);
+    } else {
+        emitAtomic(body, pos + 11, 2, 3);
+        emitAtomic(body, pos + 13, 6, rctType - 10);
+    }
 }
 
 /// One thread per block: the DC frame's channels from the DC image. A modular
@@ -406,8 +541,6 @@ void put(inout AnsWriter aw, uint ctx, uint value) {
     aw.bits += nbits + ansN;
 }
 
-static const uint kGroupHeaderBits = 4;   // use_global_tree 1, wp all_default 1, num_transforms = 0: U32 selector 0
-
 [shader("compute")]
 [numthreads(1, 1, 1)]
 void modGroupSections(uint3 tid: SV_DispatchThreadID) {
@@ -420,7 +553,8 @@ void modGroupSections(uint3 tid: SV_DispatchThreadID) {
     AnsWriter aw;
     aw.mode = params.mode;
     aw.state = kAnsSignature << 16;
-    aw.bits = kGroupHeaderBits + 32;
+    const uint headerBits = groupHeaderBits(params.rct != 0 ? groupRct[g] : 0);
+    aw.bits = headerBits + 32;
     aw.pos = aw.mode == 2 ? groupStart[g] + groupBits[g] : 0;
     const uint plane = params.width * params.height;
     for (int c = int(params.numChannels) - 1; c >= 0; --c) {
@@ -434,8 +568,8 @@ void modGroupSections(uint3 tid: SV_DispatchThreadID) {
     if (aw.mode == 1) {
         groupBits[g] = aw.bits;
     } else {
-        // GroupHeader: use_global_tree = 1, weighted header all_default = 1, no transforms (2 zero bits), then the state.
-        emitAtomic(body, groupStart[g], kGroupHeaderBits, 0x3u);
-        emitAtomic(body, groupStart[g] + kGroupHeaderBits, 32, aw.state);
+        // GroupHeader (the group's RCT when the frame has one), then the state.
+        emitGroupHeader(body, groupStart[g], params.rct != 0 ? groupRct[g] : 0);
+        emitAtomic(body, groupStart[g] + headerBits, 32, aw.state);
     }
 }

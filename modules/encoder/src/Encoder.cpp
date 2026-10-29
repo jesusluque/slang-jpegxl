@@ -152,7 +152,8 @@ Result<std::unique_ptr<Encoder>> Encoder::create(std::shared_ptr<gpu::ShaderLibr
     SJXL_ASSIGN(enc->clusterContexts_, gpu::ComputeKernel::create(lib, "sjxl/enc/cluster", "clusterContexts"));
     SJXL_ASSIGN(enc->accumulateClusters_, gpu::ComputeKernel::create(lib, "sjxl/enc/cluster", "accumulateClusters"));
     SJXL_ASSIGN(enc->acSections_, gpu::ComputeKernel::create(lib, "sjxl/enc/ac_sections", "acSections"));
-    SJXL_ASSIGN(enc->rctYCoCg_, gpu::ComputeKernel::create(lib, "sjxl/enc/modular", "rctYCoCg"));
+    SJXL_ASSIGN(enc->rctCost_, gpu::ComputeKernel::create(lib, "sjxl/enc/modular", "rctCost"));
+    SJXL_ASSIGN(enc->rctApply_, gpu::ComputeKernel::create(lib, "sjxl/enc/modular", "rctApply"));
     SJXL_ASSIGN(enc->dcFramePlanes_, gpu::ComputeKernel::create(lib, "sjxl/enc/modular", "dcFramePlanes"));
     SJXL_ASSIGN(enc->modTokenize_, gpu::ComputeKernel::create(lib, "sjxl/enc/modular", "modTokenize"));
     SJXL_ASSIGN(enc->modSamples_, gpu::ComputeKernel::create(lib, "sjxl/enc/modular", "modSamples"));
@@ -630,7 +631,8 @@ Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, cons
         SJXL_ASSIGN(auto dcPlanes, gpu::Buffer::ofType<int32_t>(dev, uint64_t{3} * nblocks, "enc.dcFramePlanes"));
         dcFramePlanes_.dispatch(batch, {nblocks, 1, 1}, [&](rhi::ShaderCursor c) {
             for (const char* name : {"rgb8", "planesIn", "treeNodes", "wpScratch", "passTokens", "passHist", "passBits", "choice", "leafMap", "modTokens",
-                                     "ctxHist", "ctxMap", "ansInfo", "ansReverse", "groupStart", "groupBits", "body"}) {
+                                     "ctxHist", "ctxMap", "ansInfo", "ansReverse", "groupStart", "groupBits", "body", "thresholds", "samples", "sampleCount",
+                                     "rctCosts", "groupRct"}) {
                 c[name].setBinding(dummy_.rhi());
             }
             c["dcValue"].setBinding(dcValue.rhi());
@@ -726,6 +728,7 @@ Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, cons
             c["groupStart"].setBinding(dummy_.rhi());
             c["groupBits"].setBinding(dummy_.rhi());
             c["body"].setBinding(dummy_.rhi());
+            for (const char* name : {"dcValue", "thresholds", "samples", "sampleCount", "rctCosts", "groupRct"}) c[name].setBinding(dummy_.rhi());
             c["params"]["width"].setData(image.width);
             c["params"]["height"].setData(image.height);
             c["params"]["groupDim"].setData(dim.groupDim);
@@ -829,6 +832,7 @@ Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, cons
         c["ctxMap"].setBinding(ctxMap.rhi());
         c["clusterInfo"].setBinding(clusterInfo.rhi());
         c["ctxMapMtf"].setBinding(ctxMapMtf.rhi());
+        c["groupRct"].setBinding(dummy_.rhi());
         c["ansInfo"].setBinding(ansInfo.rhi());
         c["ansReverse"].setBinding(ansReverse.rhi());
         c["planes"].setBinding(dummyInt_.rhi());
@@ -1190,20 +1194,32 @@ Result<std::vector<uint8_t>> Encoder::encodeLossless(const image::Rgb8& image, c
     std::memcpy(rgbWords.data(), image.pixels.data(), image.pixels.size());
     SJXL_ASSIGN(auto rgb, gpu::Buffer::fromSpan<uint32_t>(dev, rgbWords, "enc.rgb8"));
     SJXL_ASSIGN(auto planes, gpu::Buffer::ofType<int32_t>(dev, channels * pixels, "enc.planes"));
+    const FrameDim dim = codestream::frameDim(image.width, image.height);
+    const uint32_t numGroups = dim.numGroups();
+    // libjxl's four RCT candidates per group (none, YCoCg, 5, 10) by the entropy
+    // estimate of their gradient residuals; the cheapest transforms the group's pixels.
+    SJXL_ASSIGN(auto rctCosts, gpu::Buffer::ofType<float>(dev, uint64_t{numGroups} * 4, "enc.rctCosts"));
+    SJXL_ASSIGN(auto groupRct, gpu::Buffer::ofType<uint32_t>(dev, numGroups, "enc.groupRct"));
     gpu::CommandBatch batch(dev);
-    // The YCoCg RCT over the colour channels (alpha copied) into the planes.
-    rctYCoCg_.dispatch(batch, {image.width, image.height, 1}, [&](rhi::ShaderCursor c) {
+    const auto bindRct = [&](rhi::ShaderCursor c) {
         for (const char* name : {"dcValue", "planesIn", "treeNodes", "wpScratch", "passTokens", "passHist", "passBits", "choice", "leafMap", "modTokens",
-                                 "ctxHist", "ctxMap", "ansInfo", "ansReverse", "groupStart", "groupBits", "body"}) {
+                                 "ctxHist", "ctxMap", "ansInfo", "ansReverse", "groupStart", "groupBits", "body", "thresholds", "samples", "sampleCount"}) {
             c[name].setBinding(dummy_.rhi());
         }
         c["rgb8"].setBinding(rgb.rhi());
         c["planes"].setBinding(planes.rhi());
+        c["rctCosts"].setBinding(rctCosts.rhi());
+        c["groupRct"].setBinding(groupRct.rhi());
         c["params"]["width"].setData(image.width);
         c["params"]["height"].setData(image.height);
         c["params"]["numChannels"].setData(channels);
         c["params"]["bitDepth"].setData(image.bitDepth);
-    });
+        c["params"]["groupDim"].setData(dim.groupDim);
+        c["params"]["groupsX"].setData(dim.xsizeGroups);
+        c["params"]["numGroups"].setData(numGroups);
+    };
+    rctCost_.dispatchGroups(batch, {numGroups * 4, 1, 1}, bindRct);
+    rctApply_.dispatch(batch, {image.width, image.height, 1}, bindRct);
     SJXL_TRY(batch.submit(true));
     ModularSpec spec;
     spec.width = image.width;
@@ -1211,11 +1227,11 @@ Result<std::vector<uint8_t>> Encoder::encodeLossless(const image::Rgb8& image, c
     spec.channels = channels;
     spec.bitDepth = image.bitDepth;
     spec.rct = true;
-    return encodeModularFrame(spec, planes, options, info);
+    return encodeModularFrame(spec, planes, options, info, &groupRct);
 }
 
 Result<std::vector<uint8_t>> Encoder::encodeModularFrame(const ModularSpec& spec, const gpu::Buffer& planes, const Options& options,
-                                                         const codestream::FrameInfo& info) {
+                                                         const codestream::FrameInfo& info, const gpu::Buffer* groupRct) {
     gpu::Device& dev = *device_;
     const FrameDim dim = codestream::frameDim(spec.width, spec.height);
     const uint32_t numGroups = dim.numGroups();
@@ -1250,6 +1266,8 @@ Result<std::vector<uint8_t>> Encoder::encodeModularFrame(const ModularSpec& spec
         c["thresholds"].setBinding(orDummy(thresholds).rhi());
         c["samples"].setBinding(orDummy(samples).rhi());
         c["sampleCount"].setBinding(orDummy(sampleCount).rhi());
+        c["rctCosts"].setBinding(dummy_.rhi());
+        c["groupRct"].setBinding(groupRct != nullptr ? groupRct->rhi() : dummy_.rhi());
         c["planes"].setBinding(planes.rhi());
         c["planesIn"].setBinding(planes.rhi());
         c["treeNodes"].setBinding(orDummy(tree).rhi());
@@ -1285,6 +1303,7 @@ Result<std::vector<uint8_t>> Encoder::encodeModularFrame(const ModularSpec& spec
         c["params"]["sampleFraction"].setData(sampleFraction);
         c["params"]["sampleCapacity"].setData(uint32_t{samples.valid() ? static_cast<uint32_t>(samples.bytes() / 8) : 0u});
         c["params"]["streamBase"].setData(streamBase);
+        c["params"]["rct"].setData(uint32_t{spec.rct && groupRct != nullptr ? 1u : 0u});
         c["params"]["propIds"].setData(propIds);
     };
 
@@ -1487,6 +1506,7 @@ Result<std::vector<uint8_t>> Encoder::encodeModularFrame(const ModularSpec& spec
         c["hist"].setBinding(hist.rhi());
         c["quantizer"].setBinding(dummy_.rhi());
         c["ctxMap"].setBinding(ctxMap.rhi());
+        c["groupRct"].setBinding(groupRct != nullptr ? groupRct->rhi() : dummy_.rhi());
         c["clusterInfo"].setBinding(clusterInfo.rhi());
         c["ctxMapMtf"].setBinding(ctxMapMtf.rhi());
         c["ansInfo"].setBinding(ansInfo.rhi());
@@ -1520,7 +1540,7 @@ Result<std::vector<uint8_t>> Encoder::encodeModularFrame(const ModularSpec& spec
         c["params"]["ecInGlobal"].setData(0u);
         c["params"]["ecLogAlpha"].setData(6u);
         c["params"]["useDcFrame"].setData(0u);
-        c["params"]["rct"].setData(uint32_t{spec.rct ? 1u : 0u});
+        c["params"]["rct"].setData(uint32_t{spec.rct && groupRct != nullptr ? 1u : 0u});
         c["params"]["dcQuantCustom"].setData(uint32_t{spec.dcFrame ? 1u : 0u});
         c["params"]["dcQuantX"].setData(spec.dcQuant[0]);
         c["params"]["dcQuantY"].setData(spec.dcQuant[1]);
