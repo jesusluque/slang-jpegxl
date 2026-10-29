@@ -843,6 +843,7 @@ void undoTransforms(inout Dec d, StreamHeader h, uint chansOff, inout uint numCh
 /// local or global tree, every channel, inverse transforms. The channel
 /// descriptors at chansOff (numChannels entries, each with storage) are the
 /// image; on return they hold the decoded channels (the count may change).
+[noinline]
 void decodeModularStream(inout Dec d, uint chansOff, inout uint numChannels, uint streamId, GlobalTree global,
                          uint windowOff, uint bitDepth) {
     if (numChannels == 0) return;

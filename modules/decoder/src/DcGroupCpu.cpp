@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <future>
 #include <memory>
 
 namespace sjxl::dec::cpu {
@@ -1081,6 +1082,49 @@ void decodeModularStream(BitReader& br, std::vector<Channel>& channels, uint32_t
     if (!checkFinalState(r)) throw Corrupt{};
 }
 
+const uint32_t kNumStrategies = 27;
+const uint32_t kCoveredX[27] = {1, 1, 1, 1, 2, 4, 1, 2, 1, 4, 2, 4, 1, 1, 1, 1, 1, 1, 8, 4, 8, 16, 8, 16, 32, 16, 32};
+const uint32_t kCoveredY[27] = {1, 1, 1, 1, 2, 4, 2, 1, 4, 1, 4, 2, 1, 1, 1, 1, 1, 1, 8, 8, 4, 16, 16, 8, 32, 32, 16};
+
+/// The raster walk of DecodeAcMetadata: every block not covered yet starts the next
+/// varblock; checks the coverage as dcgroup.slangh does.
+void walkStrategies(const DcGroupGeom& geo, const Channel& cAcs, const Channel& cEpf, uint32_t count, DcGroupData& r) {
+    const bool is444 = (geo.hshift[0] | geo.hshift[1] | geo.hshift[2] | geo.vshift[0] | geo.vshift[1] | geo.vshift[2]) == 0;
+    std::vector<uint8_t> covered(size_t{geo.w} * geo.h, 0);
+    uint32_t num = 0;
+    for (uint32_t iy = 0; iy < geo.h; ++iy) {
+        const uint32_t y = geo.y0 + iy;
+        for (uint32_t ix = 0; ix < geo.w; ++ix) {
+            const uint32_t x = geo.x0 + ix;
+            const int32_t sharpness = cEpf.px(ix, iy);
+            if (sharpness < 0 || sharpness >= 8) throw Corrupt{};
+            if (covered[iy * geo.w + ix] != 0) continue;
+            if (num >= count) throw Corrupt{};
+            const int32_t raw = cAcs.px(num, 0);
+            const int32_t qfv = cAcs.px(num, 1);
+            if (raw < 0 || raw >= static_cast<int32_t>(kNumStrategies)) throw Corrupt{};
+            const uint32_t strategy = static_cast<uint32_t>(raw);
+            r.usedAcs |= 1u << strategy;
+            const uint32_t cx = kCoveredX[strategy], cy = kCoveredY[strategy];
+            if ((cx > 1 || cy > 1) && !is444) throw Corrupt{};
+            const uint32_t nextXGroup = (x / geo.groupBlocks + 1) * geo.groupBlocks;
+            const uint32_t nextYGroup = (y / geo.groupBlocks + 1) * geo.groupBlocks;
+            if (x + cx > nextXGroup || x + cx > geo.x0 + geo.w || y + cy > nextYGroup || y + cy > geo.y0 + geo.h) throw Corrupt{};
+            for (uint32_t by = 0; by < cy; ++by) {
+                for (uint32_t bx = 0; bx < cx; ++bx) {
+                    uint8_t& c = covered[(iy + by) * geo.w + ix + bx];
+                    if (c != 0) throw Corrupt{};
+                    c = 1;
+                }
+            }
+            r.varblocks.push_back(static_cast<int32_t>(y * geo.blocksX + x));
+            r.varblocks.push_back(static_cast<int32_t>(strategy));
+            r.varblocks.push_back(1 + std::clamp(qfv, 0, 255));
+            ++num;
+        }
+    }
+}
+
 Channel makeChannel(uint32_t w, uint32_t h, int32_t hshift, int32_t vshift) {
     Channel c;
     c.w = w;
@@ -1112,34 +1156,54 @@ Result<bool> decodeDcGroups(std::span<const uint8_t> codestream, const ParsedFra
         }
         const uint32_t numDcGroups = static_cast<uint32_t>(geoms.size());
         out.assign(numDcGroups, DcGroupData{});
-        for (uint32_t g = 0; g < numDcGroups; ++g) {
-            const DcGroupGeom& geo = geoms[g];
-            const codestream::Section& s = frame.sections[1 + g];
-            BitReader br{words.data(), words.size(), s.byteOffset * 8};
-            DcGroupData& r = out[g];
-            static const uint32_t phys[3] = {1, 0, 2};
-            std::vector<Channel> dcCh;
-            if (!useDcFrame) {
-                r.extraPrecision = br.read(2);
-                for (uint32_t i = 0; i < 3; ++i) {
-                    const uint32_t c = phys[i];
-                    dcCh.push_back(makeChannel(geo.w >> geo.hshift[c], geo.h >> geo.vshift[c], 0, 0));
+        // The groups are independent chains: one task each (the global tree is read only).
+        enum class Outcome { Ok, Unsupported, Corrupt, Overrun };
+        const auto decodeOne = [&](uint32_t g) -> Outcome {
+            try {
+                const DcGroupGeom& geo = geoms[g];
+                const codestream::Section& s = frame.sections[1 + g];
+                BitReader br{words.data(), words.size(), s.byteOffset * 8};
+                DcGroupData& r = out[g];
+                static const uint32_t phys[3] = {1, 0, 2};
+                std::vector<Channel> dcCh;
+                if (!useDcFrame) {
+                    r.extraPrecision = br.read(2);
+                    for (uint32_t i = 0; i < 3; ++i) {
+                        const uint32_t c = phys[i];
+                        dcCh.push_back(makeChannel(geo.w >> geo.hshift[c], geo.h >> geo.vshift[c], 0, 0));
+                    }
+                    decodeModularStream(br, dcCh, 1 + g, hasGlobal ? &global : nullptr);
                 }
-                decodeModularStream(br, dcCh, 1 + g, hasGlobal ? &global : nullptr);
+                // AcMetadata.
+                const uint32_t upperBound = geo.w * geo.h;
+                r.count = br.read(ceilLog2Nonzero(upperBound)) + 1;
+                const uint32_t tw = (geo.w + 7) >> 3, th = (geo.h + 7) >> 3;
+                std::vector<Channel> meta;
+                meta.push_back(makeChannel(tw, th, 3, 3));
+                meta.push_back(makeChannel(tw, th, 3, 3));
+                meta.push_back(makeChannel(r.count, 2, 0, 0));
+                meta.push_back(makeChannel(geo.w, geo.h, 0, 0));
+                decodeModularStream(br, meta, 1 + 2 * numDcGroups + g, hasGlobal ? &global : nullptr);
+                if (br.pos > (s.byteOffset + s.byteSize) * 8) return Outcome::Overrun;
+                walkStrategies(geo, meta[2], meta[3], r.count, r);
+                for (const Channel& c : dcCh) r.words.insert(r.words.end(), c.data.begin(), c.data.end());
+                for (const Channel& c : meta) r.words.insert(r.words.end(), c.data.begin(), c.data.end());
+                return Outcome::Ok;
+            } catch (const Unsupported&) {
+                return Outcome::Unsupported;
+            } catch (const Corrupt&) {
+                return Outcome::Corrupt;
             }
-            // AcMetadata.
-            const uint32_t upperBound = geo.w * geo.h;
-            r.count = br.read(ceilLog2Nonzero(upperBound)) + 1;
-            const uint32_t tw = (geo.w + 7) >> 3, th = (geo.h + 7) >> 3;
-            std::vector<Channel> meta;
-            meta.push_back(makeChannel(tw, th, 3, 3));
-            meta.push_back(makeChannel(tw, th, 3, 3));
-            meta.push_back(makeChannel(r.count, 2, 0, 0));
-            meta.push_back(makeChannel(geo.w, geo.h, 0, 0));
-            decodeModularStream(br, meta, 1 + 2 * numDcGroups + g, hasGlobal ? &global : nullptr);
-            if (br.pos > (s.byteOffset + s.byteSize) * 8) return Error(ErrorCode::Corrupt, "DC group section overrun");
-            for (const Channel& c : dcCh) r.words.insert(r.words.end(), c.data.begin(), c.data.end());
-            for (const Channel& c : meta) r.words.insert(r.words.end(), c.data.begin(), c.data.end());
+        };
+        std::vector<std::future<Outcome>> tasks;
+        for (uint32_t g = 1; g < numDcGroups; ++g) tasks.push_back(std::async(std::launch::async, decodeOne, g));
+        std::vector<Outcome> outcomes(numDcGroups, Outcome::Ok);
+        outcomes[0] = decodeOne(0);
+        for (uint32_t g = 1; g < numDcGroups; ++g) outcomes[g] = tasks[g - 1].get();
+        for (Outcome o : outcomes) {
+            if (o == Outcome::Unsupported) { out.clear(); return false; }
+            if (o == Outcome::Overrun) return Error(ErrorCode::Corrupt, "DC group section overrun");
+            if (o == Outcome::Corrupt) return Error(ErrorCode::Corrupt, "the codestream violates the specification in a DC group (CPU path)");
         }
     } catch (const Unsupported&) {
         out.clear();

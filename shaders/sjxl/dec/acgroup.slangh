@@ -49,6 +49,7 @@ uint acShift(uint4 v, uint c) { return c == 0 ? v.x : c == 1 ? v.y : v.z; }
 static const uint kNzGrid = 32;   // group-local non-zero grid per channel (groupDim / 8 <= 128 would need more)
 
 /// One pass of one AC group: coefficients are added, shifted by the pass's shift.
+[noinline]
 void decodeAcGroup(inout Dec d, AcGroupGeom g, uint pass, uint shift, uint windowOff) {
     const uint numHistograms = arena[kGsNumHistograms];
     const uint numCtxs = arena[kGsBctxNumCtxs];

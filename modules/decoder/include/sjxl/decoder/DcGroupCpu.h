@@ -23,6 +23,8 @@ namespace sjxl::dec::cpu {
 /// by physical channel (X, Y, B), as the GPU kernel sees them.
 struct DcGroupGeom {
     uint32_t x0 = 0, y0 = 0, w = 0, h = 0;
+    uint32_t blocksX = 0;       // image width in blocks
+    uint32_t groupBlocks = 0;   // AC group size in blocks (a varblock stays inside one)
     std::array<uint32_t, 3> hshift{}, vshift{};
 };
 
@@ -31,8 +33,10 @@ struct DcGroupGeom {
 /// and the sharpness, as the modular streams produced them.
 struct DcGroupData {
     uint32_t             extraPrecision = 0;
-    uint32_t             count = 0;   // AcMetadata entries (varblocks)
-    std::vector<int32_t> words;       // Y, X, B planes; ytox, ytob (tiles); acs (count x 2); sharpness (w x h)
+    uint32_t             count = 0;      // AcMetadata entries (varblocks)
+    uint32_t             usedAcs = 0;    // bit per strategy
+    std::vector<int32_t> words;          // Y, X, B planes; ytox, ytob (tiles); acs (count x 2); sharpness (w x h)
+    std::vector<int32_t> varblocks;      // the strategy walk's result: (block index, strategy, stored qf) per varblock
 };
 
 /// Decodes every DC group of `frame`. `globalTreeBit` is where DcGlobal's global

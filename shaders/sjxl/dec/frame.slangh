@@ -168,6 +168,7 @@ uint decodeContextMapStandalone(inout Dec d, uint mapOff, uint numContexts, uint
 }
 
 /// DecodeBlockCtxMap.
+[noinline]
 void readBlockCtxMap(inout Dec d, uint windowOff) {
     const uint kDefaultCtxMap[39] = {0, 1, 2, 2, 3, 3, 4, 5, 6, 6, 6, 6, 6, 7, 8, 9, 9, 10, 11, 12, 13, 14, 14, 14, 14, 14,
                                      7, 8, 9, 9, 10, 11, 12, 13, 14, 14, 14, 14, 14};
@@ -284,6 +285,7 @@ GlobalTree globalTree() {
 /// rejected those flags).
 /// PatchDictionary::Decode (no extra channels: one blending per position). The
 /// reference frame sizes come from the host, which decoded those frames first.
+[noinline]
 void readPatchDictionary(inout Dec d, uint xsize, uint ysize, uint4 refW, uint4 refH, uint numEc, uint windowOff) {
     const uint codeSet = decodeHistograms(d, 10, false, windowOff);
     if (d.error != kErrNone) return;
@@ -368,6 +370,7 @@ static const uint kMaxSplineControlPoints = 1u << 18;   // the drawing kernels' 
 /// starting points (the first absolute, then deltas), the quantization
 /// adjustment, and per spline its control point delta-deltas and the four
 /// 32-point DCTs, all as ints; the drawing kernels dequantise (splines.slang).
+[noinline]
 void readSplines(inout Dec d, uint numPixels, uint windowOff) {
     const uint codeSet = decodeHistograms(d, 6, false, windowOff);
     if (d.error != kErrNone) return;
@@ -425,6 +428,7 @@ void readSplines(inout Dec d, uint numPixels, uint windowOff) {
     arena[kGsSplinesOff] = table;
 }
 
+[noinline]
 void decodeDcGlobal(inout Dec d, uint windowOff, uint frameFlags, uint xsize, uint ysize, uint4 refW, uint4 refH, uint numEc) {
     if ((frameFlags & kFramePatches) != 0) {
         readPatchDictionary(d, xsize, ysize, refW, refH, numEc, windowOff);
@@ -565,6 +569,7 @@ void readQuantEncoding(inout Dec d, uint qe, uint kind, uint numDcGroups, uint w
 }
 
 /// DequantMatrices::Decode: 17 encodings (all library when all_default).
+[noinline]
 void readDequantMatrices(inout Dec d, uint numDcGroups, uint windowOff) {
     const uint encOff = alloc(d, kNumQuantTables * kQeWords);
     arena[kGsQuantEncOff] = encOff;
@@ -579,7 +584,13 @@ void readDequantMatrices(inout Dec d, uint numDcGroups, uint windowOff) {
 
 /// ac_strategy.cc CoeffOrderAndLut (the order, not the LUT) for a strategy
 /// with covered blocks cxIn x cyIn, written to `out` (64 * cx * cy entries).
-void naturalCoeffOrder(uint cxIn, uint cyIn, uint out) {
+/// 1: the globals thread leaves the natural orders to the finishOrders kernel
+/// (naturalOrders buffer) and writes permutation indices only; 0: everything in-thread
+/// (single-section frames, where the same thread goes on to decode the AC group).
+groupshared uint gDeferOrders;
+
+[noinline]
+void naturalCoeffOrder(uint cxIn, uint cyIn, RWStructuredBuffer<uint> dst, uint out) {
     // CoefficientLayout: cx >= cy.
     uint cx = max(cxIn, cyIn);
     uint cy = min(cxIn, cyIn);
@@ -598,7 +609,7 @@ void naturalCoeffOrder(uint cxIn, uint cyIn, uint out) {
             uint val;
             if (x < cx && y < cy) val = y * cx + x;
             else val = cur++;
-            arena[out + val] = y * cx * 8 + x;
+            dst[out + val] = y * cx * 8 + x;
         }
     }
     for (uint ip = n - 1; ip > 0; --ip) {
@@ -609,7 +620,7 @@ void naturalCoeffOrder(uint cxIn, uint cyIn, uint out) {
             if ((i & 1) != 0) { const uint t = x; x = y; y = t; }
             if ((y & xsm) != 0) continue;
             y >>= xss;
-            arena[out + cur] = y * cx * 8 + x;
+            dst[out + cur] = y * cx * 8 + x;
             ++cur;
         }
     }
@@ -622,8 +633,10 @@ uint coeffOrderContext(uint val) {
 }
 
 /// ReadPermutation (skip = llf) applied through the natural order into `dest`
-/// (or only consumed when dest == 0xFFFFFFFF).
-void readCoeffOrder(inout Dec d, inout SymReader r, uint llf, uint size, uint naturalOff, uint dest) {
+/// (or only consumed when dest == 0xFFFFFFFF). With compose false the permutation
+/// indices are left in dest for the finishOrders kernel to map.
+[noinline]
+void readCoeffOrder(inout Dec d, inout SymReader r, uint llf, uint size, uint naturalOff, uint dest, bool compose) {
     const uint lehmerOff = alloc(d, size);
     const uint tempOff = alloc(d, size * 2);
     if (d.error != kErrNone) return;
@@ -664,7 +677,7 @@ void readCoeffOrder(inout Dec d, inout SymReader r, uint llf, uint size, uint na
             next += next & (0u - next);
         }
     }
-    for (uint k = 0; k < size; ++k) arena[dest + k] = arena[naturalOff + arena[dest + k]];
+    if (compose) for (uint k = 0; k < size; ++k) arena[dest + k] = arena[naturalOff + arena[dest + k]];
 }
 
 /// DecodeCoeffOrders for one pass: used_orders and the orders of every bucket.
@@ -689,9 +702,17 @@ uint readCoeffOrders(inout Dec d, uint windowOff, out uint usedOrdersOut) {
         const uint cy = kCoveredY[o];
         const uint llf = cx * cy;
         const uint size = 64 * llf;
+        if (gDeferOrders != 0) {   // finishOrders fills the natural orders and composes the permutations
+            if ((usedOrders & (1u << ord)) == 0) continue;
+            for (uint c = 0; c < 3; ++c) {
+                readCoeffOrder(d, r, llf, size, 0, ordersOff + coeffOrderOffset(ord, c), false);
+                if (d.error != kErrNone) return ordersOff;
+            }
+            continue;
+        }
         // Natural order into channel 0's slot, copied to the others.
         const uint natural = ordersOff + coeffOrderOffset(ord, 0);
-        naturalCoeffOrder(cx, cy, natural);
+        naturalCoeffOrder(cx, cy, arena, natural);
         if ((usedOrders & (1u << ord)) == 0) {
             for (uint c = 1; c < 3; ++c) {
                 const uint dst = ordersOff + coeffOrderOffset(ord, c);
@@ -703,7 +724,7 @@ uint readCoeffOrders(inout Dec d, uint windowOff, out uint usedOrdersOut) {
             if (d.error != kErrNone) return ordersOff;
             for (uint k = 0; k < size; ++k) arena[keep + k] = arena[natural + k];
             for (uint c = 0; c < 3; ++c) {
-                readCoeffOrder(d, r, llf, size, keep, ordersOff + coeffOrderOffset(ord, c));
+                readCoeffOrder(d, r, llf, size, keep, ordersOff + coeffOrderOffset(ord, c), true);
                 if (d.error != kErrNone) return ordersOff;
             }
         }
@@ -722,7 +743,7 @@ uint readTocPermutation(inout Dec d, uint size, uint dest, uint windowOff) {
     const uint natural = alloc(d, size);
     if (d.error != kErrNone) return d.br.pos;
     for (uint i = 0; i < size; ++i) arena[natural + i] = i;
-    readCoeffOrder(d, r, 0, size, natural, dest);
+    readCoeffOrder(d, r, 0, size, natural, dest, true);
     if (d.error != kErrNone) return d.br.pos;
     if (!checkFinalState(r)) fail(d, kErrCorrupt);
     return d.br.pos;
@@ -733,6 +754,7 @@ uint passTable(uint p) { return arena[kGsPassTableOff] + p * kPassWords; }
 
 /// The whole AcGlobal section: dequant matrices, the histogram count, then per
 /// pass the coefficient orders and the AC histograms (ProcessACGlobal).
+[noinline]
 void decodeAcGlobal(inout Dec d, uint numGroups, uint numDcGroups, uint numPasses, uint windowOff) {
     readDequantMatrices(d, numDcGroups, windowOff);
     if (d.error != kErrNone) return;

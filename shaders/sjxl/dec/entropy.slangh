@@ -841,6 +841,7 @@ bool checkFinalState(SymReader r);
 /// DecodeHistograms with `numContexts` contexts (before any LZ77 context).
 /// Returns the code set's arena offset. `windowOff` is this thread's LZ77
 /// window for the nested context-map stream (0xFFFFFFFF when it has none).
+[noinline]
 uint decodeHistograms(inout Dec d, uint numContexts, bool disallowLz77, uint windowOff) {
     const uint codeSet = alloc(d, kCsSize);
     if (d.error != kErrNone) return codeSet;

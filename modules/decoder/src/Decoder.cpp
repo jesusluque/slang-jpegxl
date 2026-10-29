@@ -24,6 +24,7 @@ namespace sjxl::dec {
 namespace {
 
 constexpr uint32_t kGsHeaderSize = 64;
+constexpr uint32_t kCoeffOrderLimit = 6156;      // transform_basis.slangh: the order table in 64-entry blocks
 constexpr uint32_t kGlobalsWords = 4u << 20;      // 16 MB: AC code sets, orders, matrices encodings
 constexpr uint32_t kDcGroupWords = 1u << 20;      // 4 MB per DC group
 constexpr uint32_t kAcGroupWords = 1u << 13;        // per-channel non-zero grids (3 x 32 x 32 words) and reader state
@@ -63,6 +64,11 @@ Result<std::unique_ptr<Decoder>> Decoder::create(std::shared_ptr<gpu::ShaderLibr
     SJXL_ASSIGN(dec->globals_, gpu::ComputeKernel::create(lib, "sjxl/dec/sections", "decodeGlobals"));
     SJXL_ASSIGN(dec->dcGroups_, gpu::ComputeKernel::create(lib, "sjxl/dec/sections", "decodeDcGroups"));
     SJXL_ASSIGN(dec->acGroups_, gpu::ComputeKernel::create(lib, "sjxl/dec/sections", "decodeAcGroups"));
+    SJXL_ASSIGN(dec->buildNaturalOrders_, gpu::ComputeKernel::create(lib, "sjxl/dec/sections", "buildNaturalOrders"));
+    SJXL_ASSIGN(dec->finishOrders_, gpu::ComputeKernel::create(lib, "sjxl/dec/sections", "finishOrders"));
+    SJXL_ASSIGN(dec->hostDcBlocks_, gpu::ComputeKernel::create(lib, "sjxl/dec/sections", "hostDcBlocks"));
+    SJXL_ASSIGN(dec->hostDcVarblocks_, gpu::ComputeKernel::create(lib, "sjxl/dec/sections", "hostDcVarblocks"));
+    SJXL_ASSIGN(dec->hostDcTiles_, gpu::ComputeKernel::create(lib, "sjxl/dec/sections", "hostDcTiles"));
     SJXL_ASSIGN(dec->tables_, gpu::ComputeKernel::create(lib, "sjxl/dec/tables", "computeDequantTable"));
     SJXL_ASSIGN(dec->smoothDc_, gpu::ComputeKernel::create(lib, "sjxl/dec/dc_finalize", "smoothDc"));
     SJXL_ASSIGN(dec->computeSigma_, gpu::ComputeKernel::create(lib, "sjxl/dec/dc_finalize", "computeSigma"));
@@ -329,9 +335,9 @@ Result<Decoder::FrameOutput> Decoder::run(const codestream::Parsed& parsed, cons
     std::optional<gpu::Buffer> hostDc, hostDcBase;
 
     const auto bindSections = [&](rhi::ShaderCursor c) {
-        c["params"]["dcFromHost"].setData(uint32_t{dcFromHost ? 1u : 0u});
         c["hostDc"].setBinding(hostDc ? hostDc->rhi() : dummy.rhi());
         c["hostDcBase"].setBinding(hostDcBase ? hostDcBase->rhi() : dummy.rhi());
+        c["naturalOrders"].setBinding(naturalOrders_ ? naturalOrders_->rhi() : dummy.rhi());
         c["params"]["wideSamples"].setData(uint32_t{m.floatingPointSample || m.bitsPerSample > 16 ? 1u : 0u});
         c["params"]["perfSkip"].setData(static_cast<uint32_t>(std::strtoul(platform::env("SJXL_PERF_SKIP").c_str(), nullptr, 0)));
         c["cs"].setBinding(cs.rhi());
@@ -449,7 +455,12 @@ Result<Decoder::FrameOutput> Decoder::run(const codestream::Parsed& parsed, cons
             });
         }
     } else {
+    if (!naturalOrders_) {   // once per decoder: the natural coefficient orders
+        SJXL_ASSIGN(naturalOrders_, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{kCoeffOrderLimit} * 64, "dec.naturalOrders"));
+        buildNaturalOrders_.dispatch(batch, {39, 1, 1}, bindSections);
+    }
     globals_.dispatch(batch, {1, 1, 1}, bindSections);
+    if (!frame.singleSection) finishOrders_.dispatch(batch, {kCoeffOrderLimit * 64, frame.header.numPasses, 1}, bindSections);
     timer.mark("globals");
     if (!useDcFrame && numEc == 0 && !frame.singleSection && platform::env("SJXL_DC_CPU") != "0") {
         // The DC groups' serial chains on CPU cores (the project's one exception to GPU-only
@@ -465,18 +476,26 @@ Result<Decoder::FrameOutput> Decoder::run(const codestream::Parsed& parsed, cons
                 geo.y0 = (g / dcGroupsX) * dim.groupDim;
                 geo.w = std::min(dim.groupDim, dim.xsizeBlocks - geo.x0);
                 geo.h = std::min(dim.groupDim, dim.ysizeBlocks - geo.y0);
+                geo.blocksX = dim.xsizeBlocks;
+                geo.groupBlocks = dim.groupDim / 8;
                 for (size_t c = 0; c < 3; ++c) { geo.hshift[c] = hshift[c]; geo.vshift[c] = vshift[c]; }
             }
             std::vector<cpu::DcGroupData> data;
             SJXL_ASSIGN(const bool done, cpu::decodeDcGroups(parsed.codestream, frame, header[kGsGlobalTreeBitIndex], geoms, data));
             if (done) {
+                // hostDc: per group extraPrecision, count, usedAcs, numVarblocks, the channels, the
+                // varblock triplets; hostDcBase: word offsets, then the varblock prefix counts.
                 std::vector<int32_t> words;
-                std::vector<uint32_t> bases(numDcGroups);
+                std::vector<uint32_t> bases(2 * numDcGroups + 1);
                 for (uint32_t g = 0; g < numDcGroups; ++g) {
                     bases[g] = static_cast<uint32_t>(words.size());
+                    bases[numDcGroups + g + 1] = bases[numDcGroups + g] + static_cast<uint32_t>(data[g].varblocks.size() / 3);
                     words.push_back(static_cast<int32_t>(data[g].extraPrecision));
                     words.push_back(static_cast<int32_t>(data[g].count));
+                    words.push_back(static_cast<int32_t>(data[g].usedAcs));
+                    words.push_back(static_cast<int32_t>(data[g].varblocks.size() / 3));
                     words.insert(words.end(), data[g].words.begin(), data[g].words.end());
+                    words.insert(words.end(), data[g].varblocks.begin(), data[g].varblocks.end());
                 }
                 SJXL_ASSIGN(hostDc, gpu::Buffer::fromSpan<int32_t>(dev, words, "dec.hostDc"));
                 SJXL_ASSIGN(hostDcBase, gpu::Buffer::fromSpan<uint32_t>(dev, bases, "dec.hostDcBase"));
@@ -487,7 +506,13 @@ Result<Decoder::FrameOutput> Decoder::run(const codestream::Parsed& parsed, cons
         }
         timer.mark("dc groups (cpu)");
     }
-    dcGroups_.dispatch(batch, {numDcGroups, 1, 1}, bindSections);
+    if (dcFromHost) {
+        hostDcBlocks_.dispatch(batch, {nblocks, 1, 1}, bindSections);
+        hostDcVarblocks_.dispatch(batch, {nblocks, 1, 1}, bindSections);   // at most one varblock per block
+        hostDcTiles_.dispatch(batch, {tilesX * tilesY, 1, 1}, bindSections);
+    } else {
+        dcGroups_.dispatch(batch, {numDcGroups, 1, 1}, bindSections);
+    }
     timer.mark("dc groups");
     tables_.dispatch(batch, {kDequantTableFloats, 1, 1}, [&](rhi::ShaderCursor c) {
         c["arena"].setBinding(arena.rhi());

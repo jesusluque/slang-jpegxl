@@ -25,8 +25,9 @@ RWStructuredBuffer<int>   ytox;
 RWStructuredBuffer<int>   ytob;
 RWStructuredBuffer<uint>  firstBlock;   // nblocks: the varblock's first block
 RWStructuredBuffer<int>   coeffs;
-StructuredBuffer<int>     hostDc;       // DC groups decoded on the CPU (dcgroup.slangh fromHost): per group extraPrecision, count, then the channels
-StructuredBuffer<uint>    hostDcBase;   // word offset of each DC group in hostDc
+StructuredBuffer<int>     hostDc;         // DC groups decoded on the CPU (DcGroupCpu.cpp): per group extraPrecision, count, usedAcs, numVarblocks, the channels, the varblock triplets
+StructuredBuffer<uint>    hostDcBase;     // [g]: word offset of DC group g in hostDc; [numDcGroups + g]: its first varblock index (numDcGroups + 1 entries)
+RWStructuredBuffer<uint>  naturalOrders;  // kCoeffOrderLimit * 64: the natural coefficient orders in libjxl's slot layout (built once per decoder)
 
 #include "sjxl/dec/dcgroup.slangh"
 #include "sjxl/dec/acgroup.slangh"
@@ -62,7 +63,6 @@ struct SectionParams {
     int4  passMinC;
     uint  perfSkip;       // SJXL_PERF_SKIP timing experiments (entropy.slangh gPerfSkip)
     uint  wideSamples;    // 1: samples beyond 16 bits (the 64-bit modular arithmetic)
-    uint  dcFromHost;     // 1: the DC groups' modular streams come decoded in hostDc (SJXL_DC_CPU)
     int4  passMaxA;
     int4  passMaxB;
     int4  passMaxC;
@@ -128,7 +128,6 @@ DcGroupGeom dcGeom(uint g) {
     geom.groupBlocks = groupBlocks();
     geom.useDcFrame = (params.frameFlags & 32u) != 0 ? 1u : 0u;
     geom.windowOff = windowFor(1 + g);
-    geom.fromHost = params.dcFromHost;
     geom.hshift = params.hshift;
     geom.vshift = params.vshift;
     return geom;
@@ -190,6 +189,7 @@ uint modularAcStream(uint g, uint pass) { return 1 + 3 * params.numDcGroups + 17
 void decodeGlobals(uint3 tid: SV_DispatchThreadID) {
     gPerfSkip = params.perfSkip;
     gWideSamples = params.wideSamples;
+    gDeferOrders = params.singleSection == 0 ? 1u : 0u;
     if (tid.x != 0) return;
     for (uint i = 0; i < kGsHeaderSize; ++i) arena[i] = 0;
     arena[kGsHeaderSize - 1] = params.blocksX * params.blocksY;   // nblocks, read by the DC group body
@@ -221,6 +221,153 @@ void decodeGlobals(uint3 tid: SV_DispatchThreadID) {
     status[0] = d.error | (d.error != kErrNone ? (stage << 8) : 0);
     arena[kGsError] = d.error;
     arena[kGsArenaTop] = d.top;
+}
+
+static const uint kNumOrderBuckets = 13;   // kCoeffOrderOffset has 3 slots per bucket plus the end
+
+// --- Coefficient orders --------------------------------------------------------------------
+// The natural orders are the same for every frame: built once into naturalOrders (one
+// thread per slot), then finishOrders fills every pass's order table in parallel, mapping
+// the permutation indices the globals thread left for the orders the frame codes.
+
+[shader("compute")]
+[numthreads(1, 1, 1)]
+void buildNaturalOrders(uint3 tid: SV_DispatchThreadID) {
+    const uint slot = tid.x;   // 3 per order bucket
+    if (slot >= 3 * kNumOrderBuckets) return;
+    const uint ord = slot / 3;
+    uint strategy = 0;
+    for (uint o = 0; o < kNumStrategies; ++o) if (kStrategyOrder[o] == ord) { strategy = o; break; }
+    naturalCoeffOrder(kCoveredX[strategy], kCoveredY[strategy], naturalOrders, kCoeffOrderOffset[slot] * 64);
+}
+
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void finishOrders(uint3 tid: SV_DispatchThreadID) {
+    const uint w = tid.x;
+    const uint p = tid.y;
+    if (w >= kCoeffOrderLimit * 64 || p >= params.numPasses || params.singleSection != 0) return;
+    if (arena[kGsError] != kErrNone) return;
+    const uint blk = w / 64;
+    uint slot = 0;
+    while (slot + 1 < 3 * kNumOrderBuckets && kCoeffOrderOffset[slot + 1] <= blk) ++slot;
+    const uint ord = slot / 3;
+    const uint t = passTable(p);
+    const uint ordersOff = arena[t + 0];
+    const uint usedOrders = arena[t + 2];
+    if ((usedOrders & (1u << ord)) == 0) arena[ordersOff + w] = naturalOrders[w];
+    else arena[ordersOff + w] = naturalOrders[kCoeffOrderOffset[slot] * 64 + arena[ordersOff + w]];
+}
+
+// --- DC groups decoded on the CPU -----------------------------------------------------------
+// DcGroupCpu.cpp decodes the modular streams and walks the strategies; these kernels do what
+// the DC group thread does after its streams, one thread per block, varblock and tile.
+
+struct HostDcLayout {
+    uint base;   // extraPrecision, count, usedAcs, numVarblocks
+    uint y, x, b, wY, hY, wX, hX, wB, hB;
+    uint ytox, ytob, tw, th;
+    uint acsCh, sharp, vars;
+};
+
+HostDcLayout hostDcLayout(DcGroupGeom g) {
+    HostDcLayout L;
+    L.base = hostDcBase[g.group];
+    uint pos = L.base + 4;
+    L.wY = g.w >> shiftOf(g.hshift, 1); L.hY = g.h >> shiftOf(g.vshift, 1); L.y = pos; pos += L.wY * L.hY;
+    L.wX = g.w >> shiftOf(g.hshift, 0); L.hX = g.h >> shiftOf(g.vshift, 0); L.x = pos; pos += L.wX * L.hX;
+    L.wB = g.w >> shiftOf(g.hshift, 2); L.hB = g.h >> shiftOf(g.vshift, 2); L.b = pos; pos += L.wB * L.hB;
+    L.tw = (g.w + 7) >> 3; L.th = (g.h + 7) >> 3;
+    L.ytox = pos; pos += L.tw * L.th;
+    L.ytob = pos; pos += L.tw * L.th;
+    const uint count = uint(hostDc[L.base + 1]);
+    L.acsCh = pos; pos += count * 2;
+    L.sharp = pos; pos += g.w * g.h;
+    L.vars = pos;
+    return L;
+}
+
+uint dcGroupOfBlock(uint x, uint y) { return (y / params.groupDim) * xsizeDcGroups() + x / params.groupDim; }
+
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void hostDcBlocks(uint3 tid: SV_DispatchThreadID) {
+    const uint nblocks = params.blocksX * params.blocksY;
+    const uint block = tid.x;
+    if (block >= nblocks || arena[kGsError] != kErrNone) return;
+    const uint x = block % params.blocksX, y = block / params.blocksX;
+    const DcGroupGeom g = dcGeom(dcGroupOfBlock(x, y));
+    const HostDcLayout L = hostDcLayout(g);
+    const uint ix = x - g.x0, iy = y - g.y0;
+    const bool is444 = (g.hshift.x | g.hshift.y | g.hshift.z | g.vshift.x | g.vshift.y | g.vshift.z) == 0;
+    const float mul = 1.0f / float(1u << uint(hostDc[L.base]));
+    const int qy = hostDc[L.y + (iy >> shiftOf(g.vshift, 1)) * L.wY + (ix >> shiftOf(g.hshift, 1))];
+    const int qx = hostDc[L.x + (iy >> shiftOf(g.vshift, 0)) * L.wX + (ix >> shiftOf(g.hshift, 0))];
+    const int qb = hostDc[L.b + (iy >> shiftOf(g.vshift, 2)) * L.wB + (ix >> shiftOf(g.hshift, 2))];
+    // The same products in the same order as decodeDcGroup (bit-identical floats).
+    const float facX = gsF(kGsMulDc + 0) * mul;
+    const float facY = gsF(kGsMulDc + 1) * mul;
+    const float facB = gsF(kGsMulDc + 2) * mul;
+    const float fy = float(qy) * facY;
+    dc[1 * nblocks + block] = fy;
+    dc[0 * nblocks + block] = is444 ? fma(fy, gsF(kGsCflDcFactorX), float(qx) * facX) : float(qx) * facX;
+    dc[2 * nblocks + block] = is444 ? fma(fy, gsF(kGsCflDcFactorB), float(qb) * facB) : float(qb) * facB;
+    uint bucket = 0;
+    if (arena[kGsBctxNumDcCtxs] > 1) {
+        uint bx = 0, by = 0, bb = 0;
+        const uint nX = arena[kGsBctxDcCount + 0], nY = arena[kGsBctxDcCount + 1], nB = arena[kGsBctxDcCount + 2];
+        for (uint t = 0; t < nX; ++t) if (qx > int(arena[arena[kGsBctxDcOff + 0] + t])) ++bx;
+        for (uint t = 0; t < nY; ++t) if (qy > int(arena[arena[kGsBctxDcOff + 1] + t])) ++by;
+        for (uint t = 0; t < nB; ++t) if (qb > int(arena[arena[kGsBctxDcOff + 2] + t])) ++bb;
+        bucket = bx;
+        bucket = bucket * (nB + 1) + bb;
+        bucket = bucket * (nY + 1) + by;
+    }
+    quantDcBucket[block] = bucket;
+    epfSharp[block] = uint(hostDc[L.sharp + iy * g.w + ix]);
+    if (ix == 0 && iy == 0) {
+        uint before;
+        InterlockedOr(arena[kGsUsedAcs], uint(hostDc[L.base + 2]), before);
+    }
+}
+
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void hostDcVarblocks(uint3 tid: SV_DispatchThreadID) {
+    const uint v = tid.x;
+    if (v >= hostDcBase[2 * params.numDcGroups] || arena[kGsError] != kErrNone) return;
+    uint gi = 0;
+    while (gi + 1 < params.numDcGroups && hostDcBase[params.numDcGroups + gi + 1] <= v) ++gi;
+    const uint i = v - hostDcBase[params.numDcGroups + gi];
+    const DcGroupGeom g = dcGeom(gi);
+    const HostDcLayout L = hostDcLayout(g);
+    const uint block = uint(hostDc[L.vars + 3 * i]);
+    const uint strategy = uint(hostDc[L.vars + 3 * i + 1]);
+    const uint qfStored = uint(hostDc[L.vars + 3 * i + 2]);
+    const uint x = block % params.blocksX, y = block / params.blocksX;
+    const uint cx = kCoveredX[strategy], cy = kCoveredY[strategy];
+    for (uint by = 0; by < cy; ++by) {
+        for (uint bx = 0; bx < cx; ++bx) {
+            const uint b = (y + by) * params.blocksX + x + bx;
+            acs[b] = (strategy << 1) | ((bx | by) == 0 ? 1u : 0u);
+            qf[b] = qfStored;
+            firstBlock[b] = block;
+        }
+    }
+}
+
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void hostDcTiles(uint3 tid: SV_DispatchThreadID) {
+    const uint tilesX = (params.blocksX + 7) / 8, tilesY = (params.blocksY + 7) / 8;
+    const uint tile = tid.x;
+    if (tile >= tilesX * tilesY || arena[kGsError] != kErrNone) return;
+    const uint tx = tile % tilesX, ty = tile / tilesX;
+    const DcGroupGeom g = dcGeom(dcGroupOfBlock(tx * 8, ty * 8));
+    const HostDcLayout L = hostDcLayout(g);
+    const uint ltx = tx - (g.x0 >> 3), lty = ty - (g.y0 >> 3);
+    ytox[tile] = clamp(hostDc[L.ytox + lty * L.tw + ltx], -128, 127);
+    ytob[tile] = clamp(hostDc[L.ytob + lty * L.tw + ltx], -128, 127);
 }
 
 [shader("compute")]

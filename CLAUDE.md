@@ -58,9 +58,12 @@ cjxl in.png ref.jxl -d 1 -e 5 ; djxl out.jxl check.png      # Homebrew oracle (/
   `modules/decoder/src/DcGroupCpu.cpp` when the frame qualifies (VarDCT, no
   extra channels, no DC frame, several sections; LZ77 or transforms fall back
   to the kernel); the GPU path stays the reference, `SJXL_DC_CPU=0` selects it
-  and the `[dc-cpu]` test requires both to be bit-identical. Any further CPU
-  step needs the same justification (a serial chain the GPU cannot split),
-  the same fallback and the same test. Tests check results with kernels too (mismatch
+  and the `[dc-cpu]` test requires both to be bit-identical. The CPU also runs
+  the strategy raster walk of those groups (validation + one triplet per
+  varblock); DequantDC, buckets, CfL tiles and the acs/qf grids are the
+  `hostDc*` kernels in `sections.slang`. Any further CPU step needs the same
+  justification (a serial chain the GPU cannot split), the same fallback and
+  the same test. Tests check results with kernels too (mismatch
   counters, PSNR/max-diff metrics) and read back only counters, section
   sizes or the final bytes/pixels to write a file.
 - **Shader parameters are bound by name** through reflection
@@ -100,7 +103,10 @@ cjxl in.png ref.jxl -d 1 -e 5 ; djxl out.jxl check.png      # Homebrew oracle (/
 - **Big single-thread kernels compile slowly on Metal** (seconds to never in
   `newComputePipelineState`) when they inline several copies of a large
   function: mark such functions `[noinline]` (the ANS histogram writers,
-  context map and tree writers are), keep one copy per kernel, and check with
+  context map and tree writers are, and the decoder's decodeDcGlobal /
+  decodeAcGlobal / decodeDcGroup / decodeAcGroup / decodeModularStream /
+  decodeHistograms: the globals kernel went from 88 s to 1.8 s), keep one copy
+  per kernel, and check with
   `SJXL_DEBUG=1`, which logs every pipeline that takes over 500 ms to build
   (`SJXL_DEBUG_DISPATCH=1` traces dispatches).
 - **Metal buffers have no bounds checks**: a kernel writing past a buffer
@@ -225,7 +231,9 @@ otherwise; DC groups and AcGlobal are empty sections.
 
 Decoder stages: CPU parses signature/headers/TOC into a section table →
 one-thread kernels decode DcGlobal and AcGlobal (quantizer, block context
-map, dequant matrices, coefficient orders, histograms → prefix/ANS tables) →
+map, dequant matrices, coefficient orders, histograms → prefix/ANS tables;
+the natural orders come from a per-decoder `naturalOrders` buffer through the
+parallel `finishOrders` kernel) →
 one thread per DC group (modular DC + AcMetadata, MA tree, predictors) → per
 block DequantDC, AdaptiveDCSmoothing, EPF sigma → one thread per AC group
 (ANS/prefix tokens → quantised coefficients) → per coefficient dequant and

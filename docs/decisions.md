@@ -1575,6 +1575,48 @@ groups, uploads the words and binds them to the sections kernels.
 
 1920x1080 lossy decode (M5 Pro, debug build): 327 → 132 ms. The DC group stage
 went from 228 ms on one GPU thread to 27 ms on one CPU core plus 29 ms for the
-kernel that copies the channels and does the per-block work (serial, next to
-parallelise), and the AcGlobal decode (globals, 36-58 ms, one thread reading
-the histograms and orders) is now the largest serial piece left. djxl: 90 ms.
+kernel that copied the channels and did the per-block work.
+
+Two follow-ups the same day took the decode to 90 ms:
+
+- **The per-block tail of the DC group as parallel kernels.** When the CPU
+  decoded the streams, the DC group thread still copied the channels into its
+  arena (half of its 29 ms) and ran DequantDC, the block-context buckets, the
+  chroma-from-luma tiles and the strategy walk alone. Now the CPU also does the
+  raster walk (a bookkeeping pass over decoded integers: it validates coverage
+  as the kernel did and emits one (block, strategy, qf) triplet per varblock),
+  and three kernels in `sections.slang` read `hostDc` directly: `hostDcBlocks`
+  per block (DequantDC, buckets, sharpness, the usedAcs mask), `hostDcVarblocks`
+  per varblock (acs, qf, firstBlock over the covered blocks), `hostDcTiles` per
+  tile (ytox, ytob). The DC group kernel does not run for these frames. The
+  two DequantDC kernels write `fma(fy, cfl, q * step)` explicitly: without it
+  Metal contracted the multiply-add in one kernel and not the other, one LSB
+  apart in one pixel of 1080p. Independent DC groups decode on parallel CPU
+  threads (`std::async`, one per group).
+- **The natural coefficient orders out of the globals thread.** The thread
+  regenerated all 13 natural orders for 3 channels (394k arena words) every
+  frame, 20-40 ms of its 36-58 ms. They are built once per decoder into
+  `naturalOrders` (`buildNaturalOrders`, 39 threads) and `finishOrders` (one
+  thread per word per pass) fills each pass's order table after the globals
+  ran: the natural order for buckets the frame does not code, the natural
+  order composed with the Lehmer permutation the thread left in place for the
+  ones it does (`gDeferOrders`; single-section frames keep the in-thread path
+  because the same thread goes on to decode the AC group).
+
+The first-run compile of `decodeGlobals` was 88 s on Metal (the kernel inlines
+the whole DC-global, DC-group, AC-global and AC-group decoders); `[noinline]` on
+those entry functions, `decodeModularStream` and `decodeHistograms` brought it
+to 1.8 s, with no pipeline over 500 ms.
+
+Timings (M5 Pro, debug build, SJXL_TIMING=1):
+
+| file | before | now | globals | DC (CPU) | AC groups |
+|---|---|---|---|---|---|
+| 1920x1080 lossy | 327 ms | 90 ms | 20 | 29 | 27 |
+| conformance bike | 345 ms | 245 ms | 100-160 | 75-94 | 19 |
+| conformance cafe | 133 ms | 72 ms | 14-18 | 31 | 23 |
+
+djxl decodes the 1080p file in 90 ms. What is left serial: the AcGlobal decode
+when the frame codes custom orders for the large transforms (bike: the Lehmer
+decode of up to 65k-entry permutations and the AC histograms on one thread),
+the CPU DC chain itself (one core per group), and the encoder's chains.

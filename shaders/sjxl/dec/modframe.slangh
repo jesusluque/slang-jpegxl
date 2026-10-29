@@ -34,6 +34,7 @@ uint quadAt(uint4 v, uint i) { return i == 0 ? v.x : i == 1 ? v.y : i == 2 ? v.z
 /// DecodeGlobalInfo's modular image: the colour channels at the coded size, then the
 /// extra channels, then the global stream (GroupHeader, transforms, the channels that
 /// fit a group). Called after the frame's global tree was read.
+[noinline]
 void decodeModularImage(inout Dec d, ModularFrameGeom g, uint windowOff) {
     const uint chansOff = alloc(d, kMaxChannels * kChanWords);
     if (d.error != kErrNone) return;
@@ -79,6 +80,7 @@ void decodeModularGlobal(inout Dec d, ModularFrameGeom g, uint windowOff) {
 /// ModularFrameDecoder::DecodeGroup for the rectangle (x0, y0, w, h) in pixels:
 /// the channels from beginC whose shift lies in [minShift, maxShift], decoded
 /// as views into the full image with the group's own GroupHeader.
+[noinline]
 void decodeModularGroup(inout Dec d, uint x0, uint y0, uint w, uint h, int minShift, int maxShift, uint streamId, uint windowOff) {
     const uint fullOff = arena[kGsModChansOff];
     const uint numFull = arena[kGsModNumChannels];
