@@ -30,9 +30,19 @@ struct ModParams {
     float dcQuantX;   // dcFramePlanes: the DC frame's dc_quant per channel (as the decoder's F16 holds it)
     float dcQuantY;
     float dcQuantB;
+    // The learned tree (tree.slang): modSamples picks pixels at `sampleFraction` and
+    // quantises the candidate properties `propIds` with `thresholds`; modTokenizeTree
+    // walks the final tree over every property.
+    float sampleFraction;
+    uint  sampleCapacity;
+    uint  streamBase;     // stream id of group 0 (property 1)
+    uint4 propIds;
 };
 
 StructuredBuffer<uint>     rgb8;          // width * height * numChannels samples of bitDepth / 8 bytes, little-endian
+StructuredBuffer<int>      thresholds;    // modSamples: [16][64] per property, count at 16 * 64 + property
+RWStructuredBuffer<uint2>  samples;       // modSamples output
+RWStructuredBuffer<uint>   sampleCount;   // [0]
 StructuredBuffer<float>    dcValue;       // dcFramePlanes: the VarDCT frame's DC image, [c][block], channels X, Y, B
 RWStructuredBuffer<int>    planes;        // numChannels * width * height: Y, Co, Cg[, alpha] (written by rctYCoCg)
 StructuredBuffer<int>      planesIn;      // the same buffer, read by the token kernels
@@ -160,6 +170,173 @@ void modTokenize(uint3 tid: SV_DispatchThreadID) {
                 hybridEncode(value, tok, nbits, raw);
                 uint before;
                 InterlockedAdd(passHist[((params.pass * params.numChannels + c) * kSetContexts + ctx) * kHistBins + min(tok, kHistBins - 1)], 1u, before);
+                wpUpdateErrors(wpScratch, wp, int64_t(v), lx, ly);
+            }
+        }
+    }
+}
+
+// --- the learned tree ------------------------------------------------------------------
+
+static const uint kThreshStride = 64;
+static const uint kNumProperties = 16;
+
+/// The neighbours of (lx, ly) in a group rectangle with the decoder's edge rules.
+struct Neighbours {
+    int left, top, topleft, topright, toptop, leftleft;
+};
+
+Neighbours neighboursAt(uint base, uint at, uint lx, uint ly, uint w) {
+    Neighbours n;
+    n.left = lx > 0 ? planesIn[at - 1] : (ly > 0 ? planesIn[at - params.width] : 0);
+    n.top = ly > 0 ? planesIn[at - params.width] : n.left;
+    n.topleft = (lx > 0 && ly > 0) ? planesIn[at - params.width - 1] : n.left;
+    n.topright = (lx + 1 < w && ly > 0) ? planesIn[at - params.width + 1] : n.top;
+    n.toptop = ly > 1 ? planesIn[at - 2 * params.width] : n.top;
+    n.leftleft = lx > 1 ? planesIn[at - 2] : n.left;
+    return n;
+}
+
+/// libjxl's 16 properties (context_predict.h): channel, stream, y, x, |N|, |W|,
+/// N, W, W minus the previous pixel's gradient, the gradient W + N - NW, W - NW,
+/// NW - N, N - NE, N - NN, W - WW, and the WP property.
+void modProperties(uint c, uint stream, uint lx, uint ly, Neighbours n, int prevGradient, int wpProp, out int props[kNumProperties]) {
+    props[0] = int(c);
+    props[1] = int(stream);
+    props[2] = int(ly);
+    props[3] = int(lx);
+    props[4] = abs(n.top);
+    props[5] = abs(n.left);
+    props[6] = n.top;
+    props[7] = n.left;
+    props[8] = n.left - prevGradient;
+    props[9] = int(uint(n.left) + uint(n.top) - uint(n.topleft));
+    props[10] = n.left - n.topleft;
+    props[11] = n.topleft - n.top;
+    props[12] = n.top - n.topright;
+    props[13] = n.top - n.toptop;
+    props[14] = n.left - n.leftleft;
+    props[15] = wpProp;
+}
+
+uint propIdOf(uint k) { return k == 0 ? params.propIds.x : k == 1 ? params.propIds.y : k == 2 ? params.propIds.z : params.propIds.w; }
+
+/// QuantMap: the number of the property's thresholds below the value.
+uint quantizeProperty(uint propId, int v) {
+    const uint count = uint(thresholds[kNumProperties * kThreshStride + propId]);
+    uint q = 0;
+    for (uint i = 0; i < count; ++i) {
+        if (thresholds[propId * kThreshStride + i] < v) ++q;
+    }
+    return q;
+}
+
+uint hashSample(uint i) {
+    uint x = i * 2654435761u + 0x9E3779B9u;
+    x ^= x >> 16; x *= 0x7feb352du; x ^= x >> 15; x *= 0x846ca68bu; x ^= x >> 16;
+    return x;
+}
+
+/// One thread per group: the tree learner's samples (GatherTreeData): for a
+/// fraction of the pixels, the residual tokens of the Weighted and Gradient
+/// predictors and the quantised candidate properties.
+[shader("compute")]
+[numthreads(1, 1, 1)]
+void modSamples(uint3 tid: SV_DispatchThreadID) {
+    const uint g = tid.x;
+    if (g >= params.numGroups) return;
+    const uint x0 = (g % params.groupsX) * params.groupDim;
+    const uint y0 = (g / params.groupsX) * params.groupDim;
+    const uint w = min(params.groupDim, params.width - x0);
+    const uint h = min(params.groupDim, params.height - y0);
+    const uint plane = params.width * params.height;
+    const uint stream = params.streamBase + g;
+    const float fraction = max(params.sampleFraction, min(1.0f, 1024.0f / float(w * h)));
+    for (uint c = 0; c < params.numChannels; ++c) {
+        const uint base = c * plane;
+        WpState wp = wpInit(wpScratch, g * params.wpWordsPerGroup, w);
+        for (uint ly = 0; ly < h; ++ly) {
+            int prevGradient = 0;
+            for (uint lx = 0; lx < w; ++lx) {
+                const uint x = x0 + lx, y = y0 + ly;
+                const uint at = base + y * params.width + x;
+                const int v = planesIn[at];
+                const Neighbours n = neighboursAt(base, at, lx, ly, w);
+                int wpProp;
+                const int64_t wpPred = wpPredict(wpScratch, wp, lx, ly, int64_t(n.top), int64_t(n.left), int64_t(n.topright), int64_t(n.topleft),
+                                                 int64_t(n.toptop), wpProp);
+                if (float(hashSample(at) & 0xFFFFFFu) < fraction * 16777216.0f) {
+                    int props[kNumProperties];
+                    modProperties(c, stream, lx, ly, n, prevGradient, wpProp, props);
+                    // TreeSamples::AddSample tokenises with HybridUintConfig(4, 1, 2).
+                    uint tokW, nbitsW, raw, tokG, nbitsG;
+                    hybridEncodeCfg(packSigned(int(int64_t(v) - wpPred)), 4, 1, 2, tokW, nbitsW, raw);
+                    hybridEncodeCfg(packSigned(v - modClampedGradient(n.left, n.top, n.topleft)), 4, 1, 2, tokG, nbitsG, raw);
+                    uint2 s;
+                    s.x = min(tokW, 255u) | (min(nbitsW, 255u) << 8) | (min(tokG, 255u) << 16) | (min(nbitsG, 255u) << 24);
+                    s.y = 0;
+                    for (uint k = 0; k < 4; ++k) s.y |= min(quantizeProperty(propIdOf(k), props[propIdOf(k)]), 255u) << (8 * k);
+                    uint idx;
+                    InterlockedAdd(sampleCount[0], 1u, idx);
+                    if (idx < params.sampleCapacity) samples[idx] = s;
+                }
+                prevGradient = int(uint(n.left) + uint(n.top) - uint(n.topleft));
+                wpUpdateErrors(wpScratch, wp, int64_t(v), lx, ly);
+            }
+        }
+    }
+}
+
+/// One thread per group: the tokens under the learned tree (treeNodes in the
+/// decoder's layout, split values as property values), with the leaf's
+/// predictor, into modTokens and ctxHist.
+[shader("compute")]
+[numthreads(1, 1, 1)]
+void modTokenizeTree(uint3 tid: SV_DispatchThreadID) {
+    const uint g = tid.x;
+    if (g >= params.numGroups) return;
+    const uint x0 = (g % params.groupsX) * params.groupDim;
+    const uint y0 = (g / params.groupsX) * params.groupDim;
+    const uint w = min(params.groupDim, params.width - x0);
+    const uint h = min(params.groupDim, params.height - y0);
+    const uint plane = params.width * params.height;
+    const uint stream = params.streamBase + g;
+    for (uint c = 0; c < params.numChannels; ++c) {
+        const uint base = c * plane;
+        WpState wp = wpInit(wpScratch, g * params.wpWordsPerGroup, w);
+        for (uint ly = 0; ly < h; ++ly) {
+            int prevGradient = 0;
+            for (uint lx = 0; lx < w; ++lx) {
+                const uint x = x0 + lx, y = y0 + ly;
+                const uint at = base + y * params.width + x;
+                const int v = planesIn[at];
+                const Neighbours n = neighboursAt(base, at, lx, ly, w);
+                int wpProp;
+                const int64_t wpPred = wpPredict(wpScratch, wp, lx, ly, int64_t(n.top), int64_t(n.left), int64_t(n.topright), int64_t(n.topleft),
+                                                 int64_t(n.toptop), wpProp);
+                int props[kNumProperties];
+                modProperties(c, stream, lx, ly, n, prevGradient, wpProp, props);
+                uint node = 0;
+                for (;;) {
+                    const int prop = int(treeNodes[node * kModTreeWords + 0]);
+                    if (prop < 0) break;
+                    const int pv = uint(prop) < kNumProperties ? props[uint(prop)] : 0;
+                    node = pv > int(treeNodes[node * kModTreeWords + 1]) ? treeNodes[node * kModTreeWords + 2] : treeNodes[node * kModTreeWords + 3];
+                }
+                const uint ctx = treeNodes[node * kModTreeWords + 4];
+                const uint predictor = treeNodes[node * kModTreeWords + 5];
+                int64_t guess = int64_t(int(treeNodes[node * kModTreeWords + 6]));
+                if (predictor == kModPredWeighted) guess += wpPred;
+                else if (predictor == kModPredGradient) guess += int64_t(modClampedGradient(n.left, n.top, n.topleft));
+                else if (predictor == kModPredLeft) guess += int64_t(n.left);
+                else if (predictor == 2) guess += int64_t(n.top);
+                const uint value = packSigned(int(int64_t(v) - guess));
+                modTokens[at] = (ctx << 18) | value;
+                uint tok, nbits, raw;
+                hybridEncode(value, tok, nbits, raw);
+                uint before;
+                InterlockedAdd(ctxHist[(params.ctxBase + ctx) * kHistBins + min(tok, kHistBins - 1)], 1u, before);
+                prevGradient = props[9];
                 wpUpdateErrors(wpScratch, wp, int64_t(v), lx, ly);
             }
         }

@@ -24,8 +24,9 @@ channel) and 16-bit input are accepted, `sjxl animate` writes an animation of
 full frames, lossy or lossless, `--progressive`/`--qprogressive` split the AC
 coefficients over frequency or precision passes and `--progressive-dc` puts a
 1/8-size DC frame first. `--lossless` writes a Modular frame
-(YCoCg, weighted predictor, fixed tree, ANS; RGB or RGBA, 8 or 16 bits)
-within about 2 % of `cjxl -d 0 -e 5` on the test images. M3 continues with DC coding, the strategy
+(YCoCg, a learned MA tree over the weighted and gradient predictors, ANS
+with libjxl's histogram precision search; RGB or RGBA, 8 or 16 bits) within
+1 % of `cjxl -d 0 -e 5` on the test images, smaller on three of five. M3 continues with DC coding, the strategy
 and quant-field heuristics, and better lossless trees.
 `docs/decisions.md`
 holds the design, what each milestone measured and the roadmap; `CLAUDE.md`

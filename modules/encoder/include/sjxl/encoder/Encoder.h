@@ -51,6 +51,9 @@ struct Options {
     /// XYB frame at 1/8 size, the VarDCT frame taking its DC from it (lossy
     /// RGB only: libjxl does not combine DC frames with extra channels either).
     bool progressiveDc = false;
+    /// Modular frames: learn the MA tree from the image (libjxl's ComputeBestTree
+    /// at its hare tier) instead of the fixed WP / gradient trees per channel.
+    bool learnedTree = true;
 };
 
 /// What the last encode measured, for tests and the CLI.
@@ -103,6 +106,7 @@ private:
     gpu::ComputeKernel                  gaborishInverse_, cflTile_, quantize_;
     gpu::ComputeKernel                  tables_, buildOrders_, selectStrategies_, largeQf_, largeRows_, largeCols_, mergeLarge_, adjustQuantField_, dctRows_, dctCols_, dcFromLlf_, specialTransform_, passNonZeroCount_, acTokenize_;
     gpu::ComputeKernel                  dcTokenize_, metaTokenize_, dcGroupSections_, clusterContexts_, accumulateClusters_, acSections_;
+    gpu::ComputeKernel                  propStats_, propThresholds_, treeHistograms_, treeSplit_, treeAssign_, modSamples_, modTokenizeTree_;
     gpu::ComputeKernel                  rctYCoCg_, dcFramePlanes_, modTokenize_, extractAlpha_, channelEntropy_, remapTokens_, modGroupSections_, modularGlobalBlob_;
     gpu::ComputeKernel                  dcGroupBlobs_, globalBlobs_, layout_, blobEmit_;
     gpu::PrefixSum                      prefixSum_;

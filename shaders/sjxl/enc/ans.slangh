@@ -23,6 +23,9 @@ static const uint kAnsReverseStride = kAnsTabSize;
 static const uint kAnsShift = 13;   // every count exact
 
 groupshared uint gAnsCounts[256];
+groupshared uint gAnsRaw[256];     // the raw counts a histogram is normalised from
+groupshared uint gAnsSame[256];    // ansWriteHistogramAt: run lengths
+groupshared uint gAnsWidth[256];   // ansWriteHistogramAt: count bit widths
 
 void storeVarLenUint8(RWStructuredBuffer<uint> buf, inout SerialWriter w, uint n) {
     if (n == 0) {
@@ -52,45 +55,95 @@ void serialWriteAt(RWStructuredBuffer<uint> buf, uint base, uint pos, uint n, ui
 }
 
 /// gAnsCounts[0..length) scaled to sum to 4096, every present symbol at least 1.
-void ansNormalize(uint length) {
+/// GetPopulationCountPrecision: the bits of a count of magnitude `logcount`
+/// kept at precision `shift`.
+uint ansCountPrecision(uint logcount, uint shift) {
+    const int r = min(int(logcount), int(shift) - int((kAnsLogTabSize - logcount) >> 1));
+    return r < 0 ? 0u : uint(r);
+}
+
+/// SmallestIncrementLog: log2 of the step between representable counts around `count`.
+uint ansIncrementLog(uint count, uint shift) {
+    if (count == 0) return 0;
+    const uint bits = firstbithigh(count);
+    return bits - ansCountPrecision(bits, shift);
+}
+
+/// The largest representable count below `count` at the precision (1 at least).
+uint ansLowerCount(uint count, uint shift) {
+    if (count <= 1) return 1;
+    uint v = count - 1;
+    v &= ~((1u << ansIncrementLog(v, shift)) - 1);
+    return max(v, 1u);
+}
+
+/// gAnsCounts[0..length) from the raw counts: every non-zero count at least 1,
+/// the others rounded to the precision's representable values, and the most
+/// frequent symbol (the omitted one, implied by the decoder) taking what is
+/// left of kAnsTabSize; if nothing is left, the largest other counts step down.
+void ansNormalizeShift(uint length, uint shift) {
     uint total = 0;
-    for (uint s = 0; s < length; ++s) total += gAnsCounts[s];
+    uint omitPos = 0;
+    for (uint s = 0; s < length; ++s) {
+        total += gAnsRaw[s];
+        if (gAnsRaw[s] > gAnsRaw[omitPos]) omitPos = s;
+    }
     if (total == 0) {
+        for (uint s = 0; s < length; ++s) gAnsCounts[s] = 0;
         gAnsCounts[0] = kAnsTabSize;
         return;
     }
     uint sum = 0;
     for (uint s = 0; s < length; ++s) {
-        const uint c = gAnsCounts[s];
-        if (c != 0) {
-            const uint v = max(1u, uint(round(float(c) * float(kAnsTabSize) / float(total))));
-            gAnsCounts[s] = v;
-            sum += v;
+        uint v = 0;
+        if (gAnsRaw[s] != 0) {
+            v = max(1u, uint(round(float(gAnsRaw[s]) * float(kAnsTabSize) / float(total))));
+            v = min(v, kAnsTabSize - 1);
+            v &= ~((1u << ansIncrementLog(v, shift)) - 1);
+            v = max(v, 1u);
         }
+        gAnsCounts[s] = v;
+        if (s != omitPos) sum += v;
     }
-    // Rounding left a difference of at most the number of symbols: the
-    // largest count absorbs it one step at a time (it stays above 1).
-    while (sum != kAnsTabSize) {
-        uint largest = 0;
-        for (uint s = 1; s < length; ++s) {
-            if (gAnsCounts[s] > gAnsCounts[largest]) largest = s;
+    while (sum >= kAnsTabSize) {
+        uint largest = 0xFFFFFFFFu;
+        for (uint s = 0; s < length; ++s) {
+            if (s != omitPos && gAnsCounts[s] > 1 && (largest == 0xFFFFFFFFu || gAnsCounts[s] > gAnsCounts[largest])) largest = s;
         }
-        if (sum > kAnsTabSize) {
-            --gAnsCounts[largest];
-            --sum;
-        } else {
-            ++gAnsCounts[largest];
-            ++sum;
-        }
+        if (largest == 0xFFFFFFFFu) break;
+        const uint lower = ansLowerCount(gAnsCounts[largest], shift);
+        sum -= gAnsCounts[largest] - lower;
+        gAnsCounts[largest] = lower;
     }
+    gAnsCounts[omitPos] = kAnsTabSize - sum;
+}
+
+/// ansNormalize: the exact normalisation (precision 11, every count kept).
+void ansNormalize(uint length) {
+    for (uint s = 0; s < 256; ++s) gAnsRaw[s] = s < length ? gAnsCounts[s] : 0;
+    ansNormalizeShift(length, kAnsLogTabSize - 1);
 }
 
 // enc_ans.cc kBitWidthLengths / kBitWidthSymbols: the static code of count bit widths.
 static const uint kBitWidthLengths[14] = {5, 4, 4, 4, 4, 4, 3, 3, 3, 3, 3, 6, 7, 7};
 static const uint kBitWidthSymbols[14] = {17, 11, 15, 3, 9, 7, 4, 2, 5, 6, 0, 33, 1, 65};
+static const uint kAnsRleSymbol = kAnsLogTabSize + 1;   // the width code that starts a run
+static const uint kAnsMinReps = 5;
 
-/// The serialised histogram gAnsCounts[0..length) (normalised).
-void ansWriteHistogram(RWStructuredBuffer<uint> buf, inout SerialWriter w, uint length) {
+void ansPut(RWStructuredBuffer<uint> buf, inout SerialWriter w, uint n, uint v, bool dry) {
+    if (dry) w.pos += n;
+    else serialWrite(buf, w, n, v);
+}
+
+void ansPutVarLenUint8(RWStructuredBuffer<uint> buf, inout SerialWriter w, uint n, bool dry) {
+    if (dry) w.pos += n == 0 ? 1 : 1 + 3 + firstbithigh(n);
+    else storeVarLenUint8(buf, w, n);
+}
+
+/// ANSEncodingHistogram::Encode of gAnsCounts[0..length) normalised at
+/// `shift` (dry: only the size), with libjxl's run-length code for repeated
+/// counts. `flat` writes the flat form instead (counts 4096 / length).
+void ansWriteHistogramAt(RWStructuredBuffer<uint> buf, inout SerialWriter w, uint length, uint shift, bool flat, bool dry) {
     uint numSymbols = 0;
     uint symbols[2] = {0, 0};
     for (uint s = 0; s < length; ++s) {
@@ -99,47 +152,135 @@ void ansWriteHistogram(RWStructuredBuffer<uint> buf, inout SerialWriter w, uint 
             ++numSymbols;
         }
     }
-    if (numSymbols <= 2) {
-        serialWrite(buf, w, 1, 1);   // small
+    if (!flat && numSymbols <= 2) {
+        ansPut(buf, w, 1, 1, dry);   // small
         if (numSymbols == 0) {
-            serialWrite(buf, w, 1, 0);
-            storeVarLenUint8(buf, w, 0);
+            ansPut(buf, w, 1, 0, dry);
+            ansPutVarLenUint8(buf, w, 0, dry);
             return;
         }
-        serialWrite(buf, w, 1, numSymbols - 1);
-        for (uint i = 0; i < numSymbols; ++i) storeVarLenUint8(buf, w, symbols[i]);
-        if (numSymbols == 2) serialWrite(buf, w, kAnsLogTabSize, gAnsCounts[symbols[0]]);
+        ansPut(buf, w, 1, numSymbols - 1, dry);
+        for (uint i = 0; i < numSymbols; ++i) ansPutVarLenUint8(buf, w, symbols[i], dry);
+        if (numSymbols == 2) ansPut(buf, w, kAnsLogTabSize, gAnsCounts[symbols[0]], dry);
         return;
     }
-    serialWrite(buf, w, 1, 0);   // not small
-    serialWrite(buf, w, 1, 0);   // not flat
-    // method = shift + 1 = 14: log 3 (the upper bound, so no terminating 0), then 14 & 7.
-    serialWrite(buf, w, 3, 7);
-    serialWrite(buf, w, 3, 6);
-    storeVarLenUint8(buf, w, length - 3);
+    ansPut(buf, w, 1, 0, dry);   // not small
+    if (flat) {
+        ansPut(buf, w, 1, 1, dry);
+        ansPutVarLenUint8(buf, w, length - 1, dry);
+        return;
+    }
+    ansPut(buf, w, 1, 0, dry);   // not flat
+    // Elias-gamma-like code of method = shift + 1 (no terminating 0 at the upper bound 3 bits).
+    const uint method = min(shift, kAnsLogTabSize - 1) + 1;
+    const uint lg = firstbithigh(method);
+    ansPut(buf, w, lg, (1u << lg) - 1, dry);
+    if (lg != 3) ansPut(buf, w, 1, 0, dry);
+    ansPut(buf, w, lg, method & ((1u << lg) - 1), dry);
+    ansPutVarLenUint8(buf, w, length - 3, dry);
     uint omitPos = 0;
     for (uint s = 1; s < length; ++s) {
         if (gAnsCounts[s] > gAnsCounts[omitPos]) omitPos = s;
     }
-    uint bitWidth[256];
+    // Runs of identical counts (not across the omitted position).
+    for (uint s = 0; s < length; ++s) gAnsSame[s] = 0;
+    uint last = 0;
+    for (uint i = 1; i <= length; ++i) {
+        if (i == length || i == omitPos || i == omitPos + 1 || gAnsCounts[i] != gAnsCounts[last]) {
+            gAnsSame[last] = i - last;
+            last = i;
+        }
+    }
     uint omitWidth = 10;
     for (uint s = 0; s < length; ++s) {
-        bitWidth[s] = 0;
+        gAnsWidth[s] = 0;
         if (s != omitPos && gAnsCounts[s] > 0) {
-            bitWidth[s] = firstbithigh(gAnsCounts[s]) + 1;
-            omitWidth = max(omitWidth, bitWidth[s] + (s < omitPos ? 1u : 0u));
+            gAnsWidth[s] = firstbithigh(gAnsCounts[s]) + 1;
+            omitWidth = max(omitWidth, gAnsWidth[s] + (s < omitPos ? 1u : 0u));
         }
     }
-    bitWidth[omitPos] = omitWidth;
+    gAnsWidth[omitPos] = omitWidth;
     for (uint s = 0; s < length; ++s) {
-        serialWrite(buf, w, kBitWidthLengths[bitWidth[s]], kBitWidthSymbols[bitWidth[s]]);
-    }
-    for (uint s = 0; s < length; ++s) {
-        if (bitWidth[s] > 1 && s != omitPos) {
-            const uint bitcount = bitWidth[s] - 1;   // shift 13: every bit of the count
-            serialWrite(buf, w, bitcount, gAnsCounts[s] - (1u << bitcount));
+        ansPut(buf, w, kBitWidthLengths[gAnsWidth[s]], kBitWidthSymbols[gAnsWidth[s]], dry);
+        if (gAnsSame[s] >= kAnsMinReps) {
+            ansPut(buf, w, kBitWidthLengths[kAnsRleSymbol], kBitWidthSymbols[kAnsRleSymbol], dry);
+            ansPutVarLenUint8(buf, w, gAnsSame[s] - kAnsMinReps, dry);
+            s += gAnsSame[s] - 1;
         }
     }
+    if (shift != 0) {
+        for (uint s = 0; s < length; ++s) {
+            if (gAnsWidth[s] > 1 && s != omitPos) {
+                const uint bitcount = ansCountPrecision(gAnsWidth[s] - 1, shift);
+                const uint drop = gAnsWidth[s] - 1 - bitcount;
+                ansPut(buf, w, bitcount, (gAnsCounts[s] >> drop) - (1u << bitcount), dry);
+            }
+            if (gAnsSame[s] >= kAnsMinReps) s += gAnsSame[s] - 1;
+        }
+    }
+}
+
+/// The bits the data would take under gAnsCounts (normalised) given the raw counts.
+float ansDataBits(uint length) {
+    float bits = 0.0f;
+    for (uint s = 0; s < length; ++s) {
+        if (gAnsRaw[s] != 0 && gAnsCounts[s] != 0) bits += float(gAnsRaw[s]) * (float(kAnsLogTabSize) - log2(float(gAnsCounts[s])));
+    }
+    return bits;
+}
+
+/// ANSEncodingHistogram::ComputeBest (the fast strategy): the raw counts in
+/// gAnsCounts[0..length) normalised at precisions 0, 6 and 11 and as the flat
+/// histogram, the cheapest (description plus data) written; gAnsCounts holds
+/// its normalised counts on exit for the alias tables.
+void ansWriteBestHistogram(RWStructuredBuffer<uint> buf, inout SerialWriter w, uint length) {
+    uint numSymbols = 0;
+    for (uint s = 0; s < 256; ++s) {
+        gAnsRaw[s] = s < length ? gAnsCounts[s] : 0;
+        if (gAnsRaw[s] != 0) ++numSymbols;
+    }
+    if (numSymbols <= 2) {
+        ansNormalizeShift(length, kAnsLogTabSize - 1);
+        ansWriteHistogramAt(buf, w, length, kAnsLogTabSize - 1, false, false);
+        return;
+    }
+    const uint shifts[3] = {0, kAnsLogTabSize / 2, kAnsLogTabSize - 1};
+    float bestCost = 3.4e38f;
+    uint bestShift = kAnsLogTabSize - 1;
+    bool bestFlat = false;
+    for (uint k = 0; k < 3; ++k) {
+        ansNormalizeShift(length, shifts[k]);
+        SerialWriter dryW;
+        dryW.base = 0;
+        dryW.pos = 0;
+        ansWriteHistogramAt(buf, dryW, length, shifts[k], false, true);
+        const float cost = float(dryW.pos) + ansDataBits(length);
+        if (cost < bestCost) { bestCost = cost; bestShift = shifts[k]; bestFlat = false; }
+    }
+    {
+        // The flat histogram: counts 4096 / length, the first 4096 % length one more.
+        const uint base = kAnsTabSize / length, rem = kAnsTabSize % length;
+        for (uint s = 0; s < length; ++s) gAnsCounts[s] = base + (s < rem ? 1 : 0);
+        SerialWriter dryW;
+        dryW.base = 0;
+        dryW.pos = 0;
+        ansWriteHistogramAt(buf, dryW, length, 0, true, true);
+        const float cost = float(dryW.pos) + ansDataBits(length);
+        if (cost < bestCost) { bestCost = cost; bestFlat = true; }
+    }
+    if (bestFlat) {
+        const uint base = kAnsTabSize / length, rem = kAnsTabSize % length;
+        for (uint s = 0; s < length; ++s) gAnsCounts[s] = base + (s < rem ? 1 : 0);
+        ansWriteHistogramAt(buf, w, length, 0, true, false);
+    } else {
+        ansNormalizeShift(length, bestShift);
+        ansWriteHistogramAt(buf, w, length, bestShift, false, false);
+    }
+}
+
+/// The serialised histogram gAnsCounts[0..length) (normalised exactly).
+void ansWriteHistogram(RWStructuredBuffer<uint> buf, inout SerialWriter w, uint length) {
+    ansWriteHistogramAt(buf, w, length, kAnsLogTabSize - 1, false, false);
 }
 
 /// The alias table of gAnsCounts[0..length) with 1 << logAlpha buckets

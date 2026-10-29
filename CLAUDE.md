@@ -17,7 +17,7 @@ ctest --test-dir build/macos-arm64-debug -R prefix          # tests matching a n
 build/macos-arm64-debug/bin/sjxl_gpu_tests "prefix sum*"    # one Catch2 case by name (or a [tag])
 cmake --build build/macos-arm64-debug --target sjxl_gpu_tests   # one binary
 build/macos-arm64-debug/bin/sjxl info [in.jxl]              # device info, or a file's headers and frame list
-build/macos-arm64-debug/bin/sjxl encode in.png out.jxl --distance 1.0 [--no-aq] [--no-cfl] [--no-filters] [--no-acs] [--lambda x] [--clusters n] [--progressive | --qprogressive] [--progressive-dc]
+build/macos-arm64-debug/bin/sjxl encode in.png out.jxl --distance 1.0 [--no-aq] [--no-cfl] [--no-filters] [--no-acs] [--lambda x] [--clusters n] [--progressive | --qprogressive] [--progressive-dc] [--fixed-tree]
 build/macos-arm64-debug/bin/sjxl encode in.png out.jxl --lossless   # Modular frame, bit-exact; RGB/RGBA, 8/16-bit
 build/macos-arm64-debug/bin/sjxl animate out.jxl --fps 10 [--loops n] [--lossless] [-d d] f1.png f2.png ...   # animation, one tick per frame
 build/macos-arm64-debug/bin/sjxl decode in.jxl out.png                  # every stage on the GPU; animations write out_000.png, ...
@@ -82,7 +82,10 @@ cjxl in.png ref.jxl -d 1 -e 5 ; djxl out.jxl check.png      # Homebrew oracle (/
   group) and their AcMetadata in the kACMeta tree (`enc/dc_tokens.slang`).
   Tokens are counted in parallel, then one thread per group runs each chain
   twice (size, then placement backwards from the stream's end). Every token
-  must be in the stream, zero-cost ones included. Context maps over many
+  must be in the stream, zero-cost ones included. ANS histograms go through
+  `ansWriteBestHistogram` (precision 0/6/11 or flat, whichever is cheapest,
+  run-length coded widths); single-thread kernels keep 256-entry scratch in
+  groupshared arrays, never private ones (Metal's compiler hangs). Context maps over many
   contexts are MTF + ANS streams; the headers' MA trees use prefix codes.
 - **One Slang and one slang-rhi** per process, the pinned ones.
 - **`docs/decisions.md`** records each subsystem's design, what was measured
@@ -169,11 +172,13 @@ tokenised like the lossless one, its global part at the end of DcGlobal
 (`codes.slang writeExtraChannelGlobal`) and its groups after the AC stream in
 every AC group section (`ac_sections.slang`), in its own histogram set after
 the DC groups' sets. Lossless (`--lossless`): a Modular frame, YCoCg RCT over the colour channels (alpha is the
-fourth modular channel and an extra channel in the headers), per channel the
-weighted predictor with libjxl's fixed WP-property tree or Gradient with the
-gradient tree, whichever `channelEntropy` estimates cheaper (`modTokenize`
-runs both passes, serial per group; the host joins the chosen subtrees under
-channel splits and `remapTokens` renumbers the contexts),
+fourth modular channel and an extra channel in the headers), an MA tree
+learned as libjxl's ComputeBestTree (`enc/tree.slang`: property thresholds,
+`modSamples` keeps a quarter of the pixels with both predictors' tokens, then
+per level histograms → split decision per node → sample assignment; the host
+orders the nodes breadth first) and `modTokenizeTree` over all 16 properties
+(`--fixed-tree`: per channel libjxl's fixed WP or gradient tree, whichever
+`channelEntropy` estimates cheaper, joined under channel splits),
 residual tokens kept per sample (`enc/modular.slangh` `modTreeLeaf`, the
 decoder's group-local edge rules), clustered ANS histograms,
 the global section by one thread (`codes.slang buildModularGlobalBlob`; it

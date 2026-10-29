@@ -472,8 +472,7 @@ void writeContextMapStream(RWStructuredBuffer<uint> buf, inout SerialWriter w, u
     serialWrite(buf, w, 1, 0);                     // use_prefix_code = 0
     serialWrite(buf, w, 2, kMapLogAlpha - 5);
     encodeUintConfig(buf, w, kMapLogAlpha);
-    ansNormalize(length);
-    ansWriteHistogram(buf, w, length);
+    ansWriteBestHistogram(buf, w, length);
     ansBuildTables(ansInfo, ansReverse, kMapRegion, length, kMapLogAlpha);
     // Two passes over the tokens backwards: the size, then the placement.
     uint total = 32;
@@ -536,8 +535,7 @@ void writeHistogramSet(RWStructuredBuffer<uint> buf, inout SerialWriter w, uint 
     for (uint c = 0; c < numClusters; ++c) {
         const uint length = loadHistogram((regionBase + c) * kCodeStride);
         for (uint i = 0; i < kMaxAlphabet; ++i) gAnsCounts[i] = gHist[i];
-        ansNormalize(length);
-        ansWriteHistogram(buf, w, length);
+        ansWriteBestHistogram(buf, w, length);
         ansBuildTables(ansInfo, ansReverse, regionBase + c, length, logAlpha);
     }
 }
@@ -637,42 +635,52 @@ void buildDcGroupBlobs(uint3 gid: SV_GroupID) {
 
 /// The modular alphabet: 8-bit residual tokens stay below 64, 16-bit ones below 128.
 uint modLogAlpha() { return params.bitDepth > 8 ? 7 : 6; }
-static const uint kMaxModTreeTokens = 1024;
-groupshared uint gTreeTokens[kMaxModTreeTokens];
 
 /// The fixed tree's tokens as DecodeTree reads them, node by node: property + 1
 /// and the split value for a split, 0, predictor, offset, mul_log, mul_bits for
 /// a leaf. One prefix code over the six contexts (trivial context map).
-void writeTreeFromNodes(RWStructuredBuffer<uint> buf, inout SerialWriter w, StructuredBuffer<uint> tree, uint numNodes) {
-    uint count = 0;
-    for (uint n = 0; n < numNodes && count + 5 <= kMaxModTreeTokens; ++n) {
-        const uint base = n * kModTreeWords;
-        const int prop = int(tree[base + 0]);
-        if (prop >= 0) {
-            gTreeTokens[count++] = uint(prop) + 1;
-            gTreeTokens[count++] = packSigned(int(tree[base + 1]));
-        } else {
-            gTreeTokens[count++] = 0;
-            gTreeTokens[count++] = tree[base + 5];                 // predictor
-            gTreeTokens[count++] = packSigned(int(tree[base + 6]));   // offset
-            gTreeTokens[count++] = 0;                              // mul_log
-            gTreeTokens[count++] = 0;                              // mul_bits
-        }
+/// The tokens of node n of the tree (TokenizeTree): a split is property + 1 and
+/// the split value; a leaf is 0, predictor, offset, mul_log 0, mul_bits 0.
+uint treeNodeTokens(StructuredBuffer<uint> tree, uint n, out uint t[5]) {
+    const uint base = n * kModTreeWords;
+    const int prop = int(tree[base + 0]);
+    if (prop >= 0) {
+        t[0] = uint(prop) + 1;
+        t[1] = packSigned(int(tree[base + 1]));
+        t[2] = t[3] = t[4] = 0;
+        return 2;
     }
+    t[0] = 0;
+    t[1] = tree[base + 5];                   // predictor
+    t[2] = packSigned(int(tree[base + 6]));  // offset
+    t[3] = 0;                                // mul_log
+    t[4] = 0;                                // mul_bits
+    return 5;
+}
+
+void writeTreeFromNodes(RWStructuredBuffer<uint> buf, inout SerialWriter w, StructuredBuffer<uint> tree, uint numNodes) {
     for (uint i = 0; i < kMaxAlphabet; ++i) gHist[i] = 0;
     uint treeLen = 1;
-    for (uint i = 0; i < count; ++i) {
-        uint tok, nbits, raw;
-        hybridEncode(gTreeTokens[i], tok, nbits, raw);
-        ++gHist[tok];
-        treeLen = max(treeLen, tok + 1);
+    for (uint n = 0; n < numNodes; ++n) {
+        uint t[5];
+        const uint count = treeNodeTokens(tree, n, t);
+        for (uint i = 0; i < count; ++i) {
+            uint tok, nbits, raw;
+            hybridEncode(t[i], tok, nbits, raw);
+            ++gHist[tok];
+            treeLen = max(treeLen, tok + 1);
+        }
     }
     writePrefixHistograms(buf, w, treeLen, kNumTreeContexts, 0xFFFFFFFFu);
-    for (uint i = 0; i < count; ++i) {
-        uint tok, nbits, raw;
-        hybridEncode(gTreeTokens[i], tok, nbits, raw);
-        serialWrite(buf, w, gDataDepth[tok], gDataBits[tok]);
-        serialWrite(buf, w, nbits, raw);
+    for (uint n = 0; n < numNodes; ++n) {
+        uint t[5];
+        const uint count = treeNodeTokens(tree, n, t);
+        for (uint i = 0; i < count; ++i) {
+            uint tok, nbits, raw;
+            hybridEncode(t[i], tok, nbits, raw);
+            serialWrite(buf, w, gDataDepth[tok], gDataBits[tok]);
+            serialWrite(buf, w, nbits, raw);
+        }
     }
 }
 

@@ -29,6 +29,7 @@ constexpr float    kInvSigmaNum = -1.1715728752538099024f;
 constexpr uint32_t kMaxPatchPositions = 1u << 16;     // frame.slangh kMaxPatchPositions
 constexpr uint32_t kLz77WindowWords = 1u << 20;
 constexpr uint32_t kDequantTableFloats = 394752;
+constexpr uint32_t kGsTreeNumNodesIndex = 33;
 constexpr uint32_t kErrNone = 0, kErrCorrupt = 1, kErrUnsupported = 2, kErrArena = 3, kErrLz77Window = 4, kErrAcNzeros = 5, kErrAcLeftover = 6, kErrAnsState = 7;
 
 struct Uint2 {
@@ -776,6 +777,9 @@ Result<Decoder::FrameOutput> Decoder::run(const codestream::Parsed& parsed, cons
     SJXL_ASSIGN(const std::vector<uint32_t> header, arena.readRange<uint32_t>(dev, 0, kGsHeaderSize));
     stats_.dcGlobalBits = header[45];
     stats_.usedAcs = header[47];
+    if (modular && !platform::env("SJXL_DEBUG").empty()) {
+        log::info("decoder: modular global tree {} nodes", header[kGsTreeNumNodesIndex]);
+    }
     if (referenceOnly || dcFrame) {
         // Saved before the colour transform: the XYB planes as they are after the filters
         // (a reference frame for patches, or the DC image of the frame one level down).

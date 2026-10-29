@@ -155,6 +155,13 @@ Result<std::unique_ptr<Encoder>> Encoder::create(std::shared_ptr<gpu::ShaderLibr
     SJXL_ASSIGN(enc->rctYCoCg_, gpu::ComputeKernel::create(lib, "sjxl/enc/modular", "rctYCoCg"));
     SJXL_ASSIGN(enc->dcFramePlanes_, gpu::ComputeKernel::create(lib, "sjxl/enc/modular", "dcFramePlanes"));
     SJXL_ASSIGN(enc->modTokenize_, gpu::ComputeKernel::create(lib, "sjxl/enc/modular", "modTokenize"));
+    SJXL_ASSIGN(enc->modSamples_, gpu::ComputeKernel::create(lib, "sjxl/enc/modular", "modSamples"));
+    SJXL_ASSIGN(enc->modTokenizeTree_, gpu::ComputeKernel::create(lib, "sjxl/enc/modular", "modTokenizeTree"));
+    SJXL_ASSIGN(enc->propStats_, gpu::ComputeKernel::create(lib, "sjxl/enc/tree", "propStats"));
+    SJXL_ASSIGN(enc->propThresholds_, gpu::ComputeKernel::create(lib, "sjxl/enc/tree", "propThresholds"));
+    SJXL_ASSIGN(enc->treeHistograms_, gpu::ComputeKernel::create(lib, "sjxl/enc/tree", "treeHistograms"));
+    SJXL_ASSIGN(enc->treeSplit_, gpu::ComputeKernel::create(lib, "sjxl/enc/tree", "treeSplit"));
+    SJXL_ASSIGN(enc->treeAssign_, gpu::ComputeKernel::create(lib, "sjxl/enc/tree", "treeAssign"));
     SJXL_ASSIGN(enc->extractAlpha_, gpu::ComputeKernel::create(lib, "sjxl/enc/modular", "extractAlpha"));
     SJXL_ASSIGN(enc->channelEntropy_, gpu::ComputeKernel::create(lib, "sjxl/enc/modular", "channelEntropy"));
     SJXL_ASSIGN(enc->remapTokens_, gpu::ComputeKernel::create(lib, "sjxl/enc/modular", "remapTokens"));
@@ -1216,68 +1223,49 @@ Result<std::vector<uint8_t>> Encoder::encodeModularFrame(const ModularSpec& spec
     const bool fitsGroup = spec.width <= dim.groupDim && spec.height <= dim.groupDim;
     const uint64_t pixels = uint64_t{spec.width} * spec.height;
     const uint32_t channels = spec.channels;
-
-    // libjxl's Predictor::Best per channel: the weighted predictor with the fixed
-    // WP-property tree, or Gradient with the gradient tree, whichever the
-    // channel's tokens estimate cheaper; the frame's tree joins the choices.
-    uint32_t wpLeaves = 0, gradLeaves = 0;
-    const std::vector<uint32_t> wpTree = fixedTree(kModPropWp, kPredWeighted, channels * pixels, wpLeaves);
-    const std::vector<uint32_t> gradTree = fixedTree(kModPropGradient, kPredGradient, channels * pixels, gradLeaves);
-    SJXL_ASSIGN(auto wpTreeBuf, gpu::Buffer::fromSpan<uint32_t>(dev, wpTree, "enc.wpTree"));
-    SJXL_ASSIGN(auto gradTreeBuf, gpu::Buffer::fromSpan<uint32_t>(dev, gradTree, "enc.gradTree"));
-    uint32_t numLeaves = 0;
-    uint32_t numTreeNodes = 0;
-    gpu::Buffer treeNodes;
-
-    SJXL_ASSIGN(auto modTokens, gpu::Buffer::ofType<uint32_t>(dev, channels * pixels, "enc.modTokens"));
-    SJXL_ASSIGN(auto passTokens, gpu::Buffer::ofType<uint32_t>(dev, 2 * channels * pixels, "enc.passTokens"));
-    SJXL_ASSIGN(auto passHist, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{2} * channels * kSetContexts * kHistBins, "enc.passHist"));
-    SJXL_ASSIGN(auto passBits, gpu::Buffer::ofType<float>(dev, 2 * channels, "enc.passBits"));
-    gpu::Buffer choice, leafMapBuf;
     const uint32_t wpWordsPerGroup = 5 * 2 * (dim.groupDim + 2);
     SJXL_ASSIGN(auto wpScratch, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{numGroups} * wpWordsPerGroup, "enc.wpScratchMod"));
-    const uint32_t maxLeaves = channels * kSetContexts;   // the combined tree's leaves at most
-    SJXL_ASSIGN(auto ctxHist, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{maxLeaves} * kHistBins, "enc.ctxHist"));
-    SJXL_ASSIGN(auto ctxMap, gpu::Buffer::ofType<uint32_t>(dev, maxLeaves, "enc.ctxMap"));
-    SJXL_ASSIGN(auto ctxTotal, gpu::Buffer::ofType<float>(dev, maxLeaves, "enc.ctxTotal"));
-    SJXL_ASSIGN(auto ctxEntropy, gpu::Buffer::ofType<float>(dev, maxLeaves, "enc.ctxEntropy"));
-    SJXL_ASSIGN(auto ctxDist, gpu::Buffer::ofType<float>(dev, maxLeaves, "enc.ctxDist"));
-    SJXL_ASSIGN(auto ctxSingle, gpu::Buffer::ofType<uint32_t>(dev, maxLeaves, "enc.ctxSingle"));
-    SJXL_ASSIGN(auto clusterInfo, gpu::Buffer::ofType<uint32_t>(dev, 4, "enc.clusterInfo"));
-    SJXL_ASSIGN(auto ctxMapMtf, gpu::Buffer::ofType<uint32_t>(dev, maxLeaves, "enc.ctxMapMtf"));
-    SJXL_ASSIGN(auto hist, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{kAcClusters} * kCodeStride, "enc.hist"));
-    SJXL_ASSIGN(auto codes, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{kAcClusters} * kCodeStride, "enc.codes"));
-    // Regions: one set of clusters (the map's own code lands at (1 + 2 numDcGroups) * 32).
-    const uint32_t regions = (1 + 2 * numDcGroups) * kAcClusters + 1;
-    SJXL_ASSIGN(auto ansInfo, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{regions} * 256, "enc.ansInfo"));
-    SJXL_ASSIGN(auto ansReverse, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{regions} * 4096, "enc.ansReverse"));
-    // The global blob holds the whole stream when the image fits a group.
-    const uint64_t blobWords = kBlobStrideWords + (fitsGroup ? channels * pixels * (spec.bitDepth / 8) + 1024 : 0);
-    SJXL_ASSIGN(auto blobs, gpu::Buffer::ofType<uint32_t>(dev, blobWords, "enc.blobs"));
-    SJXL_ASSIGN(auto blobBits, gpu::Buffer::ofType<uint32_t>(dev, 2, "enc.blobBits"));
-    SJXL_ASSIGN(auto groupBits, gpu::Buffer::ofType<uint32_t>(dev, numGroups, "enc.groupBits"));
+    SJXL_ASSIGN(auto modTokens, gpu::Buffer::ofType<uint32_t>(dev, channels * pixels, "enc.modTokens"));
+    // The tree: learned (tree.slang) or libjxl's fixed WP / gradient trees per channel.
+    gpu::Buffer treeNodes, ctxHist, choice, leafMapBuf, passTokens, passHist, passBits, thresholds, samples, sampleCount;
+    uint32_t numLeaves = 0, numTreeNodes = 0;
+    std::string treeDesc;
+    const auto orDummy = [&](const gpu::Buffer& b) -> const gpu::Buffer& { return b.valid() ? b : dummy_; };
+    // libjxl's hare-tier tree learning: Predictor::Best (Weighted, Gradient); the
+    // first four of its property order {0, 1, 15, 9, 10, ...}, the stream (1)
+    // dropped when the frame has fewer than 30 streams; 48 property values; a
+    // quarter of the pixels sampled; node threshold 75 + 14 * 5.
+    const uint32_t numStreams = 18 + 3 * numDcGroups + numGroups;
+    const uint32_t streamBase = fitsGroup ? 0 : 18 + 3 * numDcGroups;
+    const std::array<uint32_t, 4> propIds = numStreams < 30 ? std::array<uint32_t, 4>{0, 15, 9, 10} : std::array<uint32_t, 4>{0, 1, 15, 9};
+    const float sampleFraction = 0.25f;
+    float nodeThreshold = 75.0f + 14.0f * 5.0f;
+    if (const std::string t = platform::env("SJXL_TREE_THRESHOLD"); !t.empty()) nodeThreshold = std::strtof(t.c_str(), nullptr);   // experiments
 
     gpu::CommandBatch batch(dev);
-    const auto bindMod = [&](rhi::ShaderCursor c, uint32_t mode, const gpu::Buffer& groupStart, const gpu::Buffer& body,
-                             const gpu::Buffer& tree, uint32_t pass) {
+    const auto bindMod = [&](rhi::ShaderCursor c, uint32_t mode, const gpu::Buffer& groupStart, const gpu::Buffer& body, const gpu::Buffer& tree,
+                             uint32_t pass) {
         c["rgb8"].setBinding(dummy_.rhi());
         c["dcValue"].setBinding(dummy_.rhi());
+        c["thresholds"].setBinding(orDummy(thresholds).rhi());
+        c["samples"].setBinding(orDummy(samples).rhi());
+        c["sampleCount"].setBinding(orDummy(sampleCount).rhi());
         c["planes"].setBinding(planes.rhi());
         c["planesIn"].setBinding(planes.rhi());
-        c["treeNodes"].setBinding(tree.rhi());
+        c["treeNodes"].setBinding(orDummy(tree).rhi());
         c["wpScratch"].setBinding(wpScratch.rhi());
-        c["passTokens"].setBinding(passTokens.rhi());
-        c["passHist"].setBinding(passHist.rhi());
-        c["passBits"].setBinding(passBits.rhi());
-        c["choice"].setBinding(choice.rhi());
-        c["leafMap"].setBinding(leafMapBuf.rhi());
+        c["passTokens"].setBinding(orDummy(passTokens).rhi());
+        c["passHist"].setBinding(orDummy(passHist).rhi());
+        c["passBits"].setBinding(orDummy(passBits).rhi());
+        c["choice"].setBinding(orDummy(choice).rhi());
+        c["leafMap"].setBinding(orDummy(leafMapBuf).rhi());
         c["modTokens"].setBinding(modTokens.rhi());
-        c["ctxHist"].setBinding(ctxHist.rhi());
-        c["ctxMap"].setBinding(ctxMap.rhi());
-        c["ansInfo"].setBinding(ansInfo.rhi());
-        c["ansReverse"].setBinding(ansReverse.rhi());
+        c["ctxHist"].setBinding(orDummy(ctxHist).rhi());
+        c["ctxMap"].setBinding(dummy_.rhi());
+        c["ansInfo"].setBinding(dummy_.rhi());
+        c["ansReverse"].setBinding(dummy_.rhi());
         c["groupStart"].setBinding(groupStart.rhi());
-        c["groupBits"].setBinding(groupBits.rhi());
+        c["groupBits"].setBinding(dummy_.rhi());
         c["body"].setBinding(body.rhi());
         c["params"]["width"].setData(spec.width);
         c["params"]["height"].setData(spec.height);
@@ -1294,40 +1282,188 @@ Result<std::vector<uint8_t>> Encoder::encodeModularFrame(const ModularSpec& spec
         c["params"]["dcQuantX"].setData(0.0f);
         c["params"]["dcQuantY"].setData(0.0f);
         c["params"]["dcQuantB"].setData(0.0f);
+        c["params"]["sampleFraction"].setData(sampleFraction);
+        c["params"]["sampleCapacity"].setData(uint32_t{samples.valid() ? static_cast<uint32_t>(samples.bytes() / 8) : 0u});
+        c["params"]["streamBase"].setData(streamBase);
+        c["params"]["propIds"].setData(propIds);
     };
-    // Both predictor passes and their per-channel entropies; the choice is bookkeeping on the host.
-    SJXL_ASSIGN(choice, gpu::Buffer::ofType<uint32_t>(dev, channels, "enc.choice"));
-    SJXL_ASSIGN(leafMapBuf, gpu::Buffer::ofType<uint32_t>(dev, channels * kSetContexts, "enc.leafMap"));
-    modTokenize_.dispatch(batch, {numGroups, 1, 1}, [&](rhi::ShaderCursor c) { bindMod(c, 0, dummy_, dummy_, wpTreeBuf, 0); });
-    modTokenize_.dispatch(batch, {numGroups, 1, 1}, [&](rhi::ShaderCursor c) { bindMod(c, 0, dummy_, dummy_, gradTreeBuf, 1); });
-    channelEntropy_.dispatch(batch, {2 * channels, 1, 1}, [&](rhi::ShaderCursor c) { bindMod(c, 0, dummy_, dummy_, wpTreeBuf, 0); });
-    SJXL_TRY(batch.submit(true));
-    SJXL_ASSIGN(const std::vector<float> passBitsHost, passBits.readAll<float>(dev));
-    std::vector<uint32_t> choiceHost(channels);
-    std::vector<const std::vector<uint32_t>*> subtrees(channels);
-    for (uint32_t c = 0; c < channels; ++c) {
-        choiceHost[c] = passBitsHost[c] <= passBitsHost[channels + c] ? 0u : 1u;
-        subtrees[c] = choiceHost[c] == 0 ? &wpTree : &gradTree;
-    }
-    std::vector<uint32_t> leafMapHost;
-    std::vector<uint32_t> treeWords;
-    bool unanimous = true;
-    for (uint32_t c = 1; c < channels; ++c) unanimous = unanimous && choiceHost[c] == choiceHost[0];
-    if (unanimous) {
-        // One tree for every channel: fewer leaves, so fewer histograms to carry.
-        treeWords = *subtrees[0];
-        numLeaves = choiceHost[0] == 0 ? wpLeaves : gradLeaves;
-        leafMapHost.assign(size_t{channels} * kSetContexts, 0);
-        for (uint32_t c = 0; c < channels; ++c)
-            for (uint32_t j = 0; j < kSetContexts; ++j) leafMapHost[c * kSetContexts + j] = j;
+
+    if (options.learnedTree) {
+        constexpr uint32_t kStatBins = 2 * 512 + 1, kThreshStride = 64, kNumProps = 16;
+        constexpr uint32_t kMaxNodes = 4096, kMaxSlots = 384, kLearnNodeWords = 8;
+        constexpr uint32_t kSlotCounts = 4 * 48 * 2 * 64, kSlotExtra = 4 * 48 * 2;
+        SJXL_ASSIGN(auto treeStats, gpu::Buffer::ofType<uint32_t>(dev, 3 * kStatBins + 16, "enc.treeStats"));
+        SJXL_ASSIGN(thresholds, gpu::Buffer::ofType<int32_t>(dev, (kNumProps + 1) * kThreshStride, "enc.treeThresholds"));
+        const uint64_t capacity = std::min<uint64_t>(channels * pixels, static_cast<uint64_t>(static_cast<double>(channels * pixels) * sampleFraction * 1.25) + 65536);
+        SJXL_ASSIGN(samples, gpu::Buffer::ofType<uint64_t>(dev, capacity, "enc.treeSamples"));
+        SJXL_ASSIGN(sampleCount, gpu::Buffer::ofType<uint32_t>(dev, 1, "enc.treeSampleCount"));
+        SJXL_ASSIGN(auto counts, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{kMaxSlots} * kSlotCounts, "enc.treeCounts"));
+        SJXL_ASSIGN(auto extra, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{kMaxSlots} * kSlotExtra, "enc.treeExtra"));
+        std::vector<uint32_t> nodesHost(uint64_t{kMaxNodes} * kLearnNodeWords, 0);
+        nodesHost[0] = 0xFFFFFFFFu;   // the root: a leaf predicting Weighted (predictor index 0)
+        SJXL_ASSIGN(auto nodes, gpu::Buffer::fromSpan<uint32_t>(dev, nodesHost, "enc.treeNodesLearn"));
+        gpu::Buffer sampleNode, counters;
+        uint32_t numSamples = 0;
+        const auto bindTree = [&](rhi::ShaderCursor c, uint32_t levelStart) {
+            c["planes"].setBinding(planes.rhi());
+            c["stats"].setBinding(treeStats.rhi());
+            c["thresholds"].setBinding(thresholds.rhi());
+            c["samples"].setBinding(samples.rhi());
+            c["sampleNode"].setBinding(orDummy(sampleNode).rhi());
+            c["counts"].setBinding(counts.rhi());
+            c["extra"].setBinding(extra.rhi());
+            c["nodes"].setBinding(nodes.rhi());
+            c["counters"].setBinding(orDummy(counters).rhi());
+            c["params"]["numSamples"].setData(numSamples);
+            c["params"]["levelStart"].setData(levelStart);
+            c["params"]["maxNodes"].setData(kMaxNodes);
+            c["params"]["maxSlots"].setData(kMaxSlots);
+            c["params"]["threshold"].setData(nodeThreshold);
+            c["params"]["fastDecodeMul"].setData(1.001f);
+            c["params"]["width"].setData(spec.width);
+            c["params"]["height"].setData(spec.height);
+            c["params"]["numChannels"].setData(channels);
+            c["params"]["numGroups"].setData(numGroups);
+            c["params"]["groupDim"].setData(dim.groupDim);
+            c["params"]["groupsX"].setData(dim.xsizeGroups);
+            c["params"]["streamBase"].setData(streamBase);
+            c["params"]["sampleFraction"].setData(std::min(0.99f, sampleFraction * 0.1f));   // CollectPixelSamples
+            c["params"]["propIds"].setData(propIds);
+        };
+        // The properties' quantisation thresholds, then the samples.
+        propStats_.dispatch(batch, {static_cast<uint32_t>(channels * pixels), 1, 1}, [&](rhi::ShaderCursor c) { bindTree(c, 0); });
+        propThresholds_.dispatch(batch, {1, 1, 1}, [&](rhi::ShaderCursor c) { bindTree(c, 0); });
+        modSamples_.dispatch(batch, {numGroups, 1, 1}, [&](rhi::ShaderCursor c) { bindMod(c, 0, dummy_, dummy_, dummy_, 0); });
+        SJXL_TRY(batch.submit(true));
+        SJXL_ASSIGN(const std::vector<uint32_t> sampleCountHost, sampleCount.readAll<uint32_t>(dev));
+        numSamples = static_cast<uint32_t>(std::min<uint64_t>(sampleCountHost[0], capacity));
+        // LearnTree: the node threshold scales with the fraction of pixels sampled (0.9 f + 0.1).
+        const float pixelFraction = static_cast<float>(numSamples) / static_cast<float>(std::max<uint64_t>(channels * pixels, 1));
+        nodeThreshold *= pixelFraction * 0.9f + 0.1f;
+        SJXL_ASSIGN(sampleNode, gpu::Buffer::ofType<uint32_t>(dev, std::max<uint32_t>(numSamples, 1), "enc.treeSampleNode"));
+        // The tree, a level at a time: histograms per open node, the split decision per node, the samples into the children.
+        uint32_t levelStart = 0, nodeCount = 1, depth = 0;
+        for (; depth < 40 && numSamples > 0; ++depth) {
+            const uint32_t inLevel = nodeCount - levelStart;
+            if (inLevel == 0) break;
+            const std::array<uint32_t, 2> countersHost{nodeCount, 0};
+            SJXL_ASSIGN(counters, gpu::Buffer::fromSpan<uint32_t>(dev, countersHost, "enc.treeCounters"));
+            batch.clear(counts);
+            batch.clear(extra);
+            treeHistograms_.dispatch(batch, {numSamples, 1, 1}, [&](rhi::ShaderCursor c) { bindTree(c, levelStart); });
+            treeSplit_.dispatchGroups(batch, {std::min(inLevel, kMaxSlots), 1, 1}, [&](rhi::ShaderCursor c) { bindTree(c, levelStart); });
+            treeAssign_.dispatch(batch, {numSamples, 1, 1}, [&](rhi::ShaderCursor c) { bindTree(c, levelStart); });
+            SJXL_TRY(batch.submit(true));
+            SJXL_ASSIGN(const std::vector<uint32_t> after, counters.readAll<uint32_t>(dev));
+            levelStart = nodeCount;
+            nodeCount = after[0];
+            if (after[1] == 0 || nodeCount + 2 > kMaxNodes) break;
+        }
+        // The decoder's layout: breadth first, a node's children consecutive, leaves numbered in that order.
+        SJXL_ASSIGN(const std::vector<uint32_t> learned, nodes.readRange<uint32_t>(dev, 0, uint64_t{nodeCount} * kLearnNodeWords));
+        std::vector<uint32_t> treeWords;
+        std::vector<uint32_t> queue{0};
+        for (size_t head = 0; head < queue.size(); ++head) {
+            const uint32_t n = queue[head];
+            const uint32_t* w = &learned[uint64_t{n} * kLearnNodeWords];
+            const size_t at = treeWords.size();
+            treeWords.resize(at + kModTreeWords, 0);
+            if (w[0] == 0xFFFFFFFFu) {
+                treeWords[at + 0] = 0xFFFFFFFFu;
+                treeWords[at + 4] = numLeaves++;
+                treeWords[at + 5] = w[4] == 0 ? kPredWeighted : kPredGradient;
+            } else {
+                const uint32_t pending = static_cast<uint32_t>(queue.size() - head - 1);
+                const uint32_t self = static_cast<uint32_t>(at / kModTreeWords);
+                treeWords[at + 0] = propIds[std::min<uint32_t>(w[0], 3)];
+                treeWords[at + 1] = w[5];
+                treeWords[at + 2] = self + pending + 1;
+                treeWords[at + 3] = self + pending + 2;
+                queue.push_back(w[2]);
+                queue.push_back(w[3]);
+            }
+        }
+        numTreeNodes = static_cast<uint32_t>(treeWords.size() / kModTreeWords);
+        SJXL_ASSIGN(treeNodes, gpu::Buffer::fromSpan<uint32_t>(dev, treeWords, "enc.treeNodes"));
+        treeDesc = std::format("learned tree over properties {} {} {} {}: {} samples, {} nodes, depth {}", propIds[0], propIds[1], propIds[2], propIds[3],
+                               numSamples, numTreeNodes, depth);
+        SJXL_ASSIGN(ctxHist, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{numLeaves} * kHistBins, "enc.ctxHist"));
+        modTokenizeTree_.dispatch(batch, {numGroups, 1, 1}, [&](rhi::ShaderCursor c) { bindMod(c, 0, dummy_, dummy_, treeNodes, 0); });
     } else {
-        treeWords = combineTreesByChannel(subtrees, leafMapHost, numLeaves);
+        // libjxl's Predictor::Best per channel: the weighted predictor with the fixed
+        // WP-property tree, or Gradient with the gradient tree, whichever the
+        // channel's tokens estimate cheaper; the frame's tree joins the choices.
+        uint32_t wpLeaves = 0, gradLeaves = 0;
+        const std::vector<uint32_t> wpTree = fixedTree(kModPropWp, kPredWeighted, channels * pixels, wpLeaves);
+        const std::vector<uint32_t> gradTree = fixedTree(kModPropGradient, kPredGradient, channels * pixels, gradLeaves);
+        SJXL_ASSIGN(auto wpTreeBuf, gpu::Buffer::fromSpan<uint32_t>(dev, wpTree, "enc.wpTree"));
+        SJXL_ASSIGN(auto gradTreeBuf, gpu::Buffer::fromSpan<uint32_t>(dev, gradTree, "enc.gradTree"));
+        SJXL_ASSIGN(passTokens, gpu::Buffer::ofType<uint32_t>(dev, 2 * channels * pixels, "enc.passTokens"));
+        SJXL_ASSIGN(passHist, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{2} * channels * kSetContexts * kHistBins, "enc.passHist"));
+        SJXL_ASSIGN(passBits, gpu::Buffer::ofType<float>(dev, 2 * channels, "enc.passBits"));
+        const uint32_t maxLeaves = channels * kSetContexts;   // the combined tree's leaves at most
+        SJXL_ASSIGN(ctxHist, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{maxLeaves} * kHistBins, "enc.ctxHist"));
+        SJXL_ASSIGN(choice, gpu::Buffer::ofType<uint32_t>(dev, channels, "enc.choice"));
+        SJXL_ASSIGN(leafMapBuf, gpu::Buffer::ofType<uint32_t>(dev, channels * kSetContexts, "enc.leafMap"));
+        modTokenize_.dispatch(batch, {numGroups, 1, 1}, [&](rhi::ShaderCursor c) { bindMod(c, 0, dummy_, dummy_, wpTreeBuf, 0); });
+        modTokenize_.dispatch(batch, {numGroups, 1, 1}, [&](rhi::ShaderCursor c) { bindMod(c, 0, dummy_, dummy_, gradTreeBuf, 1); });
+        channelEntropy_.dispatch(batch, {2 * channels, 1, 1}, [&](rhi::ShaderCursor c) { bindMod(c, 0, dummy_, dummy_, wpTreeBuf, 0); });
+        SJXL_TRY(batch.submit(true));
+        SJXL_ASSIGN(const std::vector<float> passBitsHost, passBits.readAll<float>(dev));
+        std::vector<uint32_t> choiceHost(channels);
+        std::vector<const std::vector<uint32_t>*> subtrees(channels);
+        for (uint32_t c = 0; c < channels; ++c) {
+            choiceHost[c] = passBitsHost[c] <= passBitsHost[channels + c] ? 0u : 1u;
+            subtrees[c] = choiceHost[c] == 0 ? &wpTree : &gradTree;
+            treeDesc += std::format("{}:{} ", c, choiceHost[c] == 0 ? "WP" : "grad");
+        }
+        std::vector<uint32_t> leafMapHost;
+        std::vector<uint32_t> treeWords;
+        bool unanimous = true;
+        for (uint32_t c = 1; c < channels; ++c) unanimous = unanimous && choiceHost[c] == choiceHost[0];
+        if (unanimous) {
+            // One tree for every channel: fewer leaves, so fewer histograms to carry.
+            treeWords = *subtrees[0];
+            numLeaves = choiceHost[0] == 0 ? wpLeaves : gradLeaves;
+            leafMapHost.assign(size_t{channels} * kSetContexts, 0);
+            for (uint32_t c = 0; c < channels; ++c)
+                for (uint32_t j = 0; j < kSetContexts; ++j) leafMapHost[c * kSetContexts + j] = j;
+        } else {
+            treeWords = combineTreesByChannel(subtrees, leafMapHost, numLeaves);
+        }
+        numTreeNodes = static_cast<uint32_t>(treeWords.size() / kModTreeWords);
+        SJXL_ASSIGN(treeNodes, gpu::Buffer::fromSpan<uint32_t>(dev, treeWords, "enc.treeNodes"));
+        SJXL_ASSIGN(choice, gpu::Buffer::fromSpan<uint32_t>(dev, choiceHost, "enc.choice"));
+        SJXL_ASSIGN(leafMapBuf, gpu::Buffer::fromSpan<uint32_t>(dev, leafMapHost, "enc.leafMap"));
+        remapTokens_.dispatch(batch, {static_cast<uint32_t>(channels * pixels), 1, 1}, [&](rhi::ShaderCursor c) { bindMod(c, 0, dummy_, dummy_, treeNodes, 0); });
     }
-    numTreeNodes = static_cast<uint32_t>(treeWords.size() / kModTreeWords);
-    SJXL_ASSIGN(treeNodes, gpu::Buffer::fromSpan<uint32_t>(dev, treeWords, "enc.treeNodes"));
-    SJXL_ASSIGN(choice, gpu::Buffer::fromSpan<uint32_t>(dev, choiceHost, "enc.choice"));
-    SJXL_ASSIGN(leafMapBuf, gpu::Buffer::fromSpan<uint32_t>(dev, leafMapHost, "enc.leafMap"));
-    remapTokens_.dispatch(batch, {static_cast<uint32_t>(channels * pixels), 1, 1}, [&](rhi::ShaderCursor c) { bindMod(c, 0, dummy_, dummy_, treeNodes, 0); });
+
+    // The leaves' histograms clustered, the codes and the global blob, the group sections' sizes.
+    SJXL_ASSIGN(auto ctxMap, gpu::Buffer::ofType<uint32_t>(dev, numLeaves, "enc.ctxMap"));
+    SJXL_ASSIGN(auto ctxTotal, gpu::Buffer::ofType<float>(dev, numLeaves, "enc.ctxTotal"));
+    SJXL_ASSIGN(auto ctxEntropy, gpu::Buffer::ofType<float>(dev, numLeaves, "enc.ctxEntropy"));
+    SJXL_ASSIGN(auto ctxDist, gpu::Buffer::ofType<float>(dev, numLeaves, "enc.ctxDist"));
+    SJXL_ASSIGN(auto ctxSingle, gpu::Buffer::ofType<uint32_t>(dev, numLeaves, "enc.ctxSingle"));
+    SJXL_ASSIGN(auto clusterInfo, gpu::Buffer::ofType<uint32_t>(dev, 4, "enc.clusterInfo"));
+    SJXL_ASSIGN(auto ctxMapMtf, gpu::Buffer::ofType<uint32_t>(dev, numLeaves, "enc.ctxMapMtf"));
+    SJXL_ASSIGN(auto hist, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{kAcClusters} * kCodeStride, "enc.hist"));
+    SJXL_ASSIGN(auto codes, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{kAcClusters} * kCodeStride, "enc.codes"));
+    // Regions: one set of clusters (the map's own code lands at (1 + 2 numDcGroups) * 32).
+    const uint32_t regions = (1 + 2 * numDcGroups) * kAcClusters + 1;
+    SJXL_ASSIGN(auto ansInfo, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{regions} * 256, "enc.ansInfo"));
+    SJXL_ASSIGN(auto ansReverse, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{regions} * 4096, "enc.ansReverse"));
+    // The global blob holds the whole stream when the image fits a group.
+    const uint64_t blobWords = kBlobStrideWords + (fitsGroup ? channels * pixels * (spec.bitDepth / 8) + 1024 : 0);
+    SJXL_ASSIGN(auto blobs, gpu::Buffer::ofType<uint32_t>(dev, blobWords, "enc.blobs"));
+    SJXL_ASSIGN(auto blobBits, gpu::Buffer::ofType<uint32_t>(dev, 2, "enc.blobBits"));
+    SJXL_ASSIGN(auto groupBits, gpu::Buffer::ofType<uint32_t>(dev, numGroups, "enc.groupBits"));
+    const auto bindSections = [&](rhi::ShaderCursor c, uint32_t mode, const gpu::Buffer& groupStart, const gpu::Buffer& body) {
+        bindMod(c, mode, groupStart, body, treeNodes, 0);
+        c["ctxMap"].setBinding(ctxMap.rhi());
+        c["ansInfo"].setBinding(ansInfo.rhi());
+        c["ansReverse"].setBinding(ansReverse.rhi());
+        c["groupBits"].setBinding(groupBits.rhi());
+    };
     const auto bindCluster = [&](rhi::ShaderCursor c) {
         c["ctxHist"].setBinding(ctxHist.rhi());
         c["ctxTotal"].setBinding(ctxTotal.rhi());
@@ -1392,7 +1528,7 @@ Result<std::vector<uint8_t>> Encoder::encodeModularFrame(const ModularSpec& spec
     };
     modularGlobalBlob_.dispatchGroups(batch, {1, 1, 1}, bindCodes);
     if (!fitsGroup) {
-        modGroupSections_.dispatch(batch, {numGroups, 1, 1}, [&](rhi::ShaderCursor c) { bindMod(c, 1, dummy_, dummy_, treeNodes, 0); });
+        modGroupSections_.dispatch(batch, {numGroups, 1, 1}, [&](rhi::ShaderCursor c) { bindSections(c, 1, dummy_, dummy_); });
     }
     SJXL_TRY(batch.submit(true));
 
@@ -1436,7 +1572,7 @@ Result<std::vector<uint8_t>> Encoder::encodeModularFrame(const ModularSpec& spec
         c["params"]["packed"].setData(0u);
     });
     if (!fitsGroup) {
-        modGroupSections_.dispatch(batch, {numGroups, 1, 1}, [&](rhi::ShaderCursor c) { bindMod(c, 2, groupStart, body, treeNodes, 0); });
+        modGroupSections_.dispatch(batch, {numGroups, 1, 1}, [&](rhi::ShaderCursor c) { bindSections(c, 2, groupStart, body); });
     }
     SJXL_TRY(batch.submit(true));
     SJXL_ASSIGN(const std::vector<uint32_t> bodyWords, body.readAll<uint32_t>(dev));
@@ -1453,10 +1589,8 @@ Result<std::vector<uint8_t>> Encoder::encodeModularFrame(const ModularSpec& spec
     stats_.sectionBytes = sizes;
     stats_.numAcClusters = clusterInfoHost[0];
     if (!platform::env("SJXL_DEBUG").empty()) {
-        std::string ch;
-        for (uint32_t c = 0; c < channels; ++c) ch += std::format("{}:{} ", c, choiceHost[c] == 0 ? "WP" : "grad");
-        log::info("enc debug: {} {}x{} x{} {}-bit, predictors {}, {} tree nodes, {} leaves, {} clusters, DcGlobal {} bits, {} groups",
-                  spec.dcFrame ? "DC frame" : "lossless", spec.width, spec.height, channels, spec.bitDepth, ch, numTreeNodes, numLeaves, clusterInfoHost[0],
+        log::info("enc debug: {} {}x{} x{} {}-bit, {}, {} tree nodes, {} leaves, {} clusters, DcGlobal {} bits, {} groups",
+                  spec.dcFrame ? "DC frame" : "lossless", spec.width, spec.height, channels, spec.bitDepth, treeDesc, numTreeNodes, numLeaves, clusterInfoHost[0],
                   blobBitsHost[0], numGroups);
     }
     const auto* bodyBytesPtr = reinterpret_cast<const uint8_t*>(bodyWords.data());

@@ -31,6 +31,22 @@ void hybridEncode(uint value, out uint token, out uint nbits, out uint bits) {
     bits = (value >> kHybridLsbInToken) & ((1u << nbits) - 1);
 }
 
+/// The same split under any configuration (HybridUintConfig::Encode).
+void hybridEncodeCfg(uint value, uint splitExponent, uint msbInToken, uint lsbInToken, out uint token, out uint nbits, out uint bits) {
+    const uint split = 1u << splitExponent;
+    if (value < split) {
+        token = value;
+        nbits = 0;
+        bits = 0;
+        return;
+    }
+    const uint n = firstbithigh(value);
+    const uint m = value - (1u << n);
+    token = split + ((n - splitExponent) << (msbInToken + lsbInToken)) + ((m >> (n - msbInToken)) << lsbInToken) + (m & ((1u << lsbInToken) - 1));
+    nbits = n - msbInToken - lsbInToken;
+    bits = (value >> lsbInToken) & ((1u << nbits) - 1);
+}
+
 /// libjxl ClampedGradient and the modular Gradient predictor's edge rules:
 /// left = W or N or 0, top = N or left, topleft = NW or left.
 int gradientPredict(bool hasLeft, bool hasTop, int w, int n, int nw) {

@@ -61,10 +61,12 @@ per subsystem or milestone, appended to as the work goes. Dates are absolute.
   specials; PNG colour chunks; DC and AcMetadata with the weighted predictor,
   libjxl's fixed trees and ANS; lossless with the weighted predictor and
   the per-channel predictor choice; alpha and 16-bit in the lossy path;
-  animations of full frames; progressive AC passes and DC frames.)
-  Next: three-channel strategy costs, transforms (palette, Squeeze) and a
-  learned tree for lossless, frames that reference the previous one in
-  animations, encoder speed (the serial ANS and WP passes).
+  animations of full frames; progressive AC passes and DC frames; a learned
+  MA tree and libjxl's histogram precision search for lossless.)
+  Next: per-group RCT choice and per-cluster hybrid-uint configurations for
+  lossless, palette and Squeeze, three-channel strategy costs, frames that
+  reference the previous one in animations, encoder speed (the serial ANS
+  and WP passes).
 - **M4 decoder completeness**: splines, grey JPEG transcodes, loop filters
   on YCbCr frames, extra channel blending in patches, writing the ICC
   profile into the output file, float samples. (16-bit output, animation
@@ -1127,3 +1129,58 @@ per-group headers, and B on its own grid instead of relative to Y). Our decode m
 1 on every test image, with and without the frequency passes (`[dcframe]`
 test). Not done: deeper DC levels (progressive_dc 2), DC frames with extra
 channels.
+
+## Learned MA tree for lossless (2026-10-29)
+
+`Options::learnedTree` (default; `--fixed-tree` keeps the per-channel WP /
+gradient trees) learns the Modular frame's MA tree from the image as libjxl's
+`ComputeBestTree` does at its hare tier, as level-synchronous kernels in
+`enc/tree.slang`:
+
+- `propStats` samples pixel values and horizontal differences (clamped to
+  ±512) and `propThresholds` turns them into the per-property quantisation
+  (`PreQuantizeProperties`: quantile thresholds for the pixel, absolute and
+  difference properties, the fixed table for the WP property, one bin per
+  channel, stream ids by pixel count, 48 values at most).
+- `modSamples` (modular.slang, one thread per group, the WP state serial as
+  in the tokeniser) keeps a quarter of the pixels (`nb_repeats` 0.5 × 0.5)
+  with the residual token of each candidate predictor (Weighted, Gradient:
+  `Predictor::Best`, tokenised with the (4, 1, 2) split libjxl's
+  `AddSample` uses) and the quantised values of the four candidate
+  properties: libjxl's hare order {0, 1, 15, 9, 10, …} with the stream
+  property dropped under 30 streams, so {channel, WP, gradient, W − NW} on
+  the test images and {channel, stream, WP, gradient} on 4K.
+- Per level: `treeHistograms` counts every open node's tokens per
+  (property, value, predictor) with atomics; `treeSplit` (one thread-group
+  per node) sweeps the thresholds of each property with libjxl's cost
+  (`EstimateBits` with the 1/4096 probability floor on each side plus the raw
+  bits, the predictor-change penalty 800 / (100 + threshold), the
+  static / static-constant / non-static / no-WP categories and
+  `fast_decode_multiplier` 1.001) and splits when the saving beats the node
+  threshold 75 + 14 × 5 scaled by `LearnTree`'s 0.9 f + 0.1 for the sample
+  fraction f; `treeAssign` moves the samples to the children. The host reads
+  back two counters per level and stops when a level splits nothing (at most
+  4096 nodes, 384 nodes per level).
+- The host lays the tree out breadth first with consecutive children (the
+  decoder's `TokenizeTree` order; leaf ids in that order) from the learner's
+  node records (bookkeeping, no pixel data), and `modTokenizeTree` tokenises
+  the frame under it with all sixteen properties computed per pixel.
+
+Histograms: `ansWriteBestHistogram` (ans.slangh) replaces the exact
+normalisation: libjxl's `ANSEncodingHistogram::ComputeBest` fast strategy
+tries the count precisions 0, 6 and 11 (`GetPopulationCountPrecision`,
+counts rounded to representable values, the most frequent symbol taking the
+remainder) and the flat histogram, measures the description with a dry run
+plus the data bits, and writes the cheapest, with libjxl's run-length code
+for five or more identical counts. The decoder read all of this already.
+Private arrays of 256 entries in that single-thread kernel made Metal's
+compiler hang for minutes; they are groupshared now.
+
+Measured lossless (bytes, this encoder vs `cjxl -d 0 -e 5`): sveti_stefan_320
+78527 vs 78385 (+0.18 %; fixed trees were 78928), berlin_200 27919 vs 27684
+(+0.85 %; was 28206), sveti_crop_257x129 40947 vs 40975 (−0.07 %),
+sveti_64 3556 vs 3707 (−4 %), berlin_7x5 93 vs 108. The trees have 70–135
+nodes where libjxl's have 129 on the two-group file (389 single-group);
+`SJXL_TREE_THRESHOLD` overrides the node threshold for experiments and the
+decoder prints the global tree's node count under `SJXL_DEBUG`. The
+remaining gap on berlin_200 is where libjxl tries four RCTs per group.
