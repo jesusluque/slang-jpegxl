@@ -54,10 +54,10 @@ per subsystem or milestone, appended to as the work goes. Dates are absolute.
 - **M3 encoder quality**: inverse Gaborish + default LoopFilter, EPF sharpness,
   CfL per tile, adaptive quant field, DCT16/32 strategy search, context
   clustering (≤ 32, fixed-point costs as cujpegxl), ANS for AC.
-- **M4 decoder completeness**: upsampling, splines/noise, alpha and extra
-  channels, >8-bit output, ICC, animation, JPEG recompression. (64–256 px
-  transforms, Modular frames with RCT/palette/Squeeze, lossy modular,
-  patches, progressive passes, DC frames, permuted TOCs: done.)
+- **M4 decoder completeness**: splines, alpha and extra channels, >8-bit
+  output, ICC, animation, JPEG recompression. (64–256 px transforms, Modular
+  frames with RCT/palette/Squeeze, lossy modular, patches, progressive
+  passes, DC frames, permuted TOCs, upsampling, noise: done.)
 - **M5 platforms and speed**: Linux CUDA/Vulkan, async readback, batching,
   per-stage timings here.
 
@@ -334,3 +334,31 @@ a permuted TOC. Three pieces:
 Measured: `-p` at efforts 5 and 7 (distance 1), `-p -d 0 -e 7` and
 `-p -m 1 -d 1 -e 7` on the four test images and a 768 px gradient: within 1
 LSB, lossless bit-exact (`[progressive]` test).
+
+## Upsampling and noise (2026-10-29)
+
+- **Upsampling** (`--resampling=2|4|8`; `upsample.slang`): the frame is coded
+  at ⌈size / N⌉ (`FrameDimensions::Set`), so `ParsedFrame` carries the coded
+  `dim` and the output size `outXsize/outYsize`, and every stage after the
+  loop filters (patches, noise, output, reference planes) runs at the output
+  size with planes padded to `xsizePadded · N`. Each output pixel is a 5×5
+  weighted sum around its source pixel clamped to the window's range; the
+  stored 15 / 55 / 210 weights are the triangular half of the kernels of the
+  top-left sub-positions and the rest follow by the symmetry in
+  `stage_upsampling.cc`, evaluated per tap (`kernelWeight`) rather than
+  expanded. Defaults come from a header generated from libjxl's
+  `image_metadata.cc` (`UpsamplingWeights.h`); custom weights in the metadata
+  replace them. Borders mirror at the coded size.
+- **Noise** (`--photon_noise_iso`; `noise.slang`): three random planes at the
+  output size, one xorshift128+ generator per `group_dim` tile seeded by the
+  visible / nonvisible frame indices and the tile origin (dec_frame.cc counts
+  a displayed frame as visible and resets the other), filled row by row in
+  batches of 16 words (`bits >> 9 | 0x3F800000`, floats in [1, 2)); the 5×5
+  convolution (0.16 × neighbours − 3.84 × centre, mirrored borders); then the
+  strength LUT of 8 points over the intensity (Y ± X) / 2 and the mix with the
+  colour correlation base ratios, in XYB after patches. The LUT (8 × 10 bits /
+  1024) is read in DcGlobal after the patch dictionary.
+
+Measured (`[features]` test): resampling 2, 4 and 8 at distance 1, lossless
+with resampling 2, photon noise at ISO 800–6400, and noise with resampling, on
+three images: within 1 LSB of djxl.

@@ -236,6 +236,7 @@ void decodeModularGlobals(uint3 tid: SV_DispatchThreadID) {
     if ((params.frameFlags & kFramePatches) != 0) {
         readPatchDictionary(d, params.xsize, params.ysize, params.refW, params.refH, window);
     }
+    if (d.error == kErrNone && (params.frameFlags & kFrameNoise) != 0) readNoise(d);
     if (d.error == kErrNone) decodeModularGlobal(d, modularGeom(), window);
     arena[kGsDcGlobalBits] = d.br.pos - sections[0].x;
     if (d.error == kErrNone && params.singleSection != 0) {

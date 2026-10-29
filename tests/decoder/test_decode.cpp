@@ -261,3 +261,35 @@ TEST_CASE("the decoder matches djxl on cjxl's progressive output", "[decoder][co
     WARN(std::format("{} {}: vs djxl PSNR {:.2f} dB, max diff {}", name, options, metrics->psnr, metrics->maxAbsDiff));
     CHECK(metrics->maxAbsDiff <= (options.find("-d 0") != std::string::npos ? 0 : 1));
 }
+
+TEST_CASE("the decoder matches djxl on cjxl's upsampled and noisy output", "[decoder][conformance][cjxl][features]") {
+    const std::filesystem::path djxl = test::findTool("djxl");
+    const std::filesystem::path cjxl = test::findTool("cjxl");
+    if (djxl.empty() || cjxl.empty()) SKIP("cjxl/djxl are not installed");
+    const std::string name = GENERATE(std::string("berlin_200.png"), std::string("sveti_crop_257x129.png"), std::string("sveti_stefan_320.png"));
+    const std::string options = GENERATE(std::string("-d 1 -e 5 --resampling=2"), std::string("-d 1 -e 5 --resampling=4"),
+                                         std::string("-d 1 -e 7 --resampling=8"), std::string("-d 0 -e 7 --resampling=2"),
+                                         std::string("-d 1 -e 5 --photon_noise_iso=3200"), std::string("-d 1 -e 7 --photon_noise_iso=800 --resampling=2"));
+    CAPTURE(name, options);
+    std::string tag = options;
+    for (char& ch : tag) if (ch == ' ' || ch == '-' || ch == '=') ch = '_';
+    const std::filesystem::path jxl = test::scratchDir() / std::format("dec_feat_{}{}.jxl", name, tag);
+    const std::filesystem::path png = test::scratchDir() / std::format("dec_feat_{}{}.djxl.png", name, tag);
+    REQUIRE(test::run(std::format("\"{}\" \"{}\" \"{}\" {} >/dev/null 2>&1", cjxl.string(), test::testData(name).string(), jxl.string(), options)));
+    REQUIRE(test::run(std::format("\"{}\" \"{}\" \"{}\" >/dev/null 2>&1", djxl.string(), jxl.string(), png.string())));
+    auto bytes = image::readFile(jxl);
+    REQUIRE(bytes);
+    auto reference = image::readRgb8(png);
+    REQUIRE(reference);
+    auto ours = decoder().decode(*bytes);
+    if (!ours && ours.error().code() == ErrorCode::Unsupported) {
+        WARN(std::format("{} {}: unsupported: {}", name, options, ours.error().message()));
+        SUCCEED();
+        return;
+    }
+    REQUIRE(ours);
+    auto metrics = test::compare(*reference, *ours);
+    REQUIRE(metrics);
+    WARN(std::format("{} {}: vs djxl PSNR {:.2f} dB, max diff {}", name, options, metrics->psnr, metrics->maxAbsDiff));
+    CHECK(metrics->maxAbsDiff <= 1);
+}

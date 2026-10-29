@@ -49,8 +49,11 @@ private:
     Decoder() = default;
     /// One frame; a reference-only frame stores its planes in `refs`, a DC frame in
     /// `dcFrames[level]`, and both return an empty image.
+    struct FrameIndices {
+        uint32_t visible = 0, nonvisible = 0;   // dec_cache.h: seeds of the noise generators
+    };
     [[nodiscard]] Result<image::Rgb8> run(const codestream::Parsed& parsed, const codestream::ParsedFrame& frame, bool withLz77Windows,
-                                          std::array<RefFrame, 4>& refs, std::array<RefFrame, 5>& dcFrames);
+                                          std::array<RefFrame, 4>& refs, std::array<RefFrame, 5>& dcFrames, FrameIndices indices);
     /// The permutation of a permuted TOC, decoded by a kernel: the order and the bit after it.
     struct TocPermutation {
         std::vector<uint32_t> order;
@@ -61,7 +64,7 @@ private:
     std::shared_ptr<gpu::ShaderLibrary> library_;
     gpu::Device*                        device_ = nullptr;
     gpu::ComputeKernel globals_, dcGroups_, acGroups_, tables_, smoothDc_, computeSigma_, dequantCoeffs_, llfFromDc_, idctRows_, idctCols_, transformSpecial_,
-        gaborish_, epf_, output_, modularGlobals_, modularDcGroups_, modularAcGroups_, modularFinalize_, modularToPlanes_, bucketPatches_, applyPatches_, tocPermutation_, dcFromFrame_;
+        gaborish_, epf_, output_, modularGlobals_, modularDcGroups_, modularAcGroups_, modularFinalize_, modularToPlanes_, bucketPatches_, applyPatches_, tocPermutation_, dcFromFrame_, upsample_, noiseRandom_, noiseConvolve_, noiseAdd_;
     Stats stats_;
 };
 

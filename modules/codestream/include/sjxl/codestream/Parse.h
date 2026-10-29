@@ -73,6 +73,9 @@ struct ImageMetadata {
     std::array<float, 3> opsinBiases{};          // kNegOpsinAbsorbanceBiasRGB
     std::array<float, 4> quantBiases{};          // kDefaultQuantBias
     uint32_t             customWeightsMask = 0;
+    std::array<float, 15>  upsamplingWeights2{};   // custom weights when the mask bit is set (else libjxl's defaults apply)
+    std::array<float, 55>  upsamplingWeights4{};
+    std::array<float, 210> upsamplingWeights8{};
     // Animation header
     uint32_t tpsNumerator = 100, tpsDenominator = 1, numLoops = 0;
     bool     haveTimecodes = false;
@@ -136,6 +139,7 @@ struct ParsedFrame {
     std::vector<Section>  sections;             // logical order (DcGlobal, DC groups, AcGlobal, AC groups per pass)
     bool                  singleSection = false;
     uint32_t              numSections = 0;
+    uint32_t              outXsize = 0, outYsize = 0;   // the frame's size after upsampling (dim is the coded size)
     bool                  tocPermuted = false;    // the TOC starts with an entropy-coded permutation
     size_t                tocPermutationBit = 0;  // its first bit; finishToc() continues from after it
 };

@@ -57,6 +57,7 @@ static const uint kGsPatchRefOff = 57;
 static const uint kGsPatchNumPos = 58;     // positions (4 words: x, y, ref position index, blend mode | clamp << 8)
 static const uint kGsPatchPosOff = 59;
 static const uint kGsArenaTop = 60;        // first free arena word after the globals thread (for later kernels)
+static const uint kGsNoiseLutOff = 62;     // kNoise: 8 floats (DecodeNoise)
 static const uint kMaxPatchRefs = 4096;
 static const uint kMaxPatchPositions = 1u << 16;
 static const uint kPatchRefWords = 5, kPatchPosWords = 4;
@@ -339,10 +340,23 @@ void readPatchDictionary(inout Dec d, uint xsize, uint ysize, uint4 refW, uint4 
 }
 
 static const uint kFramePatches = 2;
+static const uint kFrameNoise = 1;
+
+/// DecodeNoise: eight 10-bit values over 1024.
+void readNoise(inout Dec d) {
+    const uint lut = alloc(d, 8);
+    if (d.error != kErrNone) return;
+    for (uint i = 0; i < 8; ++i) arena[lut + i] = asuint(float(brRead(d.br, 10)) * (1.0f / 1024.0f));
+    arena[kGsNoiseLutOff] = lut;
+}
 
 void decodeDcGlobal(inout Dec d, uint windowOff, uint frameFlags, uint xsize, uint ysize, uint4 refW, uint4 refH) {
     if ((frameFlags & kFramePatches) != 0) {
         readPatchDictionary(d, xsize, ysize, refW, refH, windowOff);
+        if (d.error != kErrNone) return;
+    }
+    if ((frameFlags & kFrameNoise) != 0) {
+        readNoise(d);
         if (d.error != kErrNone) return;
     }
     readDequantDc(d);

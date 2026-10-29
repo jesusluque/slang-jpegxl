@@ -1,6 +1,8 @@
 // Copyright (c) 2026 jesus luque.
 #include "sjxl/decoder/Decoder.h"
 
+#include "sjxl/codestream/UpsamplingWeights.h"
+
 #include <cmath>
 #include <cstring>
 #include <format>
@@ -65,6 +67,10 @@ Result<std::unique_ptr<Decoder>> Decoder::create(std::shared_ptr<gpu::ShaderLibr
     SJXL_ASSIGN(dec->modularFinalize_, gpu::ComputeKernel::create(lib, "sjxl/dec/sections", "modularFinalizeFrame"));
     SJXL_ASSIGN(dec->modularToPlanes_, gpu::ComputeKernel::create(lib, "sjxl/dec/modular_out", "modularToPlanes"));
     SJXL_ASSIGN(dec->tocPermutation_, gpu::ComputeKernel::create(lib, "sjxl/dec/toc", "decodeTocPermutation"));
+    SJXL_ASSIGN(dec->upsample_, gpu::ComputeKernel::create(lib, "sjxl/dec/upsample", "upsample"));
+    SJXL_ASSIGN(dec->noiseRandom_, gpu::ComputeKernel::create(lib, "sjxl/dec/noise", "noiseRandom"));
+    SJXL_ASSIGN(dec->noiseConvolve_, gpu::ComputeKernel::create(lib, "sjxl/dec/noise", "noiseConvolve"));
+    SJXL_ASSIGN(dec->noiseAdd_, gpu::ComputeKernel::create(lib, "sjxl/dec/noise", "noiseAdd"));
     SJXL_ASSIGN(dec->dcFromFrame_, gpu::ComputeKernel::create(lib, "sjxl/dec/dc_finalize", "dcFromFrame"));
     SJXL_ASSIGN(dec->bucketPatches_, gpu::ComputeKernel::create(lib, "sjxl/dec/patches", "bucketPatches"));
     SJXL_ASSIGN(dec->applyPatches_, gpu::ComputeKernel::create(lib, "sjxl/dec/patches", "applyPatches"));
@@ -88,10 +94,14 @@ Result<image::Rgb8> Decoder::decode(std::span<const uint8_t> file) {
     std::array<RefFrame, 4> refs;
     std::array<RefFrame, 5> dcFrames;
     image::Rgb8 image;
+    FrameIndices indices;
     for (const codestream::ParsedFrame& frame : parsed.frames) {
-        auto result = run(parsed, frame, false, refs, dcFrames);
+        // dec_frame.cc: a displayed frame bumps the visible index and resets the other.
+        if (frame.header.frameType == 0 && frame.header.isLast) { ++indices.visible; indices.nonvisible = 0; }
+        else ++indices.nonvisible;
+        auto result = run(parsed, frame, false, refs, dcFrames, indices);
         if (!result && result.error().code() == ErrorCode::Unsupported && result.error().message() == "LZ77 window") {
-            result = run(parsed, frame, true, refs, dcFrames);
+            result = run(parsed, frame, true, refs, dcFrames, indices);
         }
         if (!result) return result.error();
         image = std::move(*result);
@@ -126,7 +136,7 @@ Result<Decoder::TocPermutation> Decoder::decodeTocPermutation(const codestream::
 }
 
 Result<image::Rgb8> Decoder::run(const codestream::Parsed& parsed, const codestream::ParsedFrame& frame, bool withLz77Windows,
-                                 std::array<RefFrame, 4>& refs, std::array<RefFrame, 5>& dcFrames) {
+                                 std::array<RefFrame, 4>& refs, std::array<RefFrame, 5>& dcFrames, FrameIndices indices) {
     gpu::Device& dev = *device_;
     const codestream::ImageMetadata& m = parsed.metadata;
     const bool referenceOnly = frame.header.frameType == 2;
@@ -198,9 +208,15 @@ Result<image::Rgb8> Decoder::run(const codestream::Parsed& parsed, const codestr
     const uint64_t planePixels = uint64_t{dim.xsizePadded} * dim.ysizePadded;
     SJXL_ASSIGN(auto xybA, gpu::Buffer::ofType<float>(dev, 3 * planePixels, "dec.xybA"));
     SJXL_ASSIGN(auto xybB, gpu::Buffer::ofType<float>(dev, 3 * planePixels, "dec.xybB"));
-    const uint32_t outBytes = dim.xsize * dim.ysize * 3;
+    // After upsampling the frame is outWidth x outHeight; the later stages run at that size.
+    const uint32_t upsampling = frame.header.upsampling;
+    const uint32_t upShift = upsampling == 8 ? 3 : upsampling == 4 ? 2 : upsampling == 2 ? 1 : 0;
+    const uint32_t outWidth = frame.outXsize, outHeight = frame.outYsize;
+    const uint32_t outPaddedWidth = dim.xsizePadded * upsampling, outPaddedHeight = dim.ysizePadded * upsampling;
+    const uint32_t outBytes = outWidth * outHeight * 3;
     SJXL_ASSIGN(auto rgb8, gpu::Buffer::ofType<uint32_t>(dev, (outBytes + 3) / 4, "dec.rgb8"));
     SJXL_ASSIGN(auto dummy, gpu::Buffer::ofType<float>(dev, 4, "dec.dummy"));   // stands in for absent optional inputs
+    std::optional<gpu::Buffer> weightsKeep;   // the upsampling weights live until the batch ran
 
     gpu::CommandBatch batch(dev);
 
@@ -407,6 +423,35 @@ Result<image::Rgb8> Decoder::run(const codestream::Parsed& parsed, const codestr
         epf_.dispatch(batch, {dim.xsize, dim.ysize, 1}, [&](rhi::ShaderCursor c) { bindFilter(c, 2, lf.epfPass2SigmaScale * 1.65f); });
         std::swap(src, dst);
     }
+    // Upsampling (after the loop filters, before patches: render pipeline order).
+    std::optional<gpu::Buffer> upsampled;
+    if (upsampling > 1) {
+        SJXL_ASSIGN(upsampled, gpu::Buffer::ofType<float>(dev, uint64_t{3} * outPaddedWidth * outPaddedHeight, "dec.upsampled"));
+        std::vector<float> w(280);
+        std::copy(codestream::kUpsampling2.begin(), codestream::kUpsampling2.end(), w.begin());
+        std::copy(codestream::kUpsampling4.begin(), codestream::kUpsampling4.end(), w.begin() + 15);
+        std::copy(codestream::kUpsampling8.begin(), codestream::kUpsampling8.end(), w.begin() + 70);
+        if (m.customWeightsMask & 1) std::copy(m.upsamplingWeights2.begin(), m.upsamplingWeights2.end(), w.begin());
+        if (m.customWeightsMask & 2) std::copy(m.upsamplingWeights4.begin(), m.upsamplingWeights4.end(), w.begin() + 15);
+        if (m.customWeightsMask & 4) std::copy(m.upsamplingWeights8.begin(), m.upsamplingWeights8.end(), w.begin() + 70);
+        SJXL_ASSIGN(auto weights, gpu::Buffer::fromSpan<float>(dev, w, "dec.upsWeights"));
+        upsample_.dispatch(batch, {outWidth, outHeight, 1}, [&](rhi::ShaderCursor c) {
+            c["src"].setBinding(src->rhi());
+            c["dst"].setBinding(upsampled->rhi());
+            c["weights"].setBinding(weights.rhi());
+            c["params"]["width"].setData(dim.xsize);
+            c["params"]["height"].setData(dim.ysize);
+            c["params"]["paddedWidth"].setData(dim.xsizePadded);
+            c["params"]["paddedHeight"].setData(dim.ysizePadded);
+            c["params"]["outWidth"].setData(outWidth);
+            c["params"]["outHeight"].setData(outHeight);
+            c["params"]["outPaddedWidth"].setData(outPaddedWidth);
+            c["params"]["outPaddedHeight"].setData(outPaddedHeight);
+            c["params"]["shift"].setData(upShift);
+        });
+        weightsKeep = std::move(weights);
+        src = &*upsampled;
+    }
     if (frame.header.flags & codestream::FrameHeader::kPatches) {
         // After the loop filters, before the colour transform (render pipeline order).
         const auto bindPatches = [&](rhi::ShaderCursor c) {
@@ -419,24 +464,47 @@ Result<image::Rgb8> Decoder::run(const codestream::Parsed& parsed, const codestr
                 pw[i] = refs[i].paddedWidth;
                 ph[i] = refs[i].paddedHeight;
             }
-            c["params"]["width"].setData(dim.xsize);
-            c["params"]["height"].setData(dim.ysize);
-            c["params"]["paddedWidth"].setData(dim.xsizePadded);
-            c["params"]["paddedHeight"].setData(dim.ysizePadded);
+            c["params"]["width"].setData(outWidth);
+            c["params"]["height"].setData(outHeight);
+            c["params"]["paddedWidth"].setData(outPaddedWidth);
+            c["params"]["paddedHeight"].setData(outPaddedHeight);
             c["params"]["arenaCap"].setData(globalsWords);
             c["params"]["refPaddedW"].setData(pw);
             c["params"]["refPaddedH"].setData(ph);
         };
         bucketPatches_.dispatch(batch, {1, 1, 1}, bindPatches);
-        applyPatches_.dispatch(batch, {dim.xsize * dim.ysize, 1, 1}, bindPatches);
+        applyPatches_.dispatch(batch, {outWidth * outHeight, 1, 1}, bindPatches);
+    }
+    // Noise, after patches and before the colour transform.
+    std::optional<gpu::Buffer> noiseA, noiseB;
+    if (frame.header.flags & codestream::FrameHeader::kNoise) {
+        SJXL_ASSIGN(noiseA, gpu::Buffer::ofType<float>(dev, uint64_t{3} * outPaddedWidth * outPaddedHeight, "dec.noiseA"));
+        SJXL_ASSIGN(noiseB, gpu::Buffer::ofType<float>(dev, uint64_t{3} * outPaddedWidth * outPaddedHeight, "dec.noiseB"));
+        const auto bindNoise = [&](rhi::ShaderCursor c) {
+            c["arena"].setBinding(arena.rhi());
+            c["noise"].setBinding(noiseA->rhi());
+            c["conv"].setBinding(noiseB->rhi());
+            c["xyb"].setBinding(src->rhi());
+            c["params"]["width"].setData(outWidth);
+            c["params"]["height"].setData(outHeight);
+            c["params"]["paddedWidth"].setData(outPaddedWidth);
+            c["params"]["paddedHeight"].setData(outPaddedHeight);
+            c["params"]["groupDim"].setData(dim.groupDim);
+            c["params"]["visibleFrame"].setData(indices.visible);
+            c["params"]["nonvisibleFrame"].setData(indices.nonvisible);
+        };
+        const uint32_t tilesX = (outWidth + dim.groupDim - 1) / dim.groupDim, tilesY = (outHeight + dim.groupDim - 1) / dim.groupDim;
+        noiseRandom_.dispatch(batch, {tilesX, tilesY, 1}, bindNoise);
+        noiseConvolve_.dispatch(batch, {outWidth, outHeight, 1}, bindNoise);
+        noiseAdd_.dispatch(batch, {outWidth, outHeight, 1}, bindNoise);
     }
     if (!referenceOnly && !dcFrame) output_.dispatch(batch, {(outBytes + 3) / 4, 1, 1}, [&](rhi::ShaderCursor c) {
         c["xyb"].setBinding(src->rhi());
         c["rgb8"].setBinding(rgb8.rhi());
-        c["params"]["width"].setData(dim.xsize);
-        c["params"]["height"].setData(dim.ysize);
-        c["params"]["paddedWidth"].setData(dim.xsizePadded);
-        c["params"]["paddedHeight"].setData(dim.ysizePadded);
+        c["params"]["width"].setData(outWidth);
+        c["params"]["height"].setData(outHeight);
+        c["params"]["paddedWidth"].setData(outPaddedWidth);
+        c["params"]["paddedHeight"].setData(outPaddedHeight);
         const float scale = 255.0f / m.intensityTarget;
         for (int r = 0; r < 3; ++r) {
             for (int k = 0; k < 3; ++k) c["params"]["inverseMatrix"][r * 4 + k].setData(m.opsinInverseMatrix[static_cast<size_t>(r * 3 + k)] * scale);
@@ -491,10 +559,10 @@ Result<image::Rgb8> Decoder::run(const codestream::Parsed& parsed, const codestr
         // (a reference frame for patches, or the DC image of the frame one level down).
         RefFrame& ref = referenceOnly ? refs[frame.header.saveAsReference] : dcFrames[frame.header.dcLevel];
         ref.planes.emplace(std::move(*src));
-        ref.paddedWidth = dim.xsizePadded;
-        ref.paddedHeight = dim.ysizePadded;
-        ref.width = dim.xsize;
-        ref.height = dim.ysize;
+        ref.paddedWidth = outPaddedWidth;
+        ref.paddedHeight = outPaddedHeight;
+        ref.width = outWidth;
+        ref.height = outHeight;
         return image::Rgb8{};
     }
 
@@ -584,8 +652,8 @@ Result<image::Rgb8> Decoder::run(const codestream::Parsed& parsed, const codestr
     }
     SJXL_ASSIGN(const std::vector<uint32_t> words, rgb8.readAll<uint32_t>(dev));
     image::Rgb8 out;
-    out.width = dim.xsize;
-    out.height = dim.ysize;
+    out.width = outWidth;
+    out.height = outHeight;
     out.pixels.resize(outBytes);
     std::memcpy(out.pixels.data(), words.data(), outBytes);
     return out;

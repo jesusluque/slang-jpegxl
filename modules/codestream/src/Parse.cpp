@@ -225,9 +225,9 @@ Result<void> readTransformData(BitReader& br, ImageMetadata& m) {
         }
     }
     m.customWeightsMask = br.read(3);
-    if (m.customWeightsMask & 1) for (int i = 0; i < 15; ++i) SJXL_TRY(br.readF16());
-    if (m.customWeightsMask & 2) for (int i = 0; i < 55; ++i) SJXL_TRY(br.readF16());
-    if (m.customWeightsMask & 4) for (int i = 0; i < 210; ++i) SJXL_TRY(br.readF16());
+    if (m.customWeightsMask & 1) for (float& w : m.upsamplingWeights2) { SJXL_ASSIGN(w, br.readF16()); }
+    if (m.customWeightsMask & 2) for (float& w : m.upsamplingWeights4) { SJXL_ASSIGN(w, br.readF16()); }
+    if (m.customWeightsMask & 4) for (float& w : m.upsamplingWeights8) { SJXL_ASSIGN(w, br.readF16()); }
     return ok();
 }
 
@@ -501,9 +501,8 @@ Result<void> parseFramesFrom(Parsed& p, size_t startByte) {
             if (dcFrame) return unsupported("VarDCT DC frames");
         }
         if (f.frameType == 3) return unsupported("skip-progressive frames");
-        if (f.flags & FrameHeader::kNoise) return unsupported("noise synthesis");
         if (f.flags & FrameHeader::kSplines) return unsupported("splines");
-        if (f.upsampling != 1) return unsupported("upsampling");
+        if (f.upsampling != 1 && f.upsampling != 2 && f.upsampling != 4 && f.upsampling != 8) return corrupt("upsampling factor");
         if (f.customSizeOrOrigin && !referenceOnly) return unsupported("frames with a custom size or origin");
         if (referenceOnly) {
             if (!f.saveBeforeColorTransform) return unsupported("reference frames saved after the colour transform");
@@ -525,6 +524,11 @@ Result<void> parseFramesFrom(Parsed& p, size_t startByte) {
             fx = (fx + (1u << (3 * f.dcLevel)) - 1) >> (3 * f.dcLevel);
             fy = (fy + (1u << (3 * f.dcLevel)) - 1) >> (3 * f.dcLevel);
         }
+        frame.outXsize = fx;
+        frame.outYsize = fy;
+        // FrameDimensions::Set: the frame is coded at 1 / upsampling of its size.
+        fx = (fx + f.upsampling - 1) / f.upsampling;
+        fy = (fy + f.upsampling - 1) / f.upsampling;
         frame.dim = frameDim(fx, fy, f.groupSizeShift);
         // toc.h NumTocEntries: one entry for one group and one pass; else DcGlobal,
         // DC groups, AcGlobal, then the AC groups of every pass.
@@ -584,7 +588,6 @@ Result<Parsed> parse(std::span<const uint8_t> file) {
     if (m.haveAnimation) return unsupported("animation");
     if (m.orientation != 1) return unsupported("orientation other than identity");
     if (m.bitsPerSample > 16 || m.floatingPointSample) return unsupported("floating point or >16-bit samples");
-    if (m.customWeightsMask != 0) return unsupported("custom upsampling weights");
     if (!m.tfHaveGamma && m.transferFunction != 13 && m.transferFunction != 8 && m.transferFunction != 17) {
         return unsupported("transfer functions other than sRGB, linear, gamma and DCI (PQ/HLG/709)");
     }
