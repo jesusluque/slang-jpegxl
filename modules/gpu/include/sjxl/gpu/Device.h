@@ -69,9 +69,14 @@ public:
     [[nodiscard]] rhi::IDevice* rhi() const noexcept { return device_.get(); }
     [[nodiscard]] rhi::ICommandQueue* queue() const noexcept { return queue_.get(); }
     [[nodiscard]] slang::ISession* slangSession() const noexcept { return session_.get(); }
+    /// Submits an empty command buffer without waiting: the queue's first use costs
+    /// tens of milliseconds on Metal, which this lets overlap with the caller's CPU work.
+    void warmUp();
 
     /// The directories Slang searches, in order, the codec's shaders first.
     [[nodiscard]] const std::vector<std::string>& shaderSearchPaths() const noexcept { return searchPaths_; }
+    /// Where ShaderLibrary keeps precompiled Slang modules (empty: no cache).
+    [[nodiscard]] const std::filesystem::path& moduleCacheDirectory() const noexcept { return moduleCacheDir_; }
 
     /// Blocks until everything submitted has run. A command buffer that
     /// failed meanwhile is not lost: the next CommandBatch::submit reports it
@@ -96,6 +101,7 @@ private:
     Backend                            backend_ = Backend::Metal;
     Caps                               caps_;
     std::vector<std::string>           searchPaths_;
+    std::filesystem::path              moduleCacheDir_;
     rhi::ComPtr<rhi::IPersistentCache> shaderCache_;
     rhi::ComPtr<rhi::IDevice>          device_;
     rhi::ComPtr<rhi::ICommandQueue>    queue_;

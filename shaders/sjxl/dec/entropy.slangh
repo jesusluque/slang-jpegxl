@@ -641,6 +641,7 @@ void aliasSet(uint off, uint i, uint cutoff, uint right, uint freq0, uint offset
 /// written at tableOff (2 words per entry). False on an invalid distribution.
 bool initAliasTable(inout Dec d, uint countsOff, uint length, uint logAlpha, uint tableOff) {
     const uint tableSize = 1u << logAlpha;
+    if ((gPerfSkip & 64) != 0) return true;   // timing experiment
     while (length > 0 && arena[countsOff + length - 1] == 0) --length;
     if (length == 0) {
         arena[countsOff] = kAnsTabSize;
@@ -733,6 +734,7 @@ static const uint kCsSize = 12;
 void inverseMtf(inout Dec d, uint mapOff, uint n) {
     const uint mtfOff = alloc(d, 256);
     if (d.error != kErrNone) return;
+    if ((gPerfSkip & 32) != 0) return;   // timing experiment
     for (uint i = 0; i < 256; ++i) arena[mtfOff + i] = i;
     for (uint i = 0; i < n; ++i) {
         const uint index = arena[mapOff + i];

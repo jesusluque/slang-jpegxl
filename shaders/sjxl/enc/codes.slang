@@ -74,6 +74,8 @@ struct CodeParams {
     uint lz77Modular;     // modular frames: the set carries run-length tokens (an extra distance context)
     uint modLogAlpha;     // modular frames: the set's log_alpha_size
     uint histogramTries;  // ANS histogram precisions tried (7: libjxl's approximate strategy); runtime so no unrolling
+    uint prepRegions;     // prepareHistograms: code regions to prepare (sets x kAcClusters)
+    uint prepModular;     // 1: one set (the modular frame's) at modLogAlpha
     uint jpeg;            // JPEG recompression: custom DC quant, zero DC chroma-from-luma, the raw DCT table
     uint qtRegion;        // the code region of the quant table stream
     uint qtCount;         // samples of the raw table (192); runtime so the writer's loops are not unrolled
@@ -113,6 +115,7 @@ StructuredBuffer<uint>     bctxMap;       // JPEG recompression: jpegBlockCtx's 
 RWStructuredBuffer<uint>   ctxMapMtf;  // scratch: the context map after the move-to-front transform
 RWStructuredBuffer<uint>   ansInfo;    // ANS symbol info per code region (the context map's code is region kAcClusters)
 RWStructuredBuffer<uint>   ansReverse; // ANS reverse maps per code region
+RWStructuredBuffer<uint>   histPrep;      // prepareHistograms: per code region kPrepStride words: normalised counts, length, shift, flat
 StructuredBuffer<int>      planes;     // modular: 3 * width * height channel values
 StructuredBuffer<uint>     treeNodes;  // modular: the fixed tree, kModTreeWords per node
 StructuredBuffer<uint>     modTokens;  // modular: ctx << 18 | value per channel sample
@@ -574,11 +577,61 @@ void writeHistogramSetLz77(RWStructuredBuffer<uint> buf, inout SerialWriter w, u
         encodeUintConfigAt(buf, w, logAlpha, cfg & 0xFFu, (cfg >> 8) & 0xFFu, (cfg >> 16) & 0xFFu);
     }
     for (uint c = 0; c < numClusters; ++c) {
-        const uint length = loadHistogram((regionBase + c) * kCodeStride);
-        for (uint i = 0; i < kMaxAlphabet; ++i) gAnsCounts[i] = gHist[i];
-        ansWriteBestHistogram(buf, w, length, params.histogramTries);
-        ansBuildTables(ansInfo, ansReverse, regionBase + c, length, logAlpha);
+        // The histogram as prepareHistograms normalised it (its tables are built there too).
+        const uint prep = (regionBase + c) * kPrepStride;
+        for (uint i = 0; i < kMaxAlphabet; ++i) gAnsCounts[i] = histPrep[prep + i];
+        ansWriteHistogramAt(buf, w, histPrep[prep + 256], histPrep[prep + 257], histPrep[prep + 258] != 0, false);
     }
+}
+
+static const uint kPrepStride = 260;
+
+/// The ANS alphabet of a histogram set: 64 symbols for the AC and AcMetadata sets,
+/// 128 for the DC sets, the frame's for the extra channel and modular sets.
+uint setLogAlpha(uint set) {
+    if (params.prepModular != 0) return params.modLogAlpha;
+    if (set < params.numAcSets) return kAcLogAlpha;
+    if (set >= ecSet()) return params.ecLogAlpha;
+    return ((set - params.numAcSets) & 1) == 0 ? 7 : 6;
+}
+
+/// One thread group per code region: the cluster's histogram normalised in its
+/// cheapest form (ansWriteBestHistogram's choice) into histPrep, and its alias and
+/// reverse tables. What the blob writers used to do in sequence for every cluster.
+[shader("compute")]
+[numthreads(1, 1, 1)]
+void prepareHistograms(uint3 gid: SV_GroupID) {
+    const uint r = gid.x;
+    if (r >= params.prepRegions) return;
+    const uint set = r / kAcClusters, c = r % kAcClusters;
+    if (c >= clusterInfo[set]) return;
+    const uint logAlpha = setLogAlpha(set);
+    const uint length = loadHistogram(r * kCodeStride);
+    uint numSymbols = 0;
+    for (uint s = 0; s < 256; ++s) {
+        gAnsRaw[s] = s < length ? gHist[s] : 0;
+        if (gAnsRaw[s] != 0) ++numSymbols;
+    }
+    uint shift;
+    bool flat;
+    ansBestHistogramChoice(blobs, length, numSymbols, params.histogramTries, shift, flat);
+    if (numSymbols <= 2) {
+        shift = kAnsLogTabSize - 1;
+        flat = false;
+        ansNormalizeShift(length, shift);
+    } else if (flat) {
+        const uint base = kAnsTabSize / length, rem = kAnsTabSize % length;
+        for (uint s = 0; s < 256; ++s) gAnsCounts[s] = s < length ? base + (s < rem ? 1 : 0) : 0;
+        shift = 0;
+    } else {
+        ansNormalizeShift(length, shift);
+    }
+    const uint prep = r * kPrepStride;
+    for (uint i = 0; i < 256; ++i) histPrep[prep + i] = i < length ? gAnsCounts[i] : 0;
+    histPrep[prep + 256] = length;
+    histPrep[prep + 257] = shift;
+    histPrep[prep + 258] = flat ? 1u : 0u;
+    ansBuildTables(ansInfo, ansReverse, r, length, logAlpha);
 }
 
 void writeHistogramSet(RWStructuredBuffer<uint> buf, inout SerialWriter w, uint numContexts, uint numClusters, uint logAlpha, uint set) {

@@ -6,4 +6,5 @@ sjxl_add_module(image
     PUBLIC_LIBS
         sjxl::core
     PRIVATE_LIBS
-        sjxl_stb)
+        sjxl_stb
+        ZLIB::ZLIB)

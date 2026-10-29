@@ -93,6 +93,9 @@ public:
     /// (baseline Huffman scans). Lossless in the coefficients, as cjxl does.
     [[nodiscard]] Result<std::vector<uint8_t>> encodeJpeg(const image::JpegFile& jpeg, const Options& options);
     [[nodiscard]] const Stats& stats() const noexcept { return stats_; }
+    /// Starts the GPU's first-use costs (pipeline compiler, queue) so they overlap the
+    /// caller's remaining CPU work, such as reading the input image.
+    void warmUp();
 
 private:
     Encoder() = default;
@@ -137,7 +140,7 @@ private:
     gpu::ComputeKernel                  rgbToXyb_, aqDiff_, aqMap_, aqRawField_;
     gpu::ComputeKernel                  gaborishInverse_, cflTile_, quantize_;
     gpu::ComputeKernel                  tables_, buildOrders_, selectStrategies_, largeQf_, largeRows_, largeCols_, mergeLarge_, adjustQuantField_, dctRows_, dctCols_, dcFromLlf_, specialTransform_, passNonZeroCount_, acTokenize_;
-    gpu::ComputeKernel                  dcTokenize_, dcTokenCount_, metaTokenize_, dcGroupSections_, clusterContexts_, accumulateClusters_, acSections_;
+    gpu::ComputeKernel                  prepareHistograms_, dcTokenize_, dcTokenCount_, metaTokenize_, dcGroupSections_, clusterContexts_, accumulateClusters_, acSections_;
     gpu::ComputeKernel                  propStats_, propThresholds_, treeHistograms_, treeSplit_, treeAssign_, modSamples_, modTokenizeTree_;
     gpu::ComputeKernel                  unpackPlanes_, rctCost_, rctApply_, dcFramePlanes_, modTokenize_, modTokenCount_, rleTotals_;
     gpu::ComputeKernel                  paletteCount_, paletteBuild_, paletteIndex_, paletteVerify_, compactStats_, compactBuild_, compactApply_;

@@ -246,27 +246,36 @@ void selectStrategies(uint3 gid: SV_GroupID, uint3 gtid: SV_GroupThreadID) {
                 gTmp[(y0 + y) * 32 + x0 + u] = sum;
             }
             GroupMemoryBarrierWithGroupSync();
-            // Column pass, quantisation and cost.
-            for (uint o = tid; o < 1024; o += kThreads) {
-                const uint vb = o / size, local = o % size;
-                const uint cand = kFamBase[fam] + vb;
-                const uint x0 = (vb % nvx) * nx, y0 = (vb / nvx) * ny;
-                const uint v = local / nx, u = local % nx;
-                float coef = 0.0f;
-                for (uint y = 0; y < ny; ++y) coef += gTmp[(y0 + y) * 32 + x0 + u] * basis(ny, v, y);
-                if (c == 1) gYCoef[o] = coef;
-                if (gValid[cand] == 0) continue;
-                if (v < cy && u < cx) continue;   // lowest frequencies: coded as DC
-                const uint m = memIndex(v, u, ny, nx);
-                const float quantMul = gQf[cand];
-                const float val = (coef - cmapFactor[c] * gYCoef[o]) * quantMul / dequant[tableBase + c * size + m];
-                const float q = quantise(val, v < ny / 2 && u < nx / 2);
-                const float err = val - q;
-                const float w = c == 0 ? wX : 1.0f;
+            // Column pass, quantisation and cost. Each thread takes four consecutive
+            // coefficients, which lie in one varblock (every family's varblock has at least
+            // 64), and adds its per-coefficient fixed-point terms to the candidate once.
+            {
+                const uint cand = kFamBase[fam] + (tid * 4) / size;
+                uint sumBits = 0, sumDist = 0, sumNz = 0;
+                for (uint k = 0; k < 4; ++k) {
+                    const uint o = tid * 4 + k;
+                    const uint vb = o / size, local = o % size;
+                    const uint x0 = (vb % nvx) * nx, y0 = (vb / nvx) * ny;
+                    const uint v = local / nx, u = local % nx;
+                    float coef = 0.0f;
+                    for (uint y = 0; y < ny; ++y) coef += gTmp[(y0 + y) * 32 + x0 + u] * basis(ny, v, y);
+                    if (c == 1) gYCoef[o] = coef;
+                    if (gValid[cand] == 0) continue;
+                    if (v < cy && u < cx) continue;   // lowest frequencies: coded as DC
+                    const uint m = memIndex(v, u, ny, nx);
+                    const float quantMul = gQf[cand];
+                    const float val = (coef - cmapFactor[c] * gYCoef[o]) * quantMul / dequant[tableBase + c * size + m];
+                    const float q = quantise(val, v < ny / 2 && u < nx / 2);
+                    const float err = val - q;
+                    const float w = c == 0 ? wX : 1.0f;
+                    sumBits += uint(w * entropyOf(q) * kCostScale);
+                    sumDist += uint(w * min(err * err, 64.0f) * kCostScale);
+                    if (q != 0.0f) ++sumNz;
+                }
                 uint before;
-                InterlockedAdd(gBits[cand], uint(w * entropyOf(q) * kCostScale), before);
-                InterlockedAdd(gDist[cand], uint(w * min(err * err, 64.0f) * kCostScale), before);
-                if (q != 0.0f) InterlockedAdd(gNz[c * kNumCandidates + cand], 1u, before);
+                if (sumBits != 0) InterlockedAdd(gBits[cand], sumBits, before);
+                if (sumDist != 0) InterlockedAdd(gDist[cand], sumDist, before);
+                if (sumNz != 0) InterlockedAdd(gNz[c * kNumCandidates + cand], sumNz, before);
             }
             GroupMemoryBarrierWithGroupSync();
         }

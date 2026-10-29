@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <format>
+#include <future>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -165,14 +166,17 @@ int encode(int argc, char** argv) {
                     100.0 * static_cast<double>(bytes->size()) / static_cast<double>(jpeg->data.size()), ms);
         return 0;
     }
-    // Alpha and 16-bit samples are kept in both modes.
-    auto image = sjxl::image::readImage(argv[2]);
-    if (!image) return fail(image.error());
+    // Alpha and 16-bit samples are kept in both modes. The image is read while the
+    // device, the encoder and the GPU's first-use costs come up.
+    auto imageRead = std::async(std::launch::async, [path = std::string(argv[2])] { return sjxl::image::readImage(path); });
     auto device = sjxl::gpu::Device::create();
     if (!device) return fail(device.error());
     auto library = std::make_shared<sjxl::gpu::ShaderLibrary>(*device);
     auto encoder = sjxl::enc::Encoder::create(library);
     if (!encoder) return fail(encoder.error());
+    (*encoder)->warmUp();
+    auto image = imageRead.get();
+    if (!image) return fail(image.error());
     const auto start = std::chrono::steady_clock::now();
     auto bytes = (*encoder)->encode(*image, options);
     if (!bytes) return fail(bytes.error());
@@ -236,6 +240,7 @@ int decode(int argc, char** argv) {
     auto library = std::make_shared<sjxl::gpu::ShaderLibrary>(*device);
     auto decoder = sjxl::dec::Decoder::create(library);
     if (!decoder) return fail(decoder.error());
+    (*decoder)->warmUp();
     phase("decoder create");
     const auto start = std::chrono::steady_clock::now();
     auto frames = (*decoder)->decodeAll(*bytes);

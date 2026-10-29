@@ -54,6 +54,8 @@ public:
     /// Every displayed frame, composited; one for a still image.
     [[nodiscard]] Result<std::vector<Frame>> decodeAll(std::span<const uint8_t> file);
     [[nodiscard]] const Stats& stats() const noexcept { return stats_; }
+    /// Starts the GPU's first-use costs so they overlap the caller's CPU work.
+    void warmUp();
 
 private:
     Decoder() = default;

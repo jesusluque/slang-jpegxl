@@ -1809,3 +1809,47 @@ for the four paths; the remaining fixed costs are the device (65 ms), the
 pipelines a run uses (about 140 ms) and the PNG I/O (135 ms write, 40 ms
 read), none of them the codec. The build preset for measurements is the
 release one from here on.
+
+## Process start-up: precompiled modules, zlib PNGs, overlapped warm-up (2026-10-29)
+
+Per-kernel timing of the first dispatch showed that the 140 ms of "pipeline
+loads" were Slang's front end re-parsing the modules from source on every run
+(`sections.slang` alone 80 ms); the slang-rhi disk cache only covers the
+backend code. `ShaderLibrary` now keeps precompiled modules (`IModule::serialize`
+→ `loadModuleFromIRBlob`) under the cache directory, keyed by a hash of every
+shader source plus the Slang version: the loads fell to about 10 ms per run.
+The PNG writer uses zlib (level 1, Sub filter) instead of stb's deflate:
+128 → 64 ms and a smaller file. The first GPU submit of a process costs about
+27 ms and the first pipeline about 13 ms (Metal's start-up): `Device::warmUp`
+and the codecs' `warmUp` start them without waiting, and the CLI reads the
+input image on a worker thread meanwhile, so the encode hides them; the
+decode has no CPU work to hide them behind.
+
+1920x1080, release, wall clock end to end: lossy encode 607 → 288 ms,
+lossy decode 568 → 264 ms, lossless encode 623 → 293 ms, lossless decode
+585 → 265 ms. A decode is now device 66 ms (the Slang session), warm-up
+27 ms, the codec 77 ms, the PNG write 64 ms and process start; cjxl / djxl
+82-102 ms. `SJXL_TIMING=1` lists the phases and any kernel whose load or
+pipeline took over 2 ms.
+
+## The encoder's histogram writers in parallel (2026-10-29)
+
+With the chains on the CPU, the encoder's three blob kernels (`buildDcGroupPre`,
+`buildDcGroupMid`, `buildGlobalBlobs`: 25 + 13 + 30 ms on 1080p) were its
+largest single-thread cost. Most of it was per cluster: the search for the
+cheapest histogram form (seven precisions and the flat form, each a dry run
+of the writer), the normalisation, and the alias and reverse tables (4096
+entries per cluster), done one cluster after another. `prepareHistograms`
+now does that with one thread group per code region (32 per set, all sets
+at once) into `histPrep` (normalised counts, length, shift, flat) and builds
+the ANS tables there; the blob writers copy the prepared counts and write
+each histogram once. Files are byte-identical (same tables, same forms).
+Blobs 68 → 16 ms; the 1080p lossy encode pipeline 170 → 133 ms, the lossless
+one 154 → 127 ms (release).
+
+What is left in the lossy encode: the strategy pass (two kernels, 55 ms: a
+thread group per 32x32 superblock whose per-coefficient shared-memory atomics
+could be cut fourfold by giving each thread consecutive coefficients of one
+varblock), quantisation and AC tokens 14 ms, the first CfL pass 8 ms. In the
+lossless encode the CPU tokeniser is 43 ms and the sampler 27 ms on 40 tasks
+(about 80 ns per sample per core), the tree learning 22 ms.

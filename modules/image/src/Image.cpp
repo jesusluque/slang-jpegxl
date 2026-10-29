@@ -15,6 +15,8 @@
 #define STBI_NO_PIC
 #define STBI_NO_PSD
 #include <stb_image.h>
+#include <zlib.h>
+
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include <stb_image_write.h>
 
@@ -171,6 +173,38 @@ Result<void> writePng16(const std::filesystem::path& path, const Rgb8& image) {
     return writeFile(path, png);
 }
 
+/// An 8-bit PNG: Sub-filtered rows through zlib at level 1 (stb's own deflate took
+/// 150 ms on a 1080p image, more than the decode; zlib takes a third of that).
+Result<void> writePng8(const std::filesystem::path& path, const Rgb8& image) {
+    const size_t bpp = image.channels;
+    const size_t rowBytes = size_t{image.width} * bpp;
+    std::vector<uint8_t> raw((rowBytes + 1) * image.height);
+    for (uint32_t y = 0; y < image.height; ++y) {
+        const uint8_t* row = image.pixels.data() + y * rowBytes;
+        uint8_t* out = raw.data() + y * (rowBytes + 1);
+        out[0] = 1;   // filter: Sub
+        for (size_t i = 0; i < bpp && i < rowBytes; ++i) out[1 + i] = row[i];
+        for (size_t i = bpp; i < rowBytes; ++i) out[1 + i] = static_cast<uint8_t>(row[i] - row[i - bpp]);
+    }
+    uLongf zSize = compressBound(static_cast<uLong>(raw.size()));
+    std::vector<uint8_t> z(zSize);
+    if (compress2(z.data(), &zSize, raw.data(), static_cast<uLong>(raw.size()), 1) != Z_OK) {
+        return Error::make(ErrorCode::IoFailure, "cannot compress '{}'", path.string());
+    }
+    z.resize(zSize);
+    std::vector<uint8_t> png = {0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A};
+    std::vector<uint8_t> ihdr;
+    putBe32(ihdr, image.width);
+    putBe32(ihdr, image.height);
+    ihdr.push_back(8);
+    ihdr.push_back(image.channels == 4 ? 6 : image.channels == 3 ? 2 : image.channels == 2 ? 4 : 0);
+    ihdr.push_back(0); ihdr.push_back(0); ihdr.push_back(0);
+    putChunk(png, "IHDR", ihdr);
+    putChunk(png, "IDAT", z);
+    putChunk(png, "IEND", {});
+    return writeFile(path, png);
+}
+
 }   // namespace
 
 Result<Rgb8> readRgb8(const std::filesystem::path& path) { return readWithChannels(path, false, false); }
@@ -183,16 +217,7 @@ Result<void> writePng(const std::filesystem::path& path, const Rgb8& image) {
         return Error(ErrorCode::InvalidArgument, "image pixel count does not match its size");
     }
     if (image.bitDepth == 16) return writePng16(path, image);
-    // stb tries five filters per row and searches its hash chains deeply by default: 150 ms
-    // for a 1080p image, more than the decode. One filter and a shallow search cost a few
-    // percent of file size and a fraction of the time.
-    stbi_write_force_png_filter = 1;
-    stbi_write_png_compression_level = 2;
-    if (stbi_write_png(path.string().c_str(), static_cast<int>(image.width), static_cast<int>(image.height), static_cast<int>(image.channels),
-                       image.pixels.data(), static_cast<int>(image.width * image.channels)) == 0) {
-        return Error::make(ErrorCode::IoFailure, "cannot write '{}'", path.string());
-    }
-    return ok();
+    return writePng8(path, image);
 }
 
 Result<std::vector<uint8_t>> readFile(const std::filesystem::path& path) {

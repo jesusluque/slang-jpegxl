@@ -43,6 +43,7 @@ include("${SJXL_ROOT}/cmake/Dependencies.cmake")
 include("${SJXL_ROOT}/cmake/Shaders.cmake")
 sjxl_shader_copy_target()
 
+find_package(ZLIB REQUIRED)   # the PNG writer's deflate
 add_subdirectory(modules)
 if(SJXL_BUILD_APPS)
     add_subdirectory(apps/sjxl)

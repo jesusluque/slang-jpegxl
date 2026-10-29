@@ -148,6 +148,7 @@ Result<std::shared_ptr<Device>> Device::create(const DeviceDesc& desc) {
             const std::string fromEnv = platform::env("SJXL_SHADER_CACHE");
             directory = !fromEnv.empty() ? std::filesystem::path(fromEnv) : platform::cacheDirectory() / "sjxl" / "shaders";
         }
+        device->moduleCacheDir_ = directory / "modules1";
         directory /= "gen1";
         device->shaderCache_.attach(new DiskShaderCache(directory));
     }
@@ -237,6 +238,11 @@ Device::~Device() {
     if (queue_ != nullptr) {
         queue_->waitOnHost();
     }
+}
+
+void Device::warmUp() {
+    rhi::ComPtr<rhi::ICommandEncoder> encoder = queue_->createCommandEncoder();
+    (void)queue_->submit(encoder->finish());
 }
 
 ShaderCacheStats Device::shaderCacheStats() const {

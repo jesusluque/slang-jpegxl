@@ -29,6 +29,7 @@ const std::array<uint32_t, 3>& ComputeKernel::threadGroup() const {
 Result<void> ComputeKernel::prepare() const {
     if (pipeline_ != nullptr) return ok();
     if (failed_ || library_ == nullptr) return Error::make(ErrorCode::ShaderFailure, "cannot make a pipeline for {}", name_);
+    const auto tLoad = std::chrono::steady_clock::now();
     if (program_ == nullptr) {
         auto program = library_->load(module_, {entry_}, constants_);
         if (!program) {
@@ -40,6 +41,8 @@ Result<void> ComputeKernel::prepare() const {
     rhi::ComputePipelineDesc desc;
     desc.program = program_->program.get();
     const auto t0 = std::chrono::steady_clock::now();
+    static const bool timing = !platform::env("SJXL_TIMING").empty();
+    const double loadMs = std::chrono::duration<double, std::milli>(t0 - tLoad).count();
     if (SLANG_FAILED(library_->device().rhi()->createComputePipeline(desc, pipeline_.writeRef()))) {
         failed_ = true;
         return Error::make(ErrorCode::ShaderFailure, "cannot make a pipeline for {}", name_);
@@ -49,6 +52,7 @@ Result<void> ComputeKernel::prepare() const {
     // SJXL_DEBUG lists the slow ones so they get split.
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     if (ms > 500.0 && !platform::env("SJXL_DEBUG").empty()) log::info("shaders: pipeline {} took {:.0f} ms", name_, ms);
+    if (timing && loadMs + ms > 2.0) log::info("timing kernel {}: load {:.1f} ms, pipeline {:.1f} ms", name_, loadMs, ms);
     return ok();
 }
 

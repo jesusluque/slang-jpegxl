@@ -150,6 +150,7 @@ Result<std::unique_ptr<Encoder>> Encoder::create(std::shared_ptr<gpu::ShaderLibr
     SJXL_ASSIGN(enc->passNonZeroCount_, gpu::ComputeKernel::create(lib, "sjxl/enc/transform", "passNonZeroCount"));
     SJXL_ASSIGN(enc->cflTile_, gpu::ComputeKernel::create(lib, "sjxl/enc/cfl", "cflTile"));
     SJXL_ASSIGN(enc->quantize_, gpu::ComputeKernel::create(lib, "sjxl/enc/quantize", "quantize"));
+    SJXL_ASSIGN(enc->prepareHistograms_, gpu::ComputeKernel::create(lib, "sjxl/enc/codes", "prepareHistograms"));
     SJXL_ASSIGN(enc->dcTokenize_, gpu::ComputeKernel::create(lib, "sjxl/enc/dc_tokens", "dcTokenize"));
     SJXL_ASSIGN(enc->dcTokenCount_, gpu::ComputeKernel::create(lib, "sjxl/enc/dc_tokens", "dcTokenCount"));
     SJXL_ASSIGN(enc->metaTokenize_, gpu::ComputeKernel::create(lib, "sjxl/enc/dc_tokens", "metaTokenize"));
@@ -251,6 +252,11 @@ Result<void> checkImage(const image::Rgb8& image) {
 }
 
 }   // namespace
+
+void Encoder::warmUp() {
+    (void)rgbToXyb_.prepare();
+    device_->warmUp();
+}
 
 Result<std::vector<uint8_t>> Encoder::encode(const image::Rgb8& image, const Options& options) {
     SJXL_TRY(checkImage(image));
@@ -576,6 +582,7 @@ Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, cons
     SJXL_ASSIGN(auto ctxMapMtf, gpu::Buffer::ofType<uint32_t>(dev, numContextsAll, "enc.ctxMapMtf"));
     SJXL_ASSIGN(auto ansInfo, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{numCodeRegions + 2} * 256, "enc.ansInfo"));
     SJXL_ASSIGN(auto ansReverse, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{numCodeRegions + 2} * 4096, "enc.ansReverse"));
+    SJXL_ASSIGN(auto histPrep, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{numCodeRegions} * 260, "enc.histPrep"));
     const std::array<uint32_t, kModTreeWords> qtTreeWords{0xFFFFFFFFu, 0, 0, 0, 0, kPredZero, 0, 0};   // one leaf, predictor Zero
     SJXL_ASSIGN(auto qtTree, gpu::Buffer::fromSpan<uint32_t>(dev, qtTreeWords, "enc.qtTree"));
     // The DC group streams: libjxl's kWPFixedDC tree (weighted predictor) and kACMeta tree, the WP scratch, the tokens.
@@ -1295,6 +1302,9 @@ Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, cons
         c["params"]["lz77Modular"].setData(0u);
         c["params"]["modLogAlpha"].setData(uint32_t{image.bitDepth > 8 ? 7u : 6u});
         c["params"]["histogramTries"].setData(7u);
+        c["histPrep"].setBinding(histPrep.rhi());
+        c["params"]["prepRegions"].setData(numCodeRegions);
+        c["params"]["prepModular"].setData(0u);
         c["rawQuant"].setBinding(rawQuantDev.valid() ? rawQuantDev.rhi() : dummyInt_.rhi());
         c["qtTree"].setBinding(qtTree.rhi());
         c["params"]["jpeg"].setData(uint32_t{jpeg != nullptr ? 1u : 0u});
@@ -1345,11 +1355,15 @@ Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, cons
         c["params"]["bitDepth"].setData(image.bitDepth);
     };
     timer.mark("sections + cluster");
+    prepareHistograms_.dispatchGroups(batch, {numCodeRegions, 1, 1}, bindCodes);   // every cluster's histogram form and tables, in parallel
+    timer.mark("histogram prep");
     dcGroupPre_.dispatchGroups(batch, {numDcGroups, 1, 1}, bindCodes);
+    timer.mark("blobs: dc pre");
     dcGroupMid_.dispatchGroups(batch, {numDcGroups, 1, 1}, bindCodes);
+    timer.mark("blobs: dc mid");
     globalBlobs_.dispatchGroups(batch, {1, 1, 1}, bindCodes);
     if (jpeg != nullptr) quantTableBlob_.dispatchGroups(batch, {1, 1, 1}, bindCodes);
-    timer.mark("blobs");
+    timer.mark("blobs: global");
 
     if (!cpuEntropy) sectionPasses(1, dummy_);   // bit counts
 
@@ -1957,7 +1971,11 @@ Result<std::vector<uint8_t>> Encoder::encodeModularFrame(const ModularSpec& spec
     modGeom.totalSamples = static_cast<uint32_t>(pixels);
     modGeom.channels = cpuChans;
     std::vector<int32_t> planesHost;
-    if (cpuEntropy) { SJXL_ASSIGN(planesHost, planes.readAll<int32_t>(dev)); }
+    if (cpuEntropy) {
+        const auto tPlanes = std::chrono::steady_clock::now();
+        SJXL_ASSIGN(planesHost, planes.readAll<int32_t>(dev));
+        if (timer.enabled()) log::info("timing planes readback: {:.1f} ms", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tPlanes).count());
+    }
     std::vector<uint32_t> cpuTokens;   // the final tokens when the CPU made them (the fixed-tree path reads them back)
     const auto bindMod = [&](rhi::ShaderCursor c, uint32_t mode, const gpu::Buffer& groupStart, const gpu::Buffer& body, const gpu::Buffer& tree,
                              uint32_t pass) {
@@ -2069,7 +2087,9 @@ Result<std::vector<uint8_t>> Encoder::encodeModularFrame(const ModularSpec& spec
             sp.propIds = propIds;
             sp.thresholds = thresholdsHost;
             std::vector<uint64_t> samplesHost;
+            const auto tSamples = std::chrono::steady_clock::now();
             cpu::modSamples(modGeom, planesHost, sp, samplesHost);
+            if (timer.enabled()) log::info("timing cpu modSamples: {:.1f} ms", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tSamples).count());
             const std::array<uint32_t, 1> countHost{static_cast<uint32_t>(samplesHost.size())};
             if (samplesHost.empty()) samplesHost.push_back(0);
             SJXL_ASSIGN(samples, gpu::Buffer::fromSpan<uint64_t>(dev, samplesHost, "enc.treeSamples"));
@@ -2134,7 +2154,9 @@ Result<std::vector<uint8_t>> Encoder::encodeModularFrame(const ModularSpec& spec
                                numSamples, numTreeNodes, depth);
         SJXL_ASSIGN(ctxHist, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{numLeaves + 1} * kHistBins, "enc.ctxHist"));   // + the LZ77 distance context
         if (cpuEntropy) {
+            const auto tTok = std::chrono::steady_clock::now();
             cpu::modTokenizeTree(modGeom, planesHost, treeWords, cpuTokens);
+            if (timer.enabled()) log::info("timing cpu modTokenizeTree: {:.1f} ms", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tTok).count());
             SJXL_ASSIGN(modTokens, gpu::Buffer::fromSpan<uint32_t>(dev, cpuTokens, "enc.modTokens"));
             modTokenCount_.dispatch(batch, {static_cast<uint32_t>(pixels), 1, 1}, [&](rhi::ShaderCursor c) { bindMod(c, 0, dummy_, dummy_, treeNodes, 0); });
         } else {
@@ -2312,6 +2334,7 @@ Result<std::vector<uint8_t>> Encoder::encodeModularFrame(const ModularSpec& spec
     SJXL_ASSIGN(auto codes, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{kAcClusters} * kCodeStride, "enc.codes"));
     SJXL_ASSIGN(auto ansInfo, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{regions} * 256, "enc.ansInfo"));
     SJXL_ASSIGN(auto ansReverse, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{regions} * 4096, "enc.ansReverse"));
+    SJXL_ASSIGN(auto histPrep, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{kAcClusters} * 260, "enc.histPrep"));
     // The global blob holds the whole stream when the image fits a group.
     const uint64_t blobWords = kBlobStrideWords + pixels * (spec.bitDepth / 8) + 1024;
     SJXL_ASSIGN(auto blobs, gpu::Buffer::ofType<uint32_t>(dev, blobWords, "enc.blobs"));
@@ -2402,6 +2425,9 @@ Result<std::vector<uint8_t>> Encoder::encodeModularFrame(const ModularSpec& spec
         c["params"]["lz77Modular"].setData(uint32_t{lz77 ? 1u : 0u});
         c["params"]["modLogAlpha"].setData(logAlpha);
         c["params"]["histogramTries"].setData(7u);
+        c["histPrep"].setBinding(histPrep.rhi());
+        c["params"]["prepRegions"].setData(kAcClusters);
+        c["params"]["prepModular"].setData(1u);
         c["rawQuant"].setBinding(dummyInt_.rhi());
         c["qtTree"].setBinding(dummy_.rhi());
         c["params"]["jpeg"].setData(0u);
@@ -2429,6 +2455,7 @@ Result<std::vector<uint8_t>> Encoder::encodeModularFrame(const ModularSpec& spec
         c["params"]["dcQuantY"].setData(spec.dcQuant[1]);
         c["params"]["dcQuantB"].setData(spec.dcQuant[2]);
     };
+    prepareHistograms_.dispatchGroups(batch, {kAcClusters, 1, 1}, bindCodes);   // every cluster's histogram form and tables, in parallel
     modularGlobalBlob_.dispatchGroups(batch, {1, 1, 1}, bindCodes);
     std::vector<uint32_t> sizes;
     std::vector<uint8_t> bodyOut;

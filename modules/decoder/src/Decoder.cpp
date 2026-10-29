@@ -2,6 +2,7 @@
 #include "sjxl/decoder/Decoder.h"
 
 #include "sjxl/decoder/DcGroupCpu.h"
+#include "sjxl/gpu/Device.h"
 
 #include "sjxl/image/Image.h"
 
@@ -112,6 +113,11 @@ Result<std::unique_ptr<Decoder>> Decoder::create(std::shared_ptr<gpu::ShaderLibr
     SJXL_ASSIGN(dec->epf_, gpu::ComputeKernel::create(lib, "sjxl/dec/filters", "epf"));
     SJXL_ASSIGN(dec->output_, gpu::ComputeKernel::create(lib, "sjxl/dec/output", "xybToSrgb8"));
     return dec;
+}
+
+void Decoder::warmUp() {
+    (void)globals_.prepare();
+    device_->warmUp();
 }
 
 Result<codestream::Parsed> Decoder::parseAll(std::span<const uint8_t> file) {
@@ -438,6 +444,7 @@ Result<Decoder::FrameOutput> Decoder::run(const codestream::Parsed& parsed, cons
         c["params"]["refH"].setData(rh);
     };
     if (modular) {
+        timer.mark("setup");
         modularGlobals_.dispatch(batch, {1, 1, 1}, bindSections);
         timer.mark("modular globals");
         modularDcGroups_.dispatch(batch, {numDcGroups, 1, 1}, bindSections);
@@ -557,13 +564,16 @@ Result<Decoder::FrameOutput> Decoder::run(const codestream::Parsed& parsed, cons
             });
         }
     } else {
+    timer.mark("setup");
     if (!naturalOrders_) {   // once per decoder: the natural coefficient orders
         SJXL_ASSIGN(naturalOrders_, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{kCoeffOrderLimit} * 64, "dec.naturalOrders"));
         buildNaturalOrders_.dispatch(batch, {39, 1, 1}, bindSections);
+        timer.mark("natural orders");
     }
     (frame.singleSection ? singleSection_ : globals_).dispatch(batch, {1, 1, 1}, bindSections);
-    if (!frame.singleSection) finishOrders_.dispatch(batch, {kCoeffOrderLimit * 64, frame.header.numPasses, 1}, bindSections);
     timer.mark("globals");
+    if (!frame.singleSection) finishOrders_.dispatch(batch, {kCoeffOrderLimit * 64, frame.header.numPasses, 1}, bindSections);
+    timer.mark("finish orders");
     if (!useDcFrame && numEc == 0 && !frame.singleSection && cpuAllowed) {
         // The DC groups' serial chains on CPU cores (the project's one exception to GPU-only
         // coded data, docs/decisions.md "M5"): wait for the globals, decode, upload.

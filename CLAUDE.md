@@ -41,7 +41,10 @@ cjxl in.png ref.jxl -d 1 -e 5 ; djxl out.jxl check.png      # Homebrew oracle (/
   gives one device and shader library per process.
 - **Timings** come from the release preset (`cmake --preset macos-arm64-release`); the Debug preset
   leaves the CPU chains unoptimised (3-4x slower). `SJXL_TIMING=1` also prints the CLI's phases
-  (device, create, codec, PNG write).
+  (device, create, codec, PNG write) and any kernel whose program load or pipeline took over 2 ms.
+  Precompiled Slang modules live next to the shader cache (`modules1/`, keyed by a hash of every
+  shader source and the Slang version); the GPU's first submit and first pipeline cost ~40 ms per
+  process, which `Encoder::warmUp` / `Decoder::warmUp` overlap with the caller's CPU work.
 - **Environment**: `SJXL_TIMING=1` (per-stage times, encoder and decoder),
   `SJXL_PERF_SKIP=bits` (decoder timing experiments), `SJXL_DEC_CPU=0` / `SJXL_ENC_CPU=0` (the decoder's DC and modular groups / the encoder's chains on the GPU threads, the reference paths; `SJXL_DEBUG=1` also shows the modules' debug log lines), `SJXL_BACKEND=metal,cuda,vulkan` (order to try),
   `SJXL_GPU_VALIDATION=1` (debug layers), `SJXL_SHADER_DIR`, `SJXL_SHADER_CACHE`

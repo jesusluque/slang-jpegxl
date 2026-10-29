@@ -8,6 +8,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <slang-rhi.h>
@@ -49,6 +50,13 @@ public:
     [[nodiscard]] std::shared_ptr<Device> deviceShared() const noexcept { return device_; }
 
 private:
+    /// The module from the precompiled-module cache (Slang IR, keyed by a hash of every
+    /// shader source and the Slang version), or compiled from source and cached.
+    slang::IModule* loadModuleCached(const std::string& module, rhi::ComPtr<slang::IBlob>& diag);
+    std::string sourceStamp();
+
+    std::unordered_map<std::string, slang::IModule*> modules_;   // by module name
+    std::string                                      stamp_;
     [[nodiscard]] Result<std::shared_ptr<const Program>> link(const std::string& key, slang::IModule* module,
                                                               const std::string& name,
                                                               const std::vector<std::string>& entries,

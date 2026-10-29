@@ -1,6 +1,16 @@
 // Copyright (c) 2026 jesus luque.
 #include "sjxl/gpu/ShaderLibrary.h"
 
+#include <filesystem>
+
+#include <fstream>
+
+#include <format>
+
+#include <cstring>
+
+#include <algorithm>
+
 #include <chrono>
 
 #include <functional>
@@ -11,6 +21,83 @@
 #include "sjxl/gpu/Device.h"
 
 namespace sjxl::gpu {
+
+namespace {
+
+uint64_t fnv1a(uint64_t h, const void* data, size_t n) {
+    const auto* p = static_cast<const uint8_t*>(data);
+    for (size_t i = 0; i < n; ++i) { h ^= p[i]; h *= 1099511628211ull; }
+    return h;
+}
+
+}   // namespace
+
+/// A hash of every .slang/.slangh under the search paths plus the Slang version: the
+/// precompiled modules' validity.
+std::string ShaderLibrary::sourceStamp() {
+    if (!stamp_.empty()) return stamp_;
+    uint64_t h = 1469598103934665603ull;
+    const char* tag = spGetBuildTagString();
+    h = fnv1a(h, tag, std::strlen(tag));
+    std::vector<std::filesystem::path> files;
+    for (const std::string& root : device_->shaderSearchPaths()) {
+        std::error_code ec;
+        for (std::filesystem::recursive_directory_iterator it(root, ec), end; !ec && it != end; it.increment(ec)) {
+            if (!it->is_regular_file()) continue;
+            const std::string ext = it->path().extension().string();
+            if (ext == ".slang" || ext == ".slangh") files.push_back(it->path());
+        }
+    }
+    std::sort(files.begin(), files.end());
+    for (const std::filesystem::path& f : files) {
+        const std::string name = f.string();
+        h = fnv1a(h, name.data(), name.size());
+        std::ifstream in(f, std::ios::binary);
+        std::vector<char> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        h = fnv1a(h, bytes.data(), bytes.size());
+    }
+    stamp_ = std::format("{:016x}", h);
+    return stamp_;
+}
+
+slang::IModule* ShaderLibrary::loadModuleCached(const std::string& module, rhi::ComPtr<slang::IBlob>& diag) {
+    if (auto found = modules_.find(module); found != modules_.end()) return found->second;
+    slang::ISession* session = device_->slangSession();
+    const std::filesystem::path dir = device_->moduleCacheDirectory();
+    slang::IModule* loaded = nullptr;
+    std::filesystem::path cached;
+    if (!dir.empty()) {
+        std::string name = module;
+        std::replace(name.begin(), name.end(), '/', '_');
+        cached = dir / (name + "." + sourceStamp() + ".slang-module");
+        if (std::ifstream in(cached, std::ios::binary); in) {
+            std::vector<char> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+            rhi::ComPtr<ISlangBlob> blob;
+            if (SLANG_SUCCEEDED(rhi::getRHI()->createBlob(bytes.data(), bytes.size(), blob.writeRef()))) {
+                rhi::ComPtr<slang::IBlob> ignored;
+                loaded = session->loadModuleFromIRBlob(module.c_str(), (module + ".slang").c_str(), blob.get(), ignored.writeRef());
+            }
+        }
+    }
+    if (loaded == nullptr) {
+        loaded = session->loadModule(module.c_str(), diag.writeRef());
+        if (loaded != nullptr && !cached.empty()) {
+            rhi::ComPtr<ISlangBlob> blob;
+            if (SLANG_SUCCEEDED(loaded->serialize(blob.writeRef()))) {
+                std::error_code ec;
+                std::filesystem::create_directories(dir, ec);
+                const std::filesystem::path partial = cached.string() + ".partial";
+                if (std::ofstream out(partial, std::ios::binary); out) {
+                    out.write(static_cast<const char*>(blob->getBufferPointer()), static_cast<std::streamsize>(blob->getBufferSize()));
+                    out.close();
+                    std::filesystem::rename(partial, cached, ec);
+                }
+            }
+        }
+    }
+    if (loaded != nullptr) modules_[module] = loaded;
+    return loaded;
+}
 namespace {
 
 std::string diagnostics(slang::IBlob* blob) {
@@ -45,7 +132,7 @@ Result<std::shared_ptr<const Program>> ShaderLibrary::load(const std::string& mo
         return found->second;
     }
     rhi::ComPtr<slang::IBlob> diag;
-    slang::IModule* loaded = device_->slangSession()->loadModule(module.c_str(), diag.writeRef());
+    slang::IModule* loaded = loadModuleCached(module, diag);
     if (loaded == nullptr) {
         return Error::make(ErrorCode::ShaderFailure, "cannot load Slang module '{}':\n{}", module,
                            diagnostics(diag.get()));
@@ -111,9 +198,9 @@ Result<std::shared_ptr<const Program>> ShaderLibrary::link(const std::string& ke
         return Error::make(ErrorCode::ShaderFailure, "cannot compile '{}' for {}:\n{}", module,
                            toString(device_->backend()), diagnostics(diag.get()));
     }
-    if (!platform::env("SJXL_TIMING").empty()) {
-        log::info("timing shader program {}:{}: {:.1f} ms", module, entries.empty() ? std::string() : entries.front(),
-                  std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    if (const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        ms > 2.0 && !platform::env("SJXL_TIMING").empty()) {
+        log::info("timing shader program {}:{}: {:.1f} ms", module, entries.empty() ? std::string() : entries.front(), ms);
     }
     if (std::string warnings = diagnostics(diag.get()); !warnings.empty()) {
         log::warn("slang '{}': {}", module, warnings);
