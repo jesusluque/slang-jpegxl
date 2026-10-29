@@ -153,6 +153,7 @@ Result<std::unique_ptr<Encoder>> Encoder::create(std::shared_ptr<gpu::ShaderLibr
     SJXL_ASSIGN(enc->accumulateClusters_, gpu::ComputeKernel::create(lib, "sjxl/enc/cluster", "accumulateClusters"));
     SJXL_ASSIGN(enc->acSections_, gpu::ComputeKernel::create(lib, "sjxl/enc/ac_sections", "acSections"));
     SJXL_ASSIGN(enc->rctYCoCg_, gpu::ComputeKernel::create(lib, "sjxl/enc/modular", "rctYCoCg"));
+    SJXL_ASSIGN(enc->dcFramePlanes_, gpu::ComputeKernel::create(lib, "sjxl/enc/modular", "dcFramePlanes"));
     SJXL_ASSIGN(enc->modTokenize_, gpu::ComputeKernel::create(lib, "sjxl/enc/modular", "modTokenize"));
     SJXL_ASSIGN(enc->extractAlpha_, gpu::ComputeKernel::create(lib, "sjxl/enc/modular", "extractAlpha"));
     SJXL_ASSIGN(enc->channelEntropy_, gpu::ComputeKernel::create(lib, "sjxl/enc/modular", "channelEntropy"));
@@ -275,7 +276,8 @@ Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, cons
     }
     gpu::Device& dev = *device_;
     const FrameDim dim = codestream::frameDim(image.width, image.height);
-    const codestream::FrameParams frame = frameParamsFor(options);
+    codestream::FrameParams frame = frameParamsFor(options);
+    frame.useDcFrame = options.progressiveDc && image.channels == 3;   // libjxl: no DC frames with extra channels
     // The quant field's distance: libjxl lowers it when the Gaborish is off.
     const float fieldDistance = options.distance * (frame.gaborish ? 1.0f : 0.62f);
     // The field's unit: libjxl's adaptive scale, or the flat 0.79 / d of its
@@ -612,6 +614,40 @@ Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, cons
         c["params"]["bQmMultiplier"].setData(static_cast<float>(std::pow(1.25, static_cast<int>(frame.bQmScale) - 2)));
         c["params"]["noAdjust"].setData(uint32_t{platform::env("SJXL_ENC_NO_ADJUST").empty() ? 0u : 1u});
     });
+    // The DC frame: the DC image as a Modular XYB frame at 1/8 size, scaled by the
+    // frame's DC steps (F16 in its DcGlobal); the VarDCT frame then codes no DC.
+    std::vector<uint8_t> dcFrameBytes;
+    if (frame.useDcFrame) {
+        std::array<float, 3> dcQuantF{};
+        for (uint32_t c = 0; c < 3; ++c) dcQuantF[c] = 1.0f / (codestream::kInvDcQuant[c] * qp.globalScaleFloat * static_cast<float>(qp.quantDc));
+        SJXL_ASSIGN(auto dcPlanes, gpu::Buffer::ofType<int32_t>(dev, uint64_t{3} * nblocks, "enc.dcFramePlanes"));
+        dcFramePlanes_.dispatch(batch, {nblocks, 1, 1}, [&](rhi::ShaderCursor c) {
+            for (const char* name : {"rgb8", "planesIn", "treeNodes", "wpScratch", "passTokens", "passHist", "passBits", "choice", "leafMap", "modTokens",
+                                     "ctxHist", "ctxMap", "ansInfo", "ansReverse", "groupStart", "groupBits", "body"}) {
+                c[name].setBinding(dummy_.rhi());
+            }
+            c["dcValue"].setBinding(dcValue.rhi());
+            c["planes"].setBinding(dcPlanes.rhi());
+            c["params"]["width"].setData(dim.xsizeBlocks);
+            c["params"]["height"].setData(dim.ysizeBlocks);
+            c["params"]["dcQuantX"].setData(dcQuantF[0]);
+            c["params"]["dcQuantY"].setData(dcQuantF[1]);
+            c["params"]["dcQuantB"].setData(dcQuantF[2]);
+        });
+        SJXL_TRY(batch.submit(true));
+        ModularSpec spec;
+        spec.width = dim.xsizeBlocks;
+        spec.height = dim.ysizeBlocks;
+        spec.channels = 3;
+        spec.bitDepth = 16;
+        spec.rct = false;
+        spec.dcFrame = true;
+        spec.dcQuant = dcQuantF;
+        const Stats mainStats = stats_;
+        SJXL_ASSIGN(dcFrameBytes, encodeModularFrame(spec, dcPlanes, options, codestream::FrameInfo{}));
+        stats_ = mainStats;
+        stats_.dcFrameBytes = static_cast<uint32_t>(dcFrameBytes.size());
+    }
     for (uint32_t p = 0; p < numPasses; ++p) {
         passNonZeroCount_.dispatch(batch, {3 * nblocks, 1, 1}, [&](rhi::ShaderCursor c) { bindPass(c, p); });
         acTokenize_.dispatch(batch, {3 * nblocks, 1, 1}, [&](rhi::ShaderCursor c) { bindPass(c, p); });
@@ -649,8 +685,9 @@ Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, cons
         c["params"]["metaTreeNodes"].setData(static_cast<uint32_t>(metaTreeWords.size() / kModTreeWords));
         c["params"]["wpWordsPerGroup"].setData(wpWordsPerGroup);
         c["params"]["numAcSets"].setData(numPasses);
+        c["params"]["useDcFrame"].setData(uint32_t{frame.useDcFrame ? 1u : 0u});
     };
-    dcTokenize_.dispatch(batch, {numDcGroups, 1, 1}, [&](rhi::ShaderCursor c) { bindDc(c, 0, dummy_); });
+    if (!frame.useDcFrame) dcTokenize_.dispatch(batch, {numDcGroups, 1, 1}, [&](rhi::ShaderCursor c) { bindDc(c, 0, dummy_); });
     metaTokenize_.dispatch(batch, {metaItems, 1, 1}, [&](rhi::ShaderCursor c) { bindDc(c, 0, dummy_); });
     if (hasAlpha) {
         // The alpha channel: both predictor passes, the choice (bookkeeping on two
@@ -806,6 +843,12 @@ Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, cons
         c["params"]["numAcContexts"].setData(kNumAcContexts);
         c["params"]["numEcSets"].setData(numEcSets);
         c["params"]["numAcSets"].setData(numPasses);
+        c["params"]["useDcFrame"].setData(uint32_t{frame.useDcFrame ? 1u : 0u});
+        c["params"]["rct"].setData(0u);
+        c["params"]["dcQuantCustom"].setData(0u);
+        c["params"]["dcQuantX"].setData(0.0f);
+        c["params"]["dcQuantY"].setData(0.0f);
+        c["params"]["dcQuantB"].setData(0.0f);
         c["params"]["ecInGlobal"].setData(uint32_t{hasAlpha && ecFits ? 1u : 0u});
         c["params"]["ecLogAlpha"].setData(uint32_t{image.bitDepth > 8 ? 7u : 6u});
         c["params"]["width"].setData(image.width);
@@ -946,6 +989,7 @@ Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, cons
     stats_.sectionBytes = sizes;
     const auto* bodyBytesPtr = reinterpret_cast<const uint8_t*>(bodyWords.data());
     out.insert(out.end(), bodyBytesPtr, bodyBytesPtr + bodyBytes);
+    if (!dcFrameBytes.empty()) out.insert(out.begin(), dcFrameBytes.begin(), dcFrameBytes.end());
     return out;
 }
 
@@ -1133,12 +1177,45 @@ std::vector<uint32_t> acMetaTree(uint32_t& numLeaves) {
 
 Result<std::vector<uint8_t>> Encoder::encodeLossless(const image::Rgb8& image, const Options& options, const codestream::FrameInfo& info) {
     gpu::Device& dev = *device_;
-    const FrameDim dim = codestream::frameDim(image.width, image.height);
-    const uint32_t numGroups = dim.numGroups();
-    const uint32_t numDcGroups = dim.numDcGroups();
-    const bool fitsGroup = image.width <= dim.groupDim && image.height <= dim.groupDim;
     const uint64_t pixels = uint64_t{image.width} * image.height;
     const uint32_t channels = image.channels;
+    std::vector<uint32_t> rgbWords((image.pixels.size() + 3) / 4, 0);
+    std::memcpy(rgbWords.data(), image.pixels.data(), image.pixels.size());
+    SJXL_ASSIGN(auto rgb, gpu::Buffer::fromSpan<uint32_t>(dev, rgbWords, "enc.rgb8"));
+    SJXL_ASSIGN(auto planes, gpu::Buffer::ofType<int32_t>(dev, channels * pixels, "enc.planes"));
+    gpu::CommandBatch batch(dev);
+    // The YCoCg RCT over the colour channels (alpha copied) into the planes.
+    rctYCoCg_.dispatch(batch, {image.width, image.height, 1}, [&](rhi::ShaderCursor c) {
+        for (const char* name : {"dcValue", "planesIn", "treeNodes", "wpScratch", "passTokens", "passHist", "passBits", "choice", "leafMap", "modTokens",
+                                 "ctxHist", "ctxMap", "ansInfo", "ansReverse", "groupStart", "groupBits", "body"}) {
+            c[name].setBinding(dummy_.rhi());
+        }
+        c["rgb8"].setBinding(rgb.rhi());
+        c["planes"].setBinding(planes.rhi());
+        c["params"]["width"].setData(image.width);
+        c["params"]["height"].setData(image.height);
+        c["params"]["numChannels"].setData(channels);
+        c["params"]["bitDepth"].setData(image.bitDepth);
+    });
+    SJXL_TRY(batch.submit(true));
+    ModularSpec spec;
+    spec.width = image.width;
+    spec.height = image.height;
+    spec.channels = channels;
+    spec.bitDepth = image.bitDepth;
+    spec.rct = true;
+    return encodeModularFrame(spec, planes, options, info);
+}
+
+Result<std::vector<uint8_t>> Encoder::encodeModularFrame(const ModularSpec& spec, const gpu::Buffer& planes, const Options& options,
+                                                         const codestream::FrameInfo& info) {
+    gpu::Device& dev = *device_;
+    const FrameDim dim = codestream::frameDim(spec.width, spec.height);
+    const uint32_t numGroups = dim.numGroups();
+    const uint32_t numDcGroups = dim.numDcGroups();
+    const bool fitsGroup = spec.width <= dim.groupDim && spec.height <= dim.groupDim;
+    const uint64_t pixels = uint64_t{spec.width} * spec.height;
+    const uint32_t channels = spec.channels;
 
     // libjxl's Predictor::Best per channel: the weighted predictor with the fixed
     // WP-property tree, or Gradient with the gradient tree, whichever the
@@ -1152,10 +1229,6 @@ Result<std::vector<uint8_t>> Encoder::encodeLossless(const image::Rgb8& image, c
     uint32_t numTreeNodes = 0;
     gpu::Buffer treeNodes;
 
-    std::vector<uint32_t> rgbWords((image.pixels.size() + 3) / 4, 0);
-    std::memcpy(rgbWords.data(), image.pixels.data(), image.pixels.size());
-    SJXL_ASSIGN(auto rgb, gpu::Buffer::fromSpan<uint32_t>(dev, rgbWords, "enc.rgb8"));
-    SJXL_ASSIGN(auto planes, gpu::Buffer::ofType<int32_t>(dev, channels * pixels, "enc.planes"));
     SJXL_ASSIGN(auto modTokens, gpu::Buffer::ofType<uint32_t>(dev, channels * pixels, "enc.modTokens"));
     SJXL_ASSIGN(auto passTokens, gpu::Buffer::ofType<uint32_t>(dev, 2 * channels * pixels, "enc.passTokens"));
     SJXL_ASSIGN(auto passHist, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{2} * channels * kSetContexts * kHistBins, "enc.passHist"));
@@ -1179,7 +1252,7 @@ Result<std::vector<uint8_t>> Encoder::encodeLossless(const image::Rgb8& image, c
     SJXL_ASSIGN(auto ansInfo, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{regions} * 256, "enc.ansInfo"));
     SJXL_ASSIGN(auto ansReverse, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{regions} * 4096, "enc.ansReverse"));
     // The global blob holds the whole stream when the image fits a group.
-    const uint64_t blobWords = kBlobStrideWords + (fitsGroup ? channels * pixels * (image.bitDepth / 8) + 1024 : 0);
+    const uint64_t blobWords = kBlobStrideWords + (fitsGroup ? channels * pixels * (spec.bitDepth / 8) + 1024 : 0);
     SJXL_ASSIGN(auto blobs, gpu::Buffer::ofType<uint32_t>(dev, blobWords, "enc.blobs"));
     SJXL_ASSIGN(auto blobBits, gpu::Buffer::ofType<uint32_t>(dev, 2, "enc.blobBits"));
     SJXL_ASSIGN(auto groupBits, gpu::Buffer::ofType<uint32_t>(dev, numGroups, "enc.groupBits"));
@@ -1187,7 +1260,8 @@ Result<std::vector<uint8_t>> Encoder::encodeLossless(const image::Rgb8& image, c
     gpu::CommandBatch batch(dev);
     const auto bindMod = [&](rhi::ShaderCursor c, uint32_t mode, const gpu::Buffer& groupStart, const gpu::Buffer& body,
                              const gpu::Buffer& tree, uint32_t pass) {
-        c["rgb8"].setBinding(rgb.rhi());
+        c["rgb8"].setBinding(dummy_.rhi());
+        c["dcValue"].setBinding(dummy_.rhi());
         c["planes"].setBinding(planes.rhi());
         c["planesIn"].setBinding(planes.rhi());
         c["treeNodes"].setBinding(tree.rhi());
@@ -1205,23 +1279,25 @@ Result<std::vector<uint8_t>> Encoder::encodeLossless(const image::Rgb8& image, c
         c["groupStart"].setBinding(groupStart.rhi());
         c["groupBits"].setBinding(groupBits.rhi());
         c["body"].setBinding(body.rhi());
-        c["params"]["width"].setData(image.width);
-        c["params"]["height"].setData(image.height);
+        c["params"]["width"].setData(spec.width);
+        c["params"]["height"].setData(spec.height);
         c["params"]["groupDim"].setData(dim.groupDim);
         c["params"]["groupsX"].setData(dim.xsizeGroups);
         c["params"]["numGroups"].setData(numGroups);
         c["params"]["numLeaves"].setData(numLeaves);
         c["params"]["mode"].setData(mode);
         c["params"]["numChannels"].setData(channels);
-        c["params"]["bitDepth"].setData(image.bitDepth);
+        c["params"]["bitDepth"].setData(spec.bitDepth);
         c["params"]["wpWordsPerGroup"].setData(wpWordsPerGroup);
         c["params"]["pass"].setData(pass);
         c["params"]["ctxBase"].setData(0u);
+        c["params"]["dcQuantX"].setData(0.0f);
+        c["params"]["dcQuantY"].setData(0.0f);
+        c["params"]["dcQuantB"].setData(0.0f);
     };
     // Both predictor passes and their per-channel entropies; the choice is bookkeeping on the host.
     SJXL_ASSIGN(choice, gpu::Buffer::ofType<uint32_t>(dev, channels, "enc.choice"));
     SJXL_ASSIGN(leafMapBuf, gpu::Buffer::ofType<uint32_t>(dev, channels * kSetContexts, "enc.leafMap"));
-    rctYCoCg_.dispatch(batch, {image.width, image.height, 1}, [&](rhi::ShaderCursor c) { bindMod(c, 0, dummy_, dummy_, wpTreeBuf, 0); });
     modTokenize_.dispatch(batch, {numGroups, 1, 1}, [&](rhi::ShaderCursor c) { bindMod(c, 0, dummy_, dummy_, wpTreeBuf, 0); });
     modTokenize_.dispatch(batch, {numGroups, 1, 1}, [&](rhi::ShaderCursor c) { bindMod(c, 0, dummy_, dummy_, gradTreeBuf, 1); });
     channelEntropy_.dispatch(batch, {2 * channels, 1, 1}, [&](rhi::ShaderCursor c) { bindMod(c, 0, dummy_, dummy_, wpTreeBuf, 0); });
@@ -1291,13 +1367,13 @@ Result<std::vector<uint8_t>> Encoder::encodeLossless(const image::Rgb8& image, c
         c["params"]["numGroups"].setData(numGroups);
         c["params"]["blocksX"].setData(dim.xsizeBlocks);
         c["params"]["blocksY"].setData(dim.ysizeBlocks);
-        c["params"]["width"].setData(image.width);
-        c["params"]["height"].setData(image.height);
+        c["params"]["width"].setData(spec.width);
+        c["params"]["height"].setData(spec.height);
         c["params"]["groupDim"].setData(dim.groupDim);
         c["params"]["numTreeNodes"].setData(numTreeNodes);
         c["params"]["numLeaves"].setData(numLeaves);
-        c["params"]["numChannels"].setData(image.channels);
-        c["params"]["bitDepth"].setData(image.bitDepth);
+        c["params"]["numChannels"].setData(spec.channels);
+        c["params"]["bitDepth"].setData(spec.bitDepth);
         c["params"]["dcTreeNodes"].setData(0u);
         c["params"]["dcLeaves"].setData(0u);
         c["params"]["metaTreeNodes"].setData(0u);
@@ -1307,6 +1383,12 @@ Result<std::vector<uint8_t>> Encoder::encodeLossless(const image::Rgb8& image, c
         c["params"]["numAcSets"].setData(1u);
         c["params"]["ecInGlobal"].setData(0u);
         c["params"]["ecLogAlpha"].setData(6u);
+        c["params"]["useDcFrame"].setData(0u);
+        c["params"]["rct"].setData(uint32_t{spec.rct ? 1u : 0u});
+        c["params"]["dcQuantCustom"].setData(uint32_t{spec.dcFrame ? 1u : 0u});
+        c["params"]["dcQuantX"].setData(spec.dcQuant[0]);
+        c["params"]["dcQuantY"].setData(spec.dcQuant[1]);
+        c["params"]["dcQuantB"].setData(spec.dcQuant[2]);
     };
     modularGlobalBlob_.dispatchGroups(batch, {1, 1, 1}, bindCodes);
     if (!fitsGroup) {
@@ -1361,7 +1443,8 @@ Result<std::vector<uint8_t>> Encoder::encodeLossless(const image::Rgb8& image, c
     SJXL_ASSIGN(const std::vector<uint32_t> clusterInfoHost, clusterInfo.readAll<uint32_t>(dev));
 
     codestream::BitWriter head;
-    codestream::writeModularFrameHeader(head, channels == 4 ? 1 : 0, info);
+    if (spec.dcFrame) codestream::writeDcFrameHeader(head);
+    else codestream::writeModularFrameHeader(head, channels == 4 ? 1 : 0, info);
     codestream::writeToc(head, sizes);
     std::vector<uint8_t> out = head.take();
     stats_ = Stats{};
@@ -1372,8 +1455,9 @@ Result<std::vector<uint8_t>> Encoder::encodeLossless(const image::Rgb8& image, c
     if (!platform::env("SJXL_DEBUG").empty()) {
         std::string ch;
         for (uint32_t c = 0; c < channels; ++c) ch += std::format("{}:{} ", c, choiceHost[c] == 0 ? "WP" : "grad");
-        log::info("enc debug: lossless {}x{} x{} {}-bit, predictors {}, {} tree nodes, {} leaves, {} clusters, DcGlobal {} bits, {} groups",
-                  image.width, image.height, channels, image.bitDepth, ch, numTreeNodes, numLeaves, clusterInfoHost[0], blobBitsHost[0], numGroups);
+        log::info("enc debug: {} {}x{} x{} {}-bit, predictors {}, {} tree nodes, {} leaves, {} clusters, DcGlobal {} bits, {} groups",
+                  spec.dcFrame ? "DC frame" : "lossless", spec.width, spec.height, channels, spec.bitDepth, ch, numTreeNodes, numLeaves, clusterInfoHost[0],
+                  blobBitsHost[0], numGroups);
     }
     const auto* bodyBytesPtr = reinterpret_cast<const uint8_t*>(bodyWords.data());
     out.insert(out.end(), bodyBytesPtr, bodyBytesPtr + bodyBytes);

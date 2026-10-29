@@ -41,7 +41,8 @@ struct DcTokenParams {
     uint metaTreeNodes;
     uint wpWordsPerGroup;
     uint numAcSets;         // the AC passes' sets precede the DC groups' sets
-    uint pad1, pad2;
+    uint useDcFrame;        // kUseDcFrame: no DC stream in the DC group sections
+    uint pad2;
 };
 
 StructuredBuffer<uint4>    dcGroups;      // bx0, by0, w, h (blocks)
@@ -264,17 +265,21 @@ void dcGroupSections(uint3 tid: SV_DispatchThreadID) {
     aw.set = dcSet(g);
     aw.pos = aw.mode == 2 ? dcPartStart[g * 4 + 1] + dcBits[g] : 0;
     const uint physical[3] = {1, 0, 2};
-    for (int ci = 2; ci >= 0; --ci) {
-        const uint plane = physical[ci] * params.nblocks;
-        for (int y = int(rect.w) - 1; y >= 0; --y) {
-            for (int x = int(rect.z) - 1; x >= 0; --x) {
-                const uint t = dcTokens[plane + (rect.y + uint(y)) * params.blocksX + rect.x + uint(x)];
-                put(aw, t >> 18, t & 0x3FFFFu);
+    if (params.useDcFrame == 0) {
+        for (int ci = 2; ci >= 0; --ci) {
+            const uint plane = physical[ci] * params.nblocks;
+            for (int y = int(rect.w) - 1; y >= 0; --y) {
+                for (int x = int(rect.z) - 1; x >= 0; --x) {
+                    const uint t = dcTokens[plane + (rect.y + uint(y)) * params.blocksX + rect.x + uint(x)];
+                    put(aw, t >> 18, t & 0x3FFFFu);
+                }
             }
         }
+        if (aw.mode == 1) dcBits[g] = aw.bits;
+        else emitAtomic(body, dcPartStart[g * 4 + 1], 32, aw.state);
+    } else if (aw.mode == 1) {
+        dcBits[g] = 0;
     }
-    if (aw.mode == 1) dcBits[g] = aw.bits;
-    else emitAtomic(body, dcPartStart[g * 4 + 1], 32, aw.state);
     // The AcMetadata stream: the items backwards.
     AnsWriter mw;
     mw.mode = params.mode;

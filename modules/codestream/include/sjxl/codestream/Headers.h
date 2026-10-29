@@ -63,7 +63,14 @@ struct FrameParams {
     std::array<uint32_t, 11> shift{};
     uint32_t numDownsample = 0;
     std::array<uint32_t, 4> downsample{}, lastPass{};
+    /// kUseDcFrame: the DC comes from the DC frame before this one (dc_level 1);
+    /// the DC groups carry no DC stream and the header no upsampling fields.
+    bool useDcFrame = false;
 };
+
+/// The DC frame of a VarDCT frame: a Modular frame in XYB at 1/8 size (frame
+/// type kDCFrame, dc_level 1), no filters, not displayed. Not byte-aligned on exit.
+void writeDcFrameHeader(BitWriter& w);
 
 /// A single-pass, full-frame, last VarDCT frame in XYB. Not byte-aligned on exit.
 void writeFrameHeader(BitWriter& w, const FrameParams& params, uint32_t numExtraChannels = 0, const FrameInfo& info = FrameInfo{});

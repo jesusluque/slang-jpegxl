@@ -653,3 +653,41 @@ TEST_CASE("the encoder's progressive passes decode like its single pass", "[enco
     CHECK(vsDjxl->maxAbsDiff <= 1);
     CHECK(vsSingle->maxAbsDiff == 0);
 }
+
+TEST_CASE("the encoder's DC frame feeds the VarDCT frame like djxl", "[encoder][decoder][conformance][progressive][dcframe]") {
+    const std::filesystem::path djxl = test::findTool("djxl");
+    if (djxl.empty()) SKIP("djxl is not installed");
+    const std::string name = GENERATE(std::string("berlin_7x5.png"), std::string("berlin_200.png"), std::string("sveti_stefan_320.png"));
+    const bool passes = GENERATE(false, true);   // with the three frequency passes as well: what cjxl -p emits
+    CAPTURE(name, passes);
+    auto source = image::readRgb8(test::testData(name));
+    REQUIRE(source);
+    enc::Options options;
+    options.distance = 1.0f;
+    options.progressiveDc = true;
+    options.progressive = passes ? 2u : 0u;
+    auto encoded = encoder().encode(*source, options);
+    REQUIRE(encoded);
+    auto parsed = dec::Decoder::info(*encoded);
+    REQUIRE(parsed);
+    REQUIRE(parsed->frames.size() == 2);
+    CHECK(parsed->frames[0].header.frameType == 1);   // kDCFrame
+    CHECK(parsed->frames[0].header.isModular);
+    CHECK((parsed->frames[1].header.flags & codestream::FrameHeader::kUseDcFrame) != 0);
+    const std::filesystem::path jxl = test::scratchDir() / std::format("enc_dcframe_{}_{}.jxl", passes, name);
+    const std::filesystem::path out = test::scratchDir() / std::format("enc_dcframe_{}_{}.djxl.png", passes, name);
+    REQUIRE(image::writeFile(jxl, *encoded));
+    REQUIRE(test::run(std::format("\"{}\" \"{}\" \"{}\" >/dev/null 2>&1", djxl.string(), jxl.string(), out.string())));
+    auto reference = image::readRgb8(out);
+    REQUIRE(reference);
+    auto ours = decoder().decode(*encoded);
+    REQUIRE(ours);
+    auto vsDjxl = test::compare(*reference, *ours);
+    REQUIRE(vsDjxl);
+    auto vsSource = test::compare(*source, *ours);
+    REQUIRE(vsSource);
+    WARN(std::format("DC frame {} passes {}: {} bytes (DC frame {}), vs djxl max diff {}, PSNR {:.2f} dB", name, passes, encoded->size(),
+                     encoder().stats().dcFrameBytes, vsDjxl->maxAbsDiff, vsSource->psnr));
+    CHECK(vsDjxl->maxAbsDiff <= 1);
+    CHECK(vsSource->psnr >= 30.0);
+}

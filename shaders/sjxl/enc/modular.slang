@@ -27,9 +27,13 @@ struct ModParams {
     uint wpWordsPerGroup;
     uint pass;        // modTokenize: which predictor pass (tokens and histograms land at its offset)
     uint ctxBase;     // remapTokens: the first context of this stream's set in ctxHist
+    float dcQuantX;   // dcFramePlanes: the DC frame's dc_quant per channel (as the decoder's F16 holds it)
+    float dcQuantY;
+    float dcQuantB;
 };
 
 StructuredBuffer<uint>     rgb8;          // width * height * numChannels samples of bitDepth / 8 bytes, little-endian
+StructuredBuffer<float>    dcValue;       // dcFramePlanes: the VarDCT frame's DC image, [c][block], channels X, Y, B
 RWStructuredBuffer<int>    planes;        // numChannels * width * height: Y, Co, Cg[, alpha] (written by rctYCoCg)
 StructuredBuffer<int>      planesIn;      // the same buffer, read by the token kernels
 StructuredBuffer<uint>     treeNodes;     // kModTreeWords per node
@@ -80,6 +84,27 @@ void rctYCoCg(uint3 tid: SV_DispatchThreadID) {
     planes[1 * plane + i] = co;
     planes[2 * plane + i] = cg;
     if (nc > 3) planes[3 * plane + i] = sampleAt(i * nc + 3);
+}
+
+/// One thread per block: the DC frame's channels from the DC image. A modular
+/// XYB frame holds Y, X and B - Y as integers that the decoder scales by its
+/// dc_quant per channel (dec_modular.cc: "XYB is encoded as YX(B-Y)"), so each
+/// channel is the DC rounded to its own dc_quant grid and B's integer is
+/// relative to Y's.
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void dcFramePlanes(uint3 tid: SV_DispatchThreadID) {
+    const uint n = params.width * params.height;   // blocks
+    if (tid.x >= n) return;
+    const float fx = f16tof32(f32tof16(params.dcQuantX * 128.0f)) / 128.0f;
+    const float fy = f16tof32(f32tof16(params.dcQuantY * 128.0f)) / 128.0f;
+    const float fb = f16tof32(f32tof16(params.dcQuantB * 128.0f)) / 128.0f;
+    const int yi = int(round(dcValue[1 * n + tid.x] / fy));
+    const int xi = int(round(dcValue[0 * n + tid.x] / fx));
+    const int bi = int(round(dcValue[2 * n + tid.x] / fb));
+    planes[0 * n + tid.x] = yi;
+    planes[1 * n + tid.x] = xi;
+    planes[2 * n + tid.x] = bi - yi;
 }
 
 /// One thread per pixel: channel 3 (alpha) of the input as plane 0, for a

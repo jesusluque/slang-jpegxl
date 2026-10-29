@@ -235,15 +235,36 @@ void writeModularFrameHeader(BitWriter& w, uint32_t numExtraChannels, const Fram
     writeU64(w, 0);                                                // FrameHeader extensions
 }
 
+void writeDcFrameHeader(BitWriter& w) {
+    w.writeBool(false);                                            // all_default
+    writeU32(w, U32Enc{{Val(0), Val(1), Val(2), Val(3)}}, 1);      // frame_type = kDCFrame
+    w.writeBool(true);                                             // encoding = kModular
+    writeU64(w, 0);                                                // flags
+    // xyb_encoded forces color_transform = kXYB: nothing written.
+    writeU32(w, U32Enc{{Val(1), Val(2), Val(4), Val(8)}}, 1);      // upsampling = 1 (no extra channels in a DC frame here)
+    w.write(2, 1);                                                 // group_size_shift = 1: 256 px groups
+    writeU32(w, U32Enc{{Val(1), Val(2), Val(3), BitsOffset(3, 4)}}, 1);   // num_passes = 1
+    writeU32(w, U32Enc{{Val(1), Val(2), Val(3), Val(4)}}, 1);      // dc_level = 1
+    // A DC frame has no size/origin, blending, duration, is_last or reference fields.
+    writeU32(w, U32Enc{{Val(0), Bits(4), BitsOffset(5, 16), BitsOffset(10, 48)}}, 0);   // name length
+    w.writeBool(false);                                            // LoopFilter all_default
+    w.writeBool(false);                                            // gab
+    w.write(2, 0);                                                 // epf_iters
+    writeU64(w, 0);                                                // LoopFilter extensions
+    writeU64(w, 0);                                                // FrameHeader extensions
+}
+
 void writeFrameHeader(BitWriter& w, const FrameParams& params, uint32_t numExtraChannels, const FrameInfo& info) {
     w.writeBool(false);                                            // all_default
     writeU32(w, U32Enc{{Val(0), Val(1), Val(2), Val(3)}}, 0);      // frame_type = kRegularFrame
     w.writeBool(false);                                            // encoding = kVarDCT
-    writeU64(w, 0);                                                // flags
+    writeU64(w, params.useDcFrame ? 32u : 0u);                     // flags: kUseDcFrame
     // xyb_encoded forces color_transform = kXYB: nothing written.
-    writeU32(w, U32Enc{{Val(1), Val(2), Val(4), Val(8)}}, 1);      // upsampling = 1
-    for (uint32_t i = 0; i < numExtraChannels; ++i) {
-        writeU32(w, U32Enc{{Val(1), Val(2), Val(4), Val(8)}}, 1);  // ec_upsampling = 1
+    if (!params.useDcFrame) {
+        writeU32(w, U32Enc{{Val(1), Val(2), Val(4), Val(8)}}, 1);      // upsampling = 1
+        for (uint32_t i = 0; i < numExtraChannels; ++i) {
+            writeU32(w, U32Enc{{Val(1), Val(2), Val(4), Val(8)}}, 1);  // ec_upsampling = 1
+        }
     }
     w.write(3, params.xQmScale);                                   // x_qm_scale
     w.write(3, params.bQmScale);                                   // b_qm_scale

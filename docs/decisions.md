@@ -61,11 +61,10 @@ per subsystem or milestone, appended to as the work goes. Dates are absolute.
   specials; PNG colour chunks; DC and AcMetadata with the weighted predictor,
   libjxl's fixed trees and ANS; lossless with the weighted predictor and
   the per-channel predictor choice; alpha and 16-bit in the lossy path;
-  animations of full frames; progressive AC passes.)
-  Next: DC frames (cjxl -p's 1/8 preview frame), three-channel strategy
-  costs, transforms (palette, Squeeze) and a learned tree for lossless, frames
-  that reference the previous one in animations, encoder speed (the serial
-  ANS and WP passes).
+  animations of full frames; progressive AC passes and DC frames.)
+  Next: three-channel strategy costs, transforms (palette, Squeeze) and a
+  learned tree for lossless, frames that reference the previous one in
+  animations, encoder speed (the serial ANS and WP passes).
 - **M4 decoder completeness**: splines, grey JPEG transcodes, loop filters
   on YCbCr frames, extra channel blending in patches, writing the ICC
   profile into the output file, float samples. (16-bit output, animation
@@ -1088,6 +1087,43 @@ pays +4.4 % and +5.9 % for the same modes. The debugging hook `SJXL_PASSES=
 group failures now say which check failed (non-zero count, leftover
 non-zeros, ANS final state) with `SJXL_DEBUG=1` naming the thread.
 
-Not done: cjxl's `-p` also emits a DC frame (a Modular frame at 1/8 size
-whose planes become the main frame's DC); group reordering (`centerfirst`
-permuted TOC); choosing the passes per image.
+Not done: group reordering (`centerfirst` permuted TOC); choosing the passes
+per image.
+
+## DC frames in the encoder (2026-10-29)
+
+`Options::progressiveDc` (`--progressive-dc`; cjxl's `-p` is this plus the
+three frequency passes) writes libjxl's progressive_dc 1: a DC frame before
+the VarDCT frame, which then carries flag kUseDcFrame, no upsampling fields,
+and DC group sections holding only the AcMetadata (no extra_precision, DC
+tree, histograms or DC stream: `buildDcGroupBlobs` and `dcGroupSections`
+skip them and `dcTokenize` is not run). The decoder takes the frame's DC from
+the DC frame's planes and skips the adaptive DC smoothing, as libjxl does.
+
+The DC frame is a Modular frame in XYB at 1/8 size (frame type kDCFrame,
+dc_level 1, 256 px groups, one pass, no filters, not displayed; libjxl's
+ImageBundle "lie": the pixels are already XYB). A modular XYB frame holds the
+channels Y, X and B − Y as integers that the decoder scales by its own
+dc_quant per channel (`DequantMatrices::DecodeDC`, F16 of 128 × the value),
+so `dcFramePlanes` rounds each channel of the DC image (`dcValue`, what
+`dcFromLlf` measured) to its own grid and makes B relative to Y, and the DC
+frame's DcGlobal writes the frame's three DC steps (kDCQuant[c] / (global
+scale × quant_dc), the same steps the VarDCT DC would have used) as those
+dc_quant values; the kernel applies the same F16 rounding the decoder will.
+B is thus quantised on its own grid rather than relative to Y's reconstruction
+(the DC CfL of the VarDCT path), and libjxl's lossy modular DC frame (distance
+× 0.02) is replaced by one at exactly the frame's DC precision. The modular
+machinery is the lossless path's: `encodeLossless` now only runs the RCT and
+calls `encodeModularFrame(spec, planes)`, which the DC frame calls with the
+RCT off and the custom dc_quant (`CodeParams rct, dcQuantCustom,
+dcQuantX/Y/B`). No DC frame with an alpha channel (libjxl disables
+progressive_dc with extra channels too; the option is ignored).
+
+Measured at d 1: sveti_stefan_320 16786 B with the DC frame (2039 B of it)
+against 16488 B single pass, PSNR 35.59 vs 35.60 dB; the 4K photo (as RGB)
+1240668 B against 1212760 B (+2.3 %) with a 480×270 DC frame of four groups
+(28 KB, more than the DC stream it replaces: the DC frame's fixed trees and
+per-group headers, and B on its own grid instead of relative to Y). Our decode matches djxl within
+1 on every test image, with and without the frequency passes (`[dcframe]`
+test). Not done: deeper DC levels (progressive_dc 2), DC frames with extra
+channels.

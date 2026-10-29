@@ -67,7 +67,16 @@ struct CodeParams {
     uint ecInGlobal;      // 1: the alpha channel fits a group and its stream goes into DcGlobal
     uint ecLogAlpha;      // the alpha stream's ANS alphabet (6 at 8 bits, 7 at 16)
     uint numAcSets;       // AC passes (one histogram set each); 1 for a lossless frame's layout
+    uint rct;             // modular frames: 1 writes the YCoCg RCT over channels 0..2 in the GroupHeader
+    uint dcQuantCustom;   // modular frames: 1 writes dc_quant (DequantMatrices::DecodeDC) as the three F16s below
+    uint useDcFrame;      // VarDCT frames: 1 leaves the DC groups' DC stream out (kUseDcFrame)
+    float dcQuantX;       // the custom dc_quant per channel (X, Y, B)
+    float dcQuantY;
+    float dcQuantB;
 };
+
+/// dc_quant as the decoder will hold it: F16 of 128 x the value, back to float.
+float dcQuantF16(float v) { return f16tof32(f32tof16(v * 128.0f)) / 128.0f; }
 
 StructuredBuffer<uint4>    dcGroups;   // bx0, by0, w, h in blocks
 StructuredBuffer<uint>     acs;        // per block: strategy << 1 | first
@@ -593,14 +602,16 @@ void buildDcGroupBlobs(uint3 gid: SV_GroupID) {
     const uint4 rect = dcGroups[g];
 
     // "pre": extra_precision, the DC stream's header: the kWPFixedDC tree and
-    // its clustered ANS histograms (set 1 + 2g).
+    // its clustered ANS histograms (the group's DC set). Nothing with a DC frame.
     SerialWriter pre;
     pre.base = (2 + 2 * g) * kBlobStrideWords;
     pre.pos = 0;
-    serialWrite(blobs, pre, 2, 0);
-    writeLocalGroupHeader(blobs, pre);
-    writeTreeFromNodes(blobs, pre, dcTree, params.dcTreeNodes);
-    writeHistogramSet(blobs, pre, params.dcLeaves, clusterInfo[dcSetOf(g)], 7, dcSetOf(g));
+    if (params.useDcFrame == 0) {
+        serialWrite(blobs, pre, 2, 0);
+        writeLocalGroupHeader(blobs, pre);
+        writeTreeFromNodes(blobs, pre, dcTree, params.dcTreeNodes);
+        writeHistogramSet(blobs, pre, params.dcLeaves, clusterInfo[dcSetOf(g)], 7, dcSetOf(g));
+    }
     blobBits[2 + 2 * g] = pre.pos;
 
     // "mid": count - 1 (one AcMetadata entry per varblock), the AcMetadata
@@ -768,18 +779,31 @@ void buildModularGlobalBlob(uint3 gid: SV_GroupID) {
     SerialWriter dc;
     dc.base = 0;
     dc.pos = 0;
-    serialWrite(blobs, dc, 1, 1);        // DequantMatrices DC all_default
+    if (params.dcQuantCustom != 0) {
+        // DequantMatrices::DecodeDC: dc_quant per channel as F16 of 128 x the value
+        // (a DC frame's integers scale by these into XYB).
+        serialWrite(blobs, dc, 1, 0);
+        serialWrite(blobs, dc, 16, f32tof16(params.dcQuantX * 128.0f));
+        serialWrite(blobs, dc, 16, f32tof16(params.dcQuantY * 128.0f));
+        serialWrite(blobs, dc, 16, f32tof16(params.dcQuantB * 128.0f));
+    } else {
+        serialWrite(blobs, dc, 1, 1);    // DequantMatrices DC all_default
+    }
     serialWrite(blobs, dc, 1, 1);        // has_tree
     writeTreeFromNodes(blobs, dc, treeNodes, params.numTreeNodes);
     writeHistogramSet(blobs, dc, params.numLeaves, clusterInfo[0], modLogAlpha(), 0);
     // GroupHeader of the global stream.
     serialWrite(blobs, dc, 1, 1);        // use_global_tree
     serialWrite(blobs, dc, 1, 1);        // weighted::Header all_default
-    serialWrite(blobs, dc, 2, 1);        // num_transforms: U32 Val(1)
-    serialWrite(blobs, dc, 2, 0);        // Transform id: RCT
-    serialWrite(blobs, dc, 2, 0);        // begin_c: BitsOffset(3, 0) ...
-    serialWrite(blobs, dc, 3, 0);        // ... = 0
-    serialWrite(blobs, dc, 2, 0);        // rct_type: Val(6), YCoCg
+    if (params.rct != 0) {
+        serialWrite(blobs, dc, 2, 1);    // num_transforms: U32 Val(1)
+        serialWrite(blobs, dc, 2, 0);    // Transform id: RCT
+        serialWrite(blobs, dc, 2, 0);    // begin_c: BitsOffset(3, 0) ...
+        serialWrite(blobs, dc, 3, 0);    // ... = 0
+        serialWrite(blobs, dc, 2, 0);    // rct_type: Val(6), YCoCg
+    } else {
+        serialWrite(blobs, dc, 2, 0);    // num_transforms: U32 Val(0)
+    }
     if (params.width <= params.groupDim && params.height <= params.groupDim) {
         writeModularImageStream(blobs, dc, 0);
     }

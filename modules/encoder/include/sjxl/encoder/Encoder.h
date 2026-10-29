@@ -6,6 +6,7 @@
 #pragma once
 
 #include <cstdint>
+#include <array>
 #include <memory>
 #include <vector>
 
@@ -46,6 +47,10 @@ struct Options {
     /// coefficient at half precision, then the rest: 2 passes); 2 libjxl's
     /// progressive (the 2x2 lowest frequencies, then 3x3, then all: 3 passes).
     uint32_t progressive = 0;
+    /// A DC frame first (libjxl's progressive_dc 1): the DC image as a Modular
+    /// XYB frame at 1/8 size, the VarDCT frame taking its DC from it (lossy
+    /// RGB only: libjxl does not combine DC frames with extra channels either).
+    bool progressiveDc = false;
 };
 
 /// What the last encode measured, for tests and the CLI.
@@ -59,6 +64,7 @@ struct Stats {
     bool                  gaborish = false;
     uint32_t              epfIters = 0;
     uint32_t              alphaPredictor = 0;   ///< lossy with alpha: 0 weighted, 1 gradient
+    uint32_t              dcFrameBytes = 0;     ///< progressive DC: the DC frame (header, TOC, body)
 };
 
 class Encoder {
@@ -78,6 +84,18 @@ private:
     /// One frame's bytes (frame header, TOC, body), byte-aligned, without the codestream header.
     [[nodiscard]] Result<std::vector<uint8_t>> encodeFrame(const image::Rgb8& image, const Options& options, const codestream::FrameInfo& info);
     [[nodiscard]] Result<std::vector<uint8_t>> encodeLossless(const image::Rgb8& image, const Options& options, const codestream::FrameInfo& info);
+    /// A Modular frame of `planes` (channels of width x height int32 samples,
+    /// already on the device): the frame header, TOC and body. `rct` writes the
+    /// YCoCg RCT over channels 0..2 (the planes must hold its output); a DC frame
+    /// (`dcQuant` set) is an XYB frame at 1/8 size scaled by those factors.
+    struct ModularSpec {
+        uint32_t width = 0, height = 0, channels = 3, bitDepth = 8;
+        bool     rct = true;
+        bool     dcFrame = false;
+        std::array<float, 3> dcQuant{};
+    };
+    [[nodiscard]] Result<std::vector<uint8_t>> encodeModularFrame(const ModularSpec& spec, const gpu::Buffer& planes, const Options& options,
+                                                                  const codestream::FrameInfo& info);
 
     std::shared_ptr<gpu::ShaderLibrary> library_;
     gpu::Device*                        device_ = nullptr;
@@ -85,7 +103,7 @@ private:
     gpu::ComputeKernel                  gaborishInverse_, cflTile_, quantize_;
     gpu::ComputeKernel                  tables_, buildOrders_, selectStrategies_, largeQf_, largeRows_, largeCols_, mergeLarge_, adjustQuantField_, dctRows_, dctCols_, dcFromLlf_, specialTransform_, passNonZeroCount_, acTokenize_;
     gpu::ComputeKernel                  dcTokenize_, metaTokenize_, dcGroupSections_, clusterContexts_, accumulateClusters_, acSections_;
-    gpu::ComputeKernel                  rctYCoCg_, modTokenize_, extractAlpha_, channelEntropy_, remapTokens_, modGroupSections_, modularGlobalBlob_;
+    gpu::ComputeKernel                  rctYCoCg_, dcFramePlanes_, modTokenize_, extractAlpha_, channelEntropy_, remapTokens_, modGroupSections_, modularGlobalBlob_;
     gpu::ComputeKernel                  dcGroupBlobs_, globalBlobs_, layout_, blobEmit_;
     gpu::PrefixSum                      prefixSum_;
     gpu::Buffer                         dequantAll_;   // every quant table kind, 3 channels each (kTableBase layout)

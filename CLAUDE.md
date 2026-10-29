@@ -17,7 +17,7 @@ ctest --test-dir build/macos-arm64-debug -R prefix          # tests matching a n
 build/macos-arm64-debug/bin/sjxl_gpu_tests "prefix sum*"    # one Catch2 case by name (or a [tag])
 cmake --build build/macos-arm64-debug --target sjxl_gpu_tests   # one binary
 build/macos-arm64-debug/bin/sjxl info [in.jxl]              # device info, or a file's headers and frame list
-build/macos-arm64-debug/bin/sjxl encode in.png out.jxl --distance 1.0 [--no-aq] [--no-cfl] [--no-filters] [--no-acs] [--lambda x] [--clusters n] [--progressive | --qprogressive]
+build/macos-arm64-debug/bin/sjxl encode in.png out.jxl --distance 1.0 [--no-aq] [--no-cfl] [--no-filters] [--no-acs] [--lambda x] [--clusters n] [--progressive | --qprogressive] [--progressive-dc]
 build/macos-arm64-debug/bin/sjxl encode in.png out.jxl --lossless   # Modular frame, bit-exact; RGB/RGBA, 8/16-bit
 build/macos-arm64-debug/bin/sjxl animate out.jxl --fps 10 [--loops n] [--lossless] [-d d] f1.png f2.png ...   # animation, one tick per frame
 build/macos-arm64-debug/bin/sjxl decode in.jxl out.png                  # every stage on the GPU; animations write out_000.png, ...
@@ -108,7 +108,7 @@ Modules are static libraries `sjxl_<name>` aliased `sjxl::<name>`
 | codestream | CPU-side syntax only: `BitWriter`, U32/U64/F16 field coders, SizeHeader, ImageMetadata, FrameHeader, LoopFilter, TOC (`Headers.h`); `Tables.h`: quantizer params from a distance, DCT8 dequant weights, natural order, computed from libjxl formulas |
 | image | file I/O only: PNG/PPM/JPEG via stb (`readRgb8` 8-bit RGB, `readImage8` keeps alpha, `readImage` keeps alpha and 16-bit depth; `Rgb8` has `channels` 3/4 and `bitDepth` 8/16; `writePng` writes 16-bit PNGs itself; `readFile`, `writeFile`) |
 | metrics | `metrics::compare`: PSNR, largest difference and where, measured by `shaders/sjxl/metrics/compare.slang`; what tests and `sjxl compare` use |
-| encoder | `enc::Encoder::encode(Rgb8, Options{lossless, distance, adaptiveQuant, chromaFromLuma, loopFilter, acClusters, acStrategy, acsLambda, acsSpecials})`: RGB/RGBA, 8/16-bit; lossless → `encodeLossless` (modular: rctYCoCg → modHist → cluster → buildModularGlobalBlob (tree, histograms, RCT header, the stream when the image fits a group) → modGroupSections (ANS per group)); lossy → the VarDCT pipeline (`shaders/sjxl/enc/`): xyb → aq (quant field) → gaborish (inverse) → cfl (dct, per-tile least squares) → quantize (AdjustQuantBlockAC, dead zones) → strategy + large (transform selection per 32×32 superblock, then the 64-pixel families per 64×64 region) → transform (adjustQuantField, dctRows/dctCols for any varblock, dcFromLlf, acTokenize) → cfl → quantize (per varblock) → dc_tokens (dcTokenize: WP + kWPFixedDC per DC group; metaTokenize per item with kACMeta) → cluster per set → codes (trees, ANS histograms and context maps per set) → ac_sections + dcGroupSections (ANS per group, count then emit) → layout → emit |
+| encoder | `enc::Encoder::encode(Rgb8, Options{lossless, distance, adaptiveQuant, chromaFromLuma, loopFilter, acClusters, acStrategy, acsLambda, acsSpecials})`: RGB/RGBA, 8/16-bit; lossless → `encodeLossless` (rctYCoCg, then `encodeModularFrame`, also the DC frame's writer: modHist → cluster → buildModularGlobalBlob (tree, histograms, RCT header, the stream when the image fits a group) → modGroupSections (ANS per group)); lossy → the VarDCT pipeline (`shaders/sjxl/enc/`): xyb → aq (quant field) → gaborish (inverse) → cfl (dct, per-tile least squares) → quantize (AdjustQuantBlockAC, dead zones) → strategy + large (transform selection per 32×32 superblock, then the 64-pixel families per 64×64 region) → transform (adjustQuantField, dctRows/dctCols for any varblock, dcFromLlf, acTokenize) → cfl → quantize (per varblock) → dc_tokens (dcTokenize: WP + kWPFixedDC per DC group; metaTokenize per item with kACMeta) → cluster per set → codes (trees, ANS histograms and context maps per set) → ac_sections + dcGroupSections (ANS per group, count then emit) → layout → emit |
 | decoder | `dec::Decoder::decode(bytes)`: `codestream::parse` on the CPU, then `shaders/sjxl/dec/`: sections (one thread per section: globals, DC groups, AC groups; libraries entropy/modular/frame/modframe .slangh over one `arena` buffer) → VarDCT: tables → dc_finalize → transforms; Modular: finalise (inverse transforms) → modular_out (channels to planes) → filters → output |
 | decoder (M2) | `dec::Decoder`: the GPU decode pipeline |
 
@@ -156,6 +156,10 @@ coefficients per pass, every pass has its own token buffers, non-zero grid and
 histogram set (sets are numbered passes first, then DC/AcMetadata per DC
 group, then alpha), AcGlobal carries one orders+histograms block per pass and
 the TOC one AC section per (pass, group); `SJXL_PASSES` overrides the list.
+`--progressive-dc` writes a DC frame first (a Modular XYB frame at 1/8 size
+from `dcFramePlanes`, its DcGlobal carrying the frame's DC steps as dc_quant,
+through `encodeModularFrame`) and the VarDCT frame with kUseDcFrame and no DC
+stream; cjxl's `-p` is `--progressive --progressive-dc`.
 `Encoder::encodeAnimation` writes the animation metadata and one frame per
 image through the same `encodeFrame` (full canvas, kReplace, duration in
 ticks, `is_last` on the final frame).
