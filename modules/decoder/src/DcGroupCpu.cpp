@@ -12,6 +12,7 @@
 #include "sjxl/decoder/DcGroupCpu.h"
 
 #include "sjxl/codestream/WeightedPredictor.h"
+#include "sjxl/core/Log.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -37,7 +38,7 @@ constexpr uint32_t kPredWeighted = 6;
 /// The port reports what it cannot do as `Unsupported` (the caller falls back)
 /// and corrupt streams as `Corrupt`.
 struct Unsupported {};
-struct Corrupt {};
+struct Corrupt { int line = 0; };
 
 // --- bit reader ---------------------------------------------------------------------
 
@@ -107,10 +108,10 @@ uint32_t decodeUintConfig(BitReader& br, uint32_t logAlphaSize) {
     uint32_t msb = 0, lsb = 0;
     if (splitExp != logAlphaSize) {
         msb = br.read(ceilLog2Nonzero(splitExp + 1));
-        if (msb > splitExp) throw Corrupt{};
+        if (msb > splitExp) throw Corrupt{__LINE__};
         lsb = br.read(ceilLog2Nonzero(splitExp - msb + 1));
     }
-    if (lsb + msb > splitExp) throw Corrupt{};
+    if (lsb + msb > splitExp) throw Corrupt{__LINE__};
     return packConfig(splitExp, msb, lsb);
 }
 
@@ -328,11 +329,11 @@ bool readSimpleCode(BitReader& br, uint32_t alphabet, std::vector<uint32_t>& tab
 }
 
 std::vector<uint32_t> readHuffmanCode(BitReader& br, uint32_t alphabet) {
-    if (alphabet > (1u << kPrefixMaxBits)) throw Corrupt{};
+    if (alphabet > (1u << kPrefixMaxBits)) throw Corrupt{__LINE__};
     std::vector<uint32_t> table(std::max<uint32_t>(alphabet + 376, 256), 0);
     const uint32_t simpleOrSkip = br.read(2);
     if (simpleOrSkip == 1) {
-        if (!readSimpleCode(br, alphabet, table)) throw Corrupt{};
+        if (!readSimpleCode(br, alphabet, table)) throw Corrupt{__LINE__};
         return table;
     }
     std::vector<uint32_t> lengths(alphabet, 0);
@@ -352,9 +353,9 @@ std::vector<uint32_t> readHuffmanCode(BitReader& br, uint32_t alphabet) {
             ++numCodes;
         }
     }
-    if (!(numCodes == 1 || space == 0)) throw Corrupt{};
-    if (!readHuffmanCodeLengths(br, clc, alphabet, lengths.data())) throw Corrupt{};
-    if (buildHuffmanTable(table.data(), kHuffmanTableBits, lengths.data(), alphabet) == 0) throw Corrupt{};
+    if (!(numCodes == 1 || space == 0)) throw Corrupt{__LINE__};
+    if (!readHuffmanCodeLengths(br, clc, alphabet, lengths.data())) throw Corrupt{__LINE__};
+    if (buildHuffmanTable(table.data(), kHuffmanTableBits, lengths.data(), alphabet) == 0) throw Corrupt{__LINE__};
     return table;
 }
 
@@ -587,6 +588,7 @@ bool initAliasTable(uint32_t* counts, uint32_t length, uint32_t logAlpha, uint32
 
 struct CodeSet {
     bool                               lz77 = false;
+    uint32_t                           minSymbol = 0, minLength = 0, lengthConfig = 0, distCluster = 0;   // LZ77Params
     uint32_t                           numContexts = 0;
     uint32_t                           numClusters = 1;
     bool                               usePrefix = false;
@@ -596,11 +598,34 @@ struct CodeSet {
     std::vector<std::vector<uint32_t>> tables;   // per cluster: alias entries (2 words each) or a prefix table
 };
 
+constexpr uint32_t kLz77WindowSize = 1u << 20;
+constexpr uint32_t kNumSpecialDistances = 120;
+
+const int kSpecialDistances[120][2] = {
+    {0, 1},  {1, 0},  {1, 1},  {-1, 1}, {0, 2},  {2, 0},  {1, 2},  {-1, 2}, {2, 1},  {-2, 1}, {2, 2},  {-2, 2},
+    {0, 3},  {3, 0},  {1, 3},  {-1, 3}, {3, 1},  {-3, 1}, {2, 3},  {-2, 3}, {3, 2},  {-3, 2}, {0, 4},  {4, 0},
+    {1, 4},  {-1, 4}, {4, 1},  {-4, 1}, {3, 3},  {-3, 3}, {2, 4},  {-2, 4}, {4, 2},  {-4, 2}, {0, 5},  {3, 4},
+    {-3, 4}, {4, 3},  {-4, 3}, {5, 0},  {1, 5},  {-1, 5}, {5, 1},  {-5, 1}, {2, 5},  {-2, 5}, {5, 2},  {-5, 2},
+    {4, 4},  {-4, 4}, {3, 5},  {-3, 5}, {5, 3},  {-5, 3}, {0, 6},  {6, 0},  {1, 6},  {-1, 6}, {6, 1},  {-6, 1},
+    {2, 6},  {-2, 6}, {6, 2},  {-6, 2}, {4, 5},  {-4, 5}, {5, 4},  {-5, 4}, {3, 6},  {-3, 6}, {6, 3},  {-6, 3},
+    {0, 7},  {7, 0},  {1, 7},  {-1, 7}, {5, 5},  {-5, 5}, {7, 1},  {-7, 1}, {4, 6},  {-4, 6}, {6, 4},  {-6, 4},
+    {2, 7},  {-2, 7}, {7, 2},  {-7, 2}, {3, 7},  {-3, 7}, {7, 3},  {-7, 3}, {5, 6},  {-5, 6}, {6, 5},  {-6, 5},
+    {8, 0},  {4, 7},  {-4, 7}, {7, 4},  {-7, 4}, {8, 1},  {8, 2},  {6, 6},  {-6, 6}, {8, 3},  {5, 7},  {-5, 7},
+    {7, 5},  {-7, 5}, {8, 4},  {6, 7},  {-6, 7}, {7, 6},  {-7, 6}, {8, 5},  {7, 7},  {-7, 7}, {8, 6},  {8, 7}};
+
+uint32_t specialDistance(uint32_t index, uint32_t multiplier) {
+    const int dist = kSpecialDistances[index][0] + static_cast<int>(multiplier) * kSpecialDistances[index][1];
+    return dist > 1 ? static_cast<uint32_t>(dist) : 1;
+}
+
 struct SymReader {
-    const CodeSet* cs = nullptr;
-    uint32_t       state = 0;
-    uint32_t       logEntrySize = 0;
-    uint32_t       entryMask = 0;
+    const CodeSet*        cs = nullptr;
+    uint32_t              state = 0;
+    uint32_t              logEntrySize = 0;
+    uint32_t              entryMask = 0;
+    // LZ77 (entropy.slangh readHybridUintClustered): the window of decoded values.
+    std::vector<uint32_t> window;
+    uint32_t              numDecoded = 0, numToCopy = 0, copyPos = 0, distMul = 0;
 };
 
 void decodeCodeTail(BitReader& br, CodeSet& cs, uint32_t numClusters) {
@@ -614,7 +639,7 @@ void decodeCodeTail(BitReader& br, CodeSet& cs, uint32_t numClusters) {
         std::vector<uint32_t> sizes(numClusters);
         for (uint32_t c = 0; c < numClusters; ++c) {
             sizes[c] = decodeVarLenUint16(br) + 1;
-            if (sizes[c] > (1u << kPrefixMaxBits)) throw Corrupt{};
+            if (sizes[c] > (1u << kPrefixMaxBits)) throw Corrupt{__LINE__};
         }
         for (uint32_t c = 0; c < numClusters; ++c) {
             if (sizes[c] > 1) {
@@ -627,17 +652,18 @@ void decodeCodeTail(BitReader& br, CodeSet& cs, uint32_t numClusters) {
         uint32_t counts[256];
         for (uint32_t c = 0; c < numClusters; ++c) {
             const uint32_t length = readAnsHistogram(br, counts);
-            if (length == 0 || length > (1u << cs.logAlpha)) throw Corrupt{};
+            if (length == 0 || length > (1u << cs.logAlpha)) throw Corrupt{__LINE__};
             cs.tables[c].assign(2u << cs.logAlpha, 0);
-            if (!initAliasTable(counts, length, cs.logAlpha, cs.tables[c].data())) throw Corrupt{};
+            if (!initAliasTable(counts, length, cs.logAlpha, cs.tables[c].data())) throw Corrupt{__LINE__};
         }
     }
 }
 
-SymReader makeSymReader(BitReader& br, const CodeSet& cs) {
-    if (cs.lz77) throw Unsupported{};   // the GPU path keeps LZ77 streams
+SymReader makeSymReader(BitReader& br, const CodeSet& cs, uint32_t distMul = 0) {
     SymReader r;
     r.cs = &cs;
+    r.distMul = distMul;
+    if (cs.lz77) r.window.assign(kLz77WindowSize, 0);
     if (!cs.usePrefix) {
         r.state = br.read(32);
         r.logEntrySize = kAnsLogTabSize - cs.logAlpha;
@@ -674,8 +700,45 @@ uint32_t readSymbol(BitReader& br, SymReader& r, uint32_t cluster) {
 }
 
 uint32_t readHybridUintClustered(BitReader& br, SymReader& r, uint32_t cluster) {
+    const CodeSet& cs = *r.cs;
+    const uint32_t mask = kLz77WindowSize - 1;
+    if (cs.lz77 && r.numToCopy > 0) {
+        const uint32_t ret = r.window[r.copyPos & mask];
+        ++r.copyPos;
+        --r.numToCopy;
+        r.window[r.numDecoded & mask] = ret;
+        ++r.numDecoded;
+        return ret;
+    }
     const uint32_t token = readSymbol(br, r, cluster);
-    return readHybridUintConfig(br, r.cs->configs[cluster], token);
+    if (cs.lz77 && token >= cs.minSymbol) {
+        r.numToCopy = readHybridUintConfig(br, cs.lengthConfig, token - cs.minSymbol) + cs.minLength;
+        const uint32_t dToken = readSymbol(br, r, cs.distCluster);
+        uint32_t distance = readHybridUintConfig(br, cs.configs[cs.distCluster], dToken);
+        const uint32_t numSpecial = r.distMul == 0 ? 0 : kNumSpecialDistances;
+        if (distance < numSpecial) distance = specialDistance(distance, r.distMul);
+        else distance = distance + 1 - numSpecial;
+        if (distance > r.numDecoded) distance = r.numDecoded;
+        if (distance > kLz77WindowSize) distance = kLz77WindowSize;
+        r.copyPos = r.numDecoded - distance;
+        if (distance == 0) {
+            const uint32_t toFill = std::min(r.numToCopy, kLz77WindowSize);
+            std::fill(r.window.begin(), r.window.begin() + toFill, 0u);
+        }
+        if (r.numToCopy < cs.minLength) throw Corrupt{__LINE__};
+        const uint32_t ret = r.window[r.copyPos & mask];
+        ++r.copyPos;
+        --r.numToCopy;
+        r.window[r.numDecoded & mask] = ret;
+        ++r.numDecoded;
+        return ret;
+    }
+    const uint32_t ret = readHybridUintConfig(br, cs.configs[cluster], token);
+    if (cs.lz77) {
+        r.window[r.numDecoded & mask] = ret;
+        ++r.numDecoded;
+    }
+    return ret;
 }
 
 uint32_t readHybridUint(BitReader& br, SymReader& r, uint32_t ctx) { return readHybridUintClustered(br, r, r.cs->ctxMap[ctx]); }
@@ -698,11 +761,10 @@ std::unique_ptr<CodeSet> decodeHistograms(BitReader& br, uint32_t numContexts) {
     auto cs = std::make_unique<CodeSet>();
     cs->lz77 = br.read(1) != 0;
     if (cs->lz77) {
-        (void)readU32(br, val(224), val(512), val(4096), bitsOffset(15, 8));
-        (void)readU32(br, val(3), val(4), bitsOffset(2, 5), bitsOffset(8, 9));
+        cs->minSymbol = readU32(br, val(224), val(512), val(4096), bitsOffset(15, 8));
+        cs->minLength = readU32(br, val(3), val(4), bitsOffset(2, 5), bitsOffset(8, 9));
         ++numContexts;
-        (void)decodeUintConfig(br, 8);
-        throw Unsupported{};   // LZ77 streams stay on the GPU
+        cs->lengthConfig = decodeUintConfig(br, 8);
     }
     cs->numContexts = numContexts;
     cs->ctxMap.assign(numContexts, 0);
@@ -718,10 +780,28 @@ std::unique_ptr<CodeSet> decodeHistograms(BitReader& br, uint32_t numContexts) {
             const bool useMtf = br.read(1) != 0;
             CodeSet inner;
             inner.lz77 = br.read(1) != 0;
-            if (inner.lz77) throw Unsupported{};
-            inner.numContexts = 1;
-            inner.ctxMap.assign(1, 0);
-            decodeCodeTail(br, inner, 1);
+            if (inner.lz77) {
+                inner.minSymbol = readU32(br, val(224), val(512), val(4096), bitsOffset(15, 8));
+                inner.minLength = readU32(br, val(3), val(4), bitsOffset(2, 5), bitsOffset(8, 9));
+                inner.lengthConfig = decodeUintConfig(br, 8);
+            }
+            inner.numContexts = inner.lz77 ? 2 : 1;
+            inner.ctxMap.assign(inner.numContexts, 0);
+            uint32_t innerClusters = 1;
+            if (inner.numContexts > 1) {
+                // With LZ77 the nested stream has two contexts and a context map of its own:
+                // the simple form (a third coded level is not read, as in the kernel).
+                if (numContexts <= 2) throw Corrupt{__LINE__};
+                if (br.read(1) == 0) throw Unsupported{};
+                const uint32_t bitsPerEntry = br.read(2);
+                if (bitsPerEntry != 0) for (uint32_t& m : inner.ctxMap) m = br.read(bitsPerEntry);
+                uint32_t maxEntry = 0;
+                for (uint32_t m : inner.ctxMap) maxEntry = std::max(maxEntry, m);
+                innerClusters = maxEntry + 1;
+                if (innerClusters > 2) throw Corrupt{__LINE__};
+            }
+            inner.distCluster = inner.ctxMap[inner.numContexts - 1];
+            decodeCodeTail(br, inner, innerClusters);
             SymReader r = makeSymReader(br, inner);
             uint32_t maxSym = 0;
             for (uint32_t i = 0; i < numContexts; ++i) {
@@ -729,7 +809,7 @@ std::unique_ptr<CodeSet> decodeHistograms(BitReader& br, uint32_t numContexts) {
                 maxSym = std::max(maxSym, sym);
                 cs->ctxMap[i] = sym;
             }
-            if (maxSym >= 256 || !checkFinalState(r)) throw Corrupt{};
+            if (maxSym >= 256 || !checkFinalState(r)) throw Corrupt{__LINE__};
             if (useMtf) inverseMtf(cs->ctxMap);
         }
         uint32_t maxEntry = 0;
@@ -737,8 +817,9 @@ std::unique_ptr<CodeSet> decodeHistograms(BitReader& br, uint32_t numContexts) {
         numClusters = maxEntry + 1;
         std::vector<uint8_t> seen(numClusters, 0);
         for (uint32_t v : cs->ctxMap) seen[v] = 1;
-        for (uint8_t s : seen) if (s == 0) throw Corrupt{};
+        for (uint8_t s : seen) if (s == 0) throw Corrupt{__LINE__};
     }
+    cs->distCluster = cs->ctxMap[numContexts - 1];
     decodeCodeTail(br, *cs, numClusters);
     return cs;
 }
@@ -768,19 +849,19 @@ void decodeTree(BitReader& br, Tree& t) {
     uint32_t toDecode = 1;
     uint32_t leafId = 0;
     while (toDecode > 0) {
-        if (t.nodes.size() >= kMaxTreeNodes) throw Corrupt{};
+        if (t.nodes.size() >= kMaxTreeNodes) throw Corrupt{__LINE__};
         --toDecode;
         const uint32_t prop1 = readHybridUint(br, r, 1);
-        if (prop1 > 256) throw Corrupt{};
+        if (prop1 > 256) throw Corrupt{__LINE__};
         Node n;
         if (prop1 == 0) {
             n.predictor = readHybridUint(br, r, 2);
-            if (n.predictor >= 14) throw Corrupt{};
+            if (n.predictor >= 14) throw Corrupt{__LINE__};
             n.offset = unpackSigned(readHybridUint(br, r, 3));
             const uint32_t mulLog = readHybridUint(br, r, 4);
-            if (mulLog >= 31) throw Corrupt{};
+            if (mulLog >= 31) throw Corrupt{__LINE__};
             const uint32_t mulBits = readHybridUint(br, r, 5);
-            if (mulBits >= (1u << (31u - mulLog)) - 1u) throw Corrupt{};
+            if (mulBits >= (1u << (31u - mulLog)) - 1u) throw Corrupt{__LINE__};
             n.prop = -1;
             n.multiplier = static_cast<int32_t>((mulBits + 1) << mulLog);
             n.ctx = leafId;
@@ -798,7 +879,7 @@ void decodeTree(BitReader& br, Tree& t) {
         toDecode += 2;
     }
     t.numLeaves = leafId;
-    if (!checkFinalState(r)) throw Corrupt{};
+    if (!checkFinalState(r)) throw Corrupt{__LINE__};
 }
 
 // --- the weighted predictor: codestream/WeightedPredictor.h ----------------------------
@@ -944,29 +1025,64 @@ void decodeChannel(BitReader& br, SymReader& r, const Tree& tree, const WpHeader
     }
 }
 
-/// ModularDecode of one stream over `channels`: GroupHeader (no transforms here), the
-/// tree (local or the frame's global one), every channel.
-void decodeModularStream(BitReader& br, std::vector<Channel>& channels, uint32_t streamId, const Tree* global) {
-    if (channels.empty()) return;
-    const bool useGlobalTree = br.read(1) != 0;
-    const WpHeader wp = readWpHeader(br);
-    const uint32_t numTransforms = readU32(br, val(0), val(1), bitsOffset(4, 2), bitsOffset(8, 18));
-    if (numTransforms != 0) throw Unsupported{};
-    bool any = false;
-    for (const Channel& c : channels) any = any || (c.w != 0 && c.h != 0);
-    if (!any) return;
+/// A stream's GroupHeader: use_global_tree, the WP header and its transforms, of
+/// which this port takes RCTs (applied by the caller) and rejects the rest.
+struct StreamHeaderCpu {
+    bool     useGlobalTree = false;
+    WpHeader wp;
+    uint32_t numTransforms = 0;
+    struct Rct { uint32_t beginC = 0, type = 0; };
+    std::vector<Rct> rcts;
+};
+
+StreamHeaderCpu readStreamHeader(BitReader& br) {
+    StreamHeaderCpu h;
+    h.useGlobalTree = br.read(1) != 0;
+    h.wp = readWpHeader(br);
+    h.numTransforms = readU32(br, val(0), val(1), bitsOffset(4, 2), bitsOffset(8, 18));
+    for (uint32_t i = 0; i < h.numTransforms; ++i) {
+        const uint32_t id = readU32(br, val(0), val(1), val(2), val(3));
+        if (id != 0) throw Unsupported{};   // palette and squeeze inside a stream: the kernel's business
+        StreamHeaderCpu::Rct rct;
+        rct.beginC = readU32(br, bitsOffset(3, 0), bitsOffset(6, 8), bitsOffset(10, 72), bitsOffset(13, 1096));
+        rct.type = readU32(br, val(6), bitsOffset(2, 0), bitsOffset(4, 2), bitsOffset(6, 10));
+        if (rct.type >= 42) throw Corrupt{__LINE__};
+        h.rcts.push_back(rct);
+    }
+    return h;
+}
+
+/// ModularDecode's second part over `channels`: the tree (local or the frame's
+/// global one), the symbol reader (LZ77's distance multiplier is the widest
+/// channel), every channel, the final state.
+void decodeStreamChannels(BitReader& br, const StreamHeaderCpu& h, std::vector<Channel>& channels, uint32_t streamId, const Tree* global) {
+    uint32_t distMul = 0, numChans = 0;
+    for (const Channel& c : channels) {
+        if (c.w == 0 || c.h == 0) continue;
+        distMul = std::max(distMul, c.w);
+        ++numChans;
+    }
+    if (numChans == 0) return;
     Tree local;
     const Tree* tree = global;
-    if (!useGlobalTree) {
+    if (!h.useGlobalTree) {
         decodeTree(br, local);
         local.codeSet = decodeHistograms(br, (static_cast<uint32_t>(local.nodes.size()) + 1) / 2);
         tree = &local;
     } else if (global == nullptr) {
-        throw Corrupt{};
+        throw Corrupt{__LINE__};
     }
-    SymReader r = makeSymReader(br, *tree->codeSet);
-    for (uint32_t i = 0; i < channels.size(); ++i) decodeChannel(br, r, *tree, wp, channels, i, streamId);
-    if (!checkFinalState(r)) throw Corrupt{};
+    SymReader r = makeSymReader(br, *tree->codeSet, distMul);
+    for (uint32_t i = 0; i < channels.size(); ++i) decodeChannel(br, r, *tree, h.wp, channels, i, streamId);
+    if (!checkFinalState(r)) throw Corrupt{__LINE__};
+}
+
+/// A DC group's stream: no transforms expected (the kernel undoes them; this port leaves such frames to it).
+void decodeModularStream(BitReader& br, std::vector<Channel>& channels, uint32_t streamId, const Tree* global) {
+    if (channels.empty()) return;
+    const StreamHeaderCpu h = readStreamHeader(br);
+    if (h.numTransforms != 0) throw Unsupported{};
+    decodeStreamChannels(br, h, channels, streamId, global);
 }
 
 const uint32_t kNumStrategies = 27;
@@ -984,23 +1100,23 @@ void walkStrategies(const DcGroupGeom& geo, const Channel& cAcs, const Channel& 
         for (uint32_t ix = 0; ix < geo.w; ++ix) {
             const uint32_t x = geo.x0 + ix;
             const int32_t sharpness = cEpf.px(ix, iy);
-            if (sharpness < 0 || sharpness >= 8) throw Corrupt{};
+            if (sharpness < 0 || sharpness >= 8) throw Corrupt{__LINE__};
             if (covered[iy * geo.w + ix] != 0) continue;
-            if (num >= count) throw Corrupt{};
+            if (num >= count) throw Corrupt{__LINE__};
             const int32_t raw = cAcs.px(num, 0);
             const int32_t qfv = cAcs.px(num, 1);
-            if (raw < 0 || raw >= static_cast<int32_t>(kNumStrategies)) throw Corrupt{};
+            if (raw < 0 || raw >= static_cast<int32_t>(kNumStrategies)) throw Corrupt{__LINE__};
             const uint32_t strategy = static_cast<uint32_t>(raw);
             r.usedAcs |= 1u << strategy;
             const uint32_t cx = kCoveredX[strategy], cy = kCoveredY[strategy];
-            if ((cx > 1 || cy > 1) && !is444) throw Corrupt{};
+            if ((cx > 1 || cy > 1) && !is444) throw Corrupt{__LINE__};
             const uint32_t nextXGroup = (x / geo.groupBlocks + 1) * geo.groupBlocks;
             const uint32_t nextYGroup = (y / geo.groupBlocks + 1) * geo.groupBlocks;
-            if (x + cx > nextXGroup || x + cx > geo.x0 + geo.w || y + cy > nextYGroup || y + cy > geo.y0 + geo.h) throw Corrupt{};
+            if (x + cx > nextXGroup || x + cx > geo.x0 + geo.w || y + cy > nextYGroup || y + cy > geo.y0 + geo.h) throw Corrupt{__LINE__};
             for (uint32_t by = 0; by < cy; ++by) {
                 for (uint32_t bx = 0; bx < cx; ++bx) {
                     uint8_t& c = covered[(iy + by) * geo.w + ix + bx];
-                    if (c != 0) throw Corrupt{};
+                    if (c != 0) throw Corrupt{__LINE__};
                     c = 1;
                 }
             }
@@ -1024,23 +1140,33 @@ Channel makeChannel(uint32_t w, uint32_t h, int32_t hshift, int32_t vshift) {
 
 }   // namespace
 
-Result<bool> decodeDcGroups(std::span<const uint8_t> codestream, const ParsedFrame& frame, size_t globalTreeBit,
-                            std::span<const DcGroupGeom> geoms, std::vector<DcGroupData>& out) {
+namespace {
+
+/// The frame's global tree (DcGlobal's modular part), if it has one.
+bool readGlobalTree(const std::vector<uint32_t>& words, size_t globalTreeBit, Tree& global) {
+    BitReader br{words.data(), words.size(), globalTreeBit};
+    if (br.read(1) == 0) return false;
+    decodeTree(br, global);
+    log::debug("decoder (CPU): global tree from bit {}: {} nodes, {} leaves, ends at bit {}", globalTreeBit, global.nodes.size(), global.numLeaves, br.pos);
+    global.codeSet = decodeHistograms(br, (static_cast<uint32_t>(global.nodes.size()) + 1) / 2);
+    return true;
+}
+
+std::vector<uint32_t> codestreamWords(std::span<const uint8_t> codestream) {
     std::vector<uint32_t> words((codestream.size() + 3) / 4 + 2, 0);
     std::memcpy(words.data(), codestream.data(), codestream.size());
+    return words;
+}
+
+}   // namespace
+
+Result<bool> decodeDcGroups(std::span<const uint8_t> codestream, const ParsedFrame& frame, size_t globalTreeBit,
+                            std::span<const DcGroupGeom> geoms, std::vector<DcGroupData>& out) {
+    const std::vector<uint32_t> words = codestreamWords(codestream);
     const bool useDcFrame = (frame.header.flags & codestream::FrameHeader::kUseDcFrame) != 0;
     try {
-        // The global tree (DcGlobal's modular part), if the frame has one.
         Tree global;
-        bool hasGlobal = false;
-        {
-            BitReader br{words.data(), words.size(), globalTreeBit};
-            if (br.read(1) != 0) {
-                decodeTree(br, global);
-                global.codeSet = decodeHistograms(br, (static_cast<uint32_t>(global.nodes.size()) + 1) / 2);
-                hasGlobal = true;
-            }
-        }
+        const bool hasGlobal = readGlobalTree(words, globalTreeBit, global);
         const uint32_t numDcGroups = static_cast<uint32_t>(geoms.size());
         out.assign(numDcGroups, DcGroupData{});
         // The groups are independent chains: one task each (the global tree is read only).
@@ -1097,6 +1223,81 @@ Result<bool> decodeDcGroups(std::span<const uint8_t> codestream, const ParsedFra
         return false;
     } catch (const Corrupt&) {
         return Error(ErrorCode::Corrupt, "the codestream violates the specification in a DC group (CPU path)");
+    }
+    return true;
+}
+
+Result<bool> decodeModularGroups(std::span<const uint8_t> codestream, const ParsedFrame& frame, size_t globalTreeBit, const ModGroupsGeom& geom,
+                                 std::vector<ModGroupData>& out) {
+    const std::vector<uint32_t> words = codestreamWords(codestream);
+    try {
+        Tree global;
+        const bool hasGlobal = readGlobalTree(words, globalTreeBit, global);
+        const uint32_t numGroups = geom.numGroups;
+        out.assign(numGroups, ModGroupData{});
+        enum class Outcome { Ok, Unsupported, Corrupt };
+        const uint32_t perRow = (geom.xsize + geom.groupDim - 1) / geom.groupDim;
+        const auto decodeOne = [&](uint32_t g) -> Outcome {
+            try {
+                ModGroupData& r = out[g];
+                const uint32_t x0 = (g % perRow) * geom.groupDim, y0 = (g / perRow) * geom.groupDim;
+                // The group's rectangles of the channels left to the groups, as the kernel picks them.
+                std::vector<Channel> local;
+                for (uint32_t c = geom.beginC; c < geom.channels.size(); ++c) {
+                    const ModFullChannel& fc = geom.channels[c];
+                    const int32_t shift = std::min(fc.hshift, fc.vshift);
+                    if (shift < geom.minShift || shift > geom.maxShift) continue;
+                    const uint32_t rx0 = x0 >> fc.hshift, ry0 = y0 >> fc.vshift;
+                    if (rx0 >= fc.w || ry0 >= fc.h) continue;
+                    const uint32_t rw = std::min(geom.groupDim >> fc.hshift, fc.w - rx0);
+                    const uint32_t rh = std::min(geom.groupDim >> fc.vshift, fc.h - ry0);
+                    if (rw == 0 || rh == 0) continue;
+                    local.push_back(makeChannel(rw, rh, fc.hshift, fc.vshift));
+                    r.rects.push_back({c, rx0, ry0, rw, rh});
+                }
+                if (local.empty()) return Outcome::Ok;
+                const codestream::Section& s = frame.sections[2 + geom.numDcGroups + g];
+                BitReader br{words.data(), words.size(), s.byteOffset * 8};
+                const StreamHeaderCpu h = readStreamHeader(br);
+                if (h.numTransforms > 1) return Outcome::Unsupported;
+                if (h.numTransforms == 1) {
+                    r.hasRct = true;
+                    r.rctBeginC = h.rcts[0].beginC;
+                    r.rctType = h.rcts[0].type;
+                    if (r.rctBeginC + 3 > local.size()) { log::debug("decoder (CPU): modular group {}: RCT begin {} over {} channels", g, r.rctBeginC, local.size()); return Outcome::Corrupt; }
+                    for (uint32_t k = 1; k < 3; ++k) {
+                        if (local[r.rctBeginC + k].w != local[r.rctBeginC].w || local[r.rctBeginC + k].h != local[r.rctBeginC].h) return Outcome::Corrupt;
+                    }
+                }
+                decodeStreamChannels(br, h, local, 1 + 3 * geom.numDcGroups + 17 + g, hasGlobal ? &global : nullptr);
+                if (br.pos > (s.byteOffset + s.byteSize) * 8) {
+                    log::debug("decoder (CPU): modular group {} overruns its section: bit {} of [{}, {})", g, br.pos, s.byteOffset * 8, (s.byteOffset + s.byteSize) * 8);
+                    return Outcome::Corrupt;
+                }
+                for (const Channel& c : local) r.words.insert(r.words.end(), c.data.begin(), c.data.end());
+                return Outcome::Ok;
+            } catch (const Unsupported&) {
+                return Outcome::Unsupported;
+            } catch (const Corrupt& c) {
+                log::debug("decoder (CPU): modular group {} fails the check at DcGroupCpu.cpp:{}", g, c.line);
+                return Outcome::Corrupt;
+            }
+        };
+        std::vector<std::future<Outcome>> tasks;
+        for (uint32_t g = 1; g < numGroups; ++g) tasks.push_back(std::async(std::launch::async, decodeOne, g));
+        std::vector<Outcome> outcomes(numGroups, Outcome::Ok);
+        if (numGroups > 0) outcomes[0] = decodeOne(0);
+        for (uint32_t g = 1; g < numGroups; ++g) outcomes[g] = tasks[g - 1].get();
+        for (Outcome o : outcomes) {
+            if (o == Outcome::Unsupported) { out.clear(); return false; }
+            if (o == Outcome::Corrupt) return Error(ErrorCode::Corrupt, "the codestream violates the specification in a modular group (CPU path)");
+        }
+    } catch (const Unsupported&) {
+        out.clear();
+        return false;
+    } catch (const Corrupt& c) {
+        log::debug("decoder (CPU): the global tree fails the check at DcGroupCpu.cpp:{}", c.line);
+        return Error(ErrorCode::Corrupt, "the codestream violates the specification in a modular group (CPU path)");
     }
     return true;
 }

@@ -925,18 +925,24 @@ TEST_CASE("the decoder matches djxl on the JPEG XL conformance inputs", "[decode
     CHECK(metrics->maxAbsDiff <= 1);
 }
 
-TEST_CASE("the CPU DC-group decoder matches the GPU path bit for bit", "[decoder][dc-cpu]") {
-    // Both paths over our own and cjxl's files: images wider than a DC group and with
-    // chroma subsampling / several DC groups come from the cjxl matrix below.
-    struct Case { std::string name; std::string cjxlArgs; };
-    const Case c = GENERATE(Case{"sveti_stefan_320.png", ""}, Case{"sveti_crop_257x129.png", "-d 1 -e 7"}, Case{"berlin_200.png", "-d 2 -e 5"},
-                            Case{"sveti_stefan_320.png", "-d 0.5 -e 6 -p"});
-    CAPTURE(c.name, c.cjxlArgs);
+TEST_CASE("the CPU DC-group and modular-group decoders match the GPU path bit for bit", "[decoder][dc-cpu]") {
+    // Both paths over our own and cjxl's files: VarDCT with several DC groups, chroma
+    // subsampling and progressive passes; Modular (lossless) with per-group RCTs, the
+    // learned tree, fixed trees and cjxl's own transforms.
+    struct Case { std::string name; std::string cjxlArgs; bool lossless; bool fixedTree; };
+    const Case c = GENERATE(Case{"sveti_stefan_320.png", "", false, false}, Case{"sveti_crop_257x129.png", "-d 1 -e 7", false, false},
+                            Case{"berlin_200.png", "-d 2 -e 5", false, false}, Case{"sveti_stefan_320.png", "-d 0.5 -e 6 -p", false, false},
+                            Case{"sveti_stefan_320.png", "", true, false}, Case{"sveti_crop_257x129.png", "", true, true},
+                            Case{"sveti_stefan_320.png", "-d 0 -e 7", true, false}, Case{"berlin_200.png", "-d 0 -e 3", true, false});
+    CAPTURE(c.name, c.cjxlArgs, c.lossless, c.fixedTree);
     std::vector<uint8_t> encoded;
     if (c.cjxlArgs.empty()) {
         auto source = image::readRgb8(test::testData(c.name));
         REQUIRE(source);
-        auto made = encoder().encode(*source, enc::Options{});
+        enc::Options options;
+        options.lossless = c.lossless;
+        options.learnedTree = !c.fixedTree;
+        auto made = encoder().encode(*source, options);
         REQUIRE(made);
         encoded = std::move(*made);
     } else {
@@ -948,11 +954,11 @@ TEST_CASE("the CPU DC-group decoder matches the GPU path bit for bit", "[decoder
         REQUIRE(bytes);
         encoded = std::move(*bytes);
     }
-    setenv("SJXL_DC_CPU", "0", 1);
+    setenv("SJXL_DEC_CPU", "0", 1);
     auto gpu = decoder().decode(encoded);
-    setenv("SJXL_DC_CPU", "1", 1);
+    setenv("SJXL_DEC_CPU", "1", 1);
     auto cpu = decoder().decode(encoded);
-    unsetenv("SJXL_DC_CPU");
+    unsetenv("SJXL_DEC_CPU");
     REQUIRE(gpu);
     REQUIRE(cpu);
     auto metrics = test::compare(*gpu, *cpu);

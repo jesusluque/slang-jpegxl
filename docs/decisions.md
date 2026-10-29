@@ -1721,3 +1721,34 @@ includes a lossless case. 1920x1080 lossless encode: 2.9 s → 0.48 s (samples
 152 ms including the 25 MB plane readback, tokenise 137 ms including the token
 upload and histogram kernel, sections 60 ms, run-length 40 ms, tree learning
 32 ms). cjxl -d 0 -e 5: 0.3 s.
+
+## The lossless decoder's groups on the CPU (2026-10-29)
+
+A 1080p lossless decode spent 572 of 600 ms in `decodeModularAcGroups`: one
+GPU thread per 256 px group walking its channels' rectangles through the
+weighted predictor, the MA tree and the ANS reader, the same chain as the DC
+groups. `DcGroupCpu.cpp` now also decodes a Modular frame's group sections
+(`decodeModularGroups`): after the globals thread ran, the host reads the
+full-image channel descriptors it laid out in the arena (sizes, shifts, data
+offsets, strides), every group is a task over the rectangles the kernel would
+pick (the channels from `beginC` whose shift lies in the pass's bracket), with
+the group's GroupHeader (a local tree if it has one; one RCT accepted, any
+other transform falls back to the kernel). Two kernels put the results in
+place: `hostModCopy` writes every rectangle into its channel per sample and
+`hostModRct` undoes the groups' RCTs per pixel, moving the values the way
+`invRct` permutes the descriptors. The finalise thread then undoes the global
+transforms as before. For this the CPU port gained what the DC groups did not
+need: LZ77 (window, lengths, the special distances with the widest channel as
+multiplier) and the nested context-map stream's own two-context map when that
+stream uses LZ77, which cjxl's lossy-modular DC frames do (the conformance
+`progressive` input found the omission).
+
+`SJXL_DEC_CPU=0` keeps both of the decoder's GPU paths (the DC groups and the
+modular groups; `SJXL_DC_CPU` still works). The `[dc-cpu]` test now has four
+lossless cases (our learned and fixed trees, cjxl -e 3 and -e 7) and the 26
+conformance inputs decode bit-identically either way. `SJXL_DEBUG=1` now also
+raises the log level, so the modules' `log::debug` lines (fallback reasons,
+the CPU port's diagnostics) are visible; before, nothing ever raised it.
+
+1920x1080 lossless decode: 638 → 215 ms (the CPU groups 167 ms on 40 tasks,
+the copy kernels 26 ms, the globals thread 18 ms). djxl: 100 ms.

@@ -46,4 +46,36 @@ struct DcGroupData {
 [[nodiscard]] Result<bool> decodeDcGroups(std::span<const uint8_t> codestream, const codestream::ParsedFrame& frame,
                                           size_t globalTreeBit, std::span<const DcGroupGeom> geoms, std::vector<DcGroupData>& out);
 
+/// A full-image channel of a Modular frame, as the globals thread laid it out in
+/// the arena (the group kernels decode rectangles of them).
+struct ModFullChannel {
+    uint32_t w = 0, h = 0;
+    int32_t  hshift = 0, vshift = 0;
+    uint32_t data = 0, stride = 0;   // arena offset of the channel, words per row
+};
+
+struct ModGroupsGeom {
+    uint32_t                     xsize = 0, ysize = 0, groupDim = 0;   // pixels
+    uint32_t                     numGroups = 0, numDcGroups = 0;
+    int32_t                      minShift = 0, maxShift = 3;          // the pass's downsampling bracket
+    uint32_t                     beginC = 0;                          // first channel the groups decode
+    std::span<const ModFullChannel> channels;
+};
+
+/// What one group decoded: the rectangles (channel, origin, size; data concatenated
+/// in `words`) and the RCT its GroupHeader declared, which the host's kernel undoes.
+struct ModGroupData {
+    struct Rect { uint32_t channel, x0, y0, w, h; };
+    std::vector<Rect>    rects;
+    bool                 hasRct = false;
+    uint32_t             rctBeginC = 0, rctType = 0;   // beginC indexes the group's rectangles
+    std::vector<int32_t> words;
+};
+
+/// Decodes every group section of a Modular frame's single pass. Returns false, with
+/// nothing decoded, when a group uses a transform other than one RCT (the GPU
+/// kernel then decodes the groups).
+[[nodiscard]] Result<bool> decodeModularGroups(std::span<const uint8_t> codestream, const codestream::ParsedFrame& frame, size_t globalTreeBit,
+                                               const ModGroupsGeom& geom, std::vector<ModGroupData>& out);
+
 }   // namespace sjxl::dec::cpu

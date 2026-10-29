@@ -40,7 +40,7 @@ cjxl in.png ref.jxl -d 1 -e 5 ; djxl out.jxl check.png      # Homebrew oracle (/
   They SKIP when no device opens and never fall back. `tests/support/TestDevice.h`
   gives one device and shader library per process.
 - **Environment**: `SJXL_TIMING=1` (per-stage times, encoder and decoder),
-  `SJXL_PERF_SKIP=bits` (decoder timing experiments), `SJXL_DC_CPU=0` / `SJXL_ENC_CPU=0` (the decoder's DC groups / the encoder's DC tokens and ANS sections on the GPU threads, the reference paths), `SJXL_BACKEND=metal,cuda,vulkan` (order to try),
+  `SJXL_PERF_SKIP=bits` (decoder timing experiments), `SJXL_DEC_CPU=0` / `SJXL_ENC_CPU=0` (the decoder's DC and modular groups / the encoder's chains on the GPU threads, the reference paths; `SJXL_DEBUG=1` also shows the modules' debug log lines), `SJXL_BACKEND=metal,cuda,vulkan` (order to try),
   `SJXL_GPU_VALIDATION=1` (debug layers), `SJXL_SHADER_DIR`, `SJXL_SHADER_CACHE`
   (default `~/Library/Caches/sjxl/shaders`).
 - **Toolchain**: Slang 2026.14.1 at `~/tools/slang` (`SLANG_ROOT`), slang-rhi
@@ -59,10 +59,12 @@ cjxl in.png ref.jxl -d 1 -e 5 ; djxl out.jxl check.png      # Homebrew oracle (/
   `modules/decoder/src/DcGroupCpu.cpp` when the frame qualifies (VarDCT, no
   extra channels, no DC frame, several sections; LZ77 or transforms fall back
   to the kernel); the GPU path stays the reference, `SJXL_DC_CPU=0` selects it
-  and the `[dc-cpu]` test requires both to be bit-identical. The CPU also runs
+  and the `[dc-cpu]` test requires both to be bit-identical (`SJXL_DEC_CPU=0` is the knob's current name). The CPU also runs
   the strategy raster walk of those groups (validation + one triplet per
   varblock); DequantDC, buckets, CfL tiles and the acs/qf grids are the
-  `hostDc*` kernels in `sections.slang`. The encoder's counterpart
+  `hostDc*` kernels in `sections.slang`; a Modular frame's group sections go
+  the same way (`decodeModularGroups`, LZ77 included; `hostModCopy` /
+  `hostModRct` place the rectangles and undo the groups' RCTs). The encoder's counterpart
   (`modules/encoder/src/EntropyCpu.cpp`, docs "M5: the encoder's serial
   chains"): the DC tokens through the weighted predictor and the ANS emission
   of every section run on CPU cores from the GPU's tokens, tables and blobs,

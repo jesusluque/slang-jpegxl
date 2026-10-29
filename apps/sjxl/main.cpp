@@ -287,6 +287,7 @@ int compare(int argc, char** argv) {
 
 int main(int argc, char** argv) {
     if (argc < 2) return usage();
+    if (std::getenv("SJXL_DEBUG") != nullptr) sjxl::log::setMinimum(sjxl::log::Level::Debug);   // the modules' log::debug lines
     const std::string_view command = argv[1];
     if (command == "info") return info(argc, argv);
     if (command == "encode") return encode(argc, argv);

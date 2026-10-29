@@ -35,10 +35,14 @@ constexpr uint32_t kLz77WindowWords = 1u << 20;
 constexpr uint32_t kDequantTableFloats = 394752;
 constexpr uint32_t kGsTreeNumNodesIndex = 33;
 constexpr uint32_t kGsGlobalTreeBitIndex = 54;   // frame.slangh kGsGlobalTreeBit
+constexpr uint32_t kGsModChansOffIndex = 48, kGsModNumChannelsIndex = 49, kGsModBeginCIndex = 50;   // modframe.slangh
 constexpr uint32_t kErrNone = 0, kErrCorrupt = 1, kErrUnsupported = 2, kErrArena = 3, kErrLz77Window = 4, kErrAcNzeros = 5, kErrAcLeftover = 6, kErrAnsState = 7;
 
 struct Uint2 {
     uint32_t x, y;
+};
+struct Uint4 {
+    uint32_t x, y, z, w;
 };
 
 const char* describe(uint32_t code) {
@@ -69,6 +73,8 @@ Result<std::unique_ptr<Decoder>> Decoder::create(std::shared_ptr<gpu::ShaderLibr
     SJXL_ASSIGN(dec->hostDcBlocks_, gpu::ComputeKernel::create(lib, "sjxl/dec/sections", "hostDcBlocks"));
     SJXL_ASSIGN(dec->hostDcVarblocks_, gpu::ComputeKernel::create(lib, "sjxl/dec/sections", "hostDcVarblocks"));
     SJXL_ASSIGN(dec->hostDcTiles_, gpu::ComputeKernel::create(lib, "sjxl/dec/sections", "hostDcTiles"));
+    SJXL_ASSIGN(dec->hostModCopy_, gpu::ComputeKernel::create(lib, "sjxl/dec/sections", "hostModCopy"));
+    SJXL_ASSIGN(dec->hostModRct_, gpu::ComputeKernel::create(lib, "sjxl/dec/sections", "hostModRct"));
     SJXL_ASSIGN(dec->tables_, gpu::ComputeKernel::create(lib, "sjxl/dec/tables", "computeDequantTable"));
     SJXL_ASSIGN(dec->smoothDc_, gpu::ComputeKernel::create(lib, "sjxl/dec/dc_finalize", "smoothDc"));
     SJXL_ASSIGN(dec->computeSigma_, gpu::ComputeKernel::create(lib, "sjxl/dec/dc_finalize", "computeSigma"));
@@ -333,10 +339,23 @@ Result<Decoder::FrameOutput> Decoder::run(const codestream::Parsed& parsed, cons
     // globals ran, bound to every sections kernel (the DC group kernel copies them).
     bool dcFromHost = false;
     std::optional<gpu::Buffer> hostDc, hostDcBase;
+    // The serial chains the CPU may take (the DC groups, a Modular frame's groups);
+    // SJXL_DEC_CPU=0 (or the older SJXL_DC_CPU=0) keeps the GPU reference path.
+    const bool cpuAllowed = platform::env("SJXL_DEC_CPU") != "0" && platform::env("SJXL_DC_CPU") != "0";
+    std::optional<gpu::Buffer> hostMod, hostModRects, hostModPrefix, hostModRctTab, hostModRctPrefix;
+    uint32_t hostModRectCount = 0, hostModRctCount = 0;
+    int32_t passMinShift0 = 0, passMaxShift0 = 3;   // pass 0's downsampling bracket (set by bindSections)
 
     const auto bindSections = [&](rhi::ShaderCursor c) {
         c["hostDc"].setBinding(hostDc ? hostDc->rhi() : dummy.rhi());
         c["hostDcBase"].setBinding(hostDcBase ? hostDcBase->rhi() : dummy.rhi());
+        c["hostMod"].setBinding(hostMod ? hostMod->rhi() : dummy.rhi());
+        c["hostModRects"].setBinding(hostModRects ? hostModRects->rhi() : dummy.rhi());
+        c["hostModPrefix"].setBinding(hostModPrefix ? hostModPrefix->rhi() : dummy.rhi());
+        c["hostModRctTab"].setBinding(hostModRctTab ? hostModRctTab->rhi() : dummy.rhi());
+        c["hostModRctPrefix"].setBinding(hostModRctPrefix ? hostModRctPrefix->rhi() : dummy.rhi());
+        c["params"]["hostModRects"].setData(hostModRectCount);
+        c["params"]["hostModRctGroups"].setData(hostModRctCount);
         c["naturalOrders"].setBinding(naturalOrders_ ? naturalOrders_->rhi() : dummy.rhi());
         c["params"]["wideSamples"].setData(uint32_t{m.floatingPointSample || m.bitsPerSample > 16 ? 1u : 0u});
         c["params"]["perfSkip"].setData(static_cast<uint32_t>(std::strtoul(platform::env("SJXL_PERF_SKIP").c_str(), nullptr, 0)));
@@ -399,6 +418,8 @@ Result<Decoder::FrameOutput> Decoder::run(const codestream::Parsed& parsed, cons
                 minShift[p] = mn;
                 maxShift[p] = mx;
             }
+            passMinShift0 = minShift[0];
+            passMaxShift0 = maxShift[0];
             const auto quad = [](const auto& a, size_t at) { return std::array{a[at], a[at + 1], a[at + 2], a[at + 3]}; };
             c["params"]["passShiftA"].setData(quad(shift, 0));
             c["params"]["passShiftB"].setData(quad(shift, 4));
@@ -420,7 +441,83 @@ Result<Decoder::FrameOutput> Decoder::run(const codestream::Parsed& parsed, cons
         timer.mark("modular globals");
         modularDcGroups_.dispatch(batch, {numDcGroups, 1, 1}, bindSections);
         timer.mark("modular dc groups");
-        modularAcGroups_.dispatch(batch, {numGroups, 1, 1}, bindSections);
+        bool groupsFromHost = false;
+        if (!frame.singleSection && frame.header.numPasses == 1 && cpuAllowed) {
+            // The groups' chains on CPU cores (docs/decisions.md "The lossless decoder's groups
+            // on the CPU"): the full-image channels' layout from the globals thread, every group
+            // a task, the rectangles copied in and the groups' RCTs undone by kernels.
+            SJXL_TRY(batch.submit(true));
+            SJXL_ASSIGN(const std::vector<uint32_t> header, arena.readRange<uint32_t>(dev, 0, kGsHeaderSize));
+            if (header[0] == 0 && header[kGsModNumChannelsIndex] > header[kGsModBeginCIndex]) {
+                const uint32_t numFull = header[kGsModNumChannelsIndex];
+                SJXL_ASSIGN(const std::vector<uint32_t> desc, arena.readRange<uint32_t>(dev, header[kGsModChansOffIndex], uint64_t{numFull} * 8));
+                std::vector<cpu::ModFullChannel> fullChans(numFull);
+                for (uint32_t c = 0; c < numFull; ++c) {
+                    const uint32_t* w = &desc[c * 8];
+                    fullChans[c] = {w[0], w[1], static_cast<int32_t>(w[2]), static_cast<int32_t>(w[3]), w[4], w[5]};
+                }
+                cpu::ModGroupsGeom mg;
+                mg.xsize = dim.xsize;
+                mg.ysize = dim.ysize;
+                mg.groupDim = dim.groupDim;
+                mg.numGroups = numGroups;
+                mg.numDcGroups = numDcGroups;
+                mg.minShift = passMinShift0;
+                mg.maxShift = passMaxShift0;
+                mg.beginC = header[kGsModBeginCIndex];
+                mg.channels = fullChans;
+                std::vector<cpu::ModGroupData> data;
+                SJXL_ASSIGN(const bool done, cpu::decodeModularGroups(parsed.codestream, frame, header[kGsGlobalTreeBitIndex], mg, data));
+                if (done) {
+                    std::vector<int32_t> words;
+                    std::vector<Uint4> rects, rctTab;
+                    std::vector<uint32_t> prefix{0}, rctPrefix{0};
+                    for (const cpu::ModGroupData& g : data) {
+                        uint32_t src = static_cast<uint32_t>(words.size());
+                        std::array<uint32_t, 3> origins{};
+                        uint32_t stride = 0, rw = 0, rh = 0;
+                        for (uint32_t i = 0; i < g.rects.size(); ++i) {
+                            const cpu::ModGroupData::Rect& r = g.rects[i];
+                            const cpu::ModFullChannel& fc = fullChans[r.channel];
+                            const uint32_t origin = fc.data + r.y0 * fc.stride + r.x0;
+                            rects.push_back({origin, fc.stride, r.w, r.h});
+                            rects.push_back({src, 0, 0, 0});
+                            prefix.push_back(prefix.back() + r.w * r.h);
+                            if (g.hasRct && i >= g.rctBeginC && i < g.rctBeginC + 3) {
+                                origins[i - g.rctBeginC] = origin;
+                                stride = fc.stride;
+                                rw = r.w;
+                                rh = r.h;
+                            }
+                            src += r.w * r.h;
+                        }
+                        words.insert(words.end(), g.words.begin(), g.words.end());
+                        if (g.hasRct) {
+                            rctTab.push_back({origins[0], origins[1], origins[2], stride});
+                            rctTab.push_back({rw, rh, g.rctType, 0});
+                            rctPrefix.push_back(rctPrefix.back() + rw * rh);
+                        }
+                    }
+                    if (words.empty()) words.push_back(0);
+                    if (rects.empty()) rects.push_back({0, 0, 0, 0});
+                    if (rctTab.empty()) rctTab.push_back({0, 0, 0, 0});
+                    SJXL_ASSIGN(hostMod, gpu::Buffer::fromSpan<int32_t>(dev, words, "dec.hostMod"));
+                    SJXL_ASSIGN(hostModRects, gpu::Buffer::fromSpan<Uint4>(dev, rects, "dec.hostModRects"));
+                    SJXL_ASSIGN(hostModPrefix, gpu::Buffer::fromSpan<uint32_t>(dev, prefix, "dec.hostModPrefix"));
+                    SJXL_ASSIGN(hostModRctTab, gpu::Buffer::fromSpan<Uint4>(dev, rctTab, "dec.hostModRctTab"));
+                    SJXL_ASSIGN(hostModRctPrefix, gpu::Buffer::fromSpan<uint32_t>(dev, rctPrefix, "dec.hostModRctPrefix"));
+                    hostModRectCount = static_cast<uint32_t>(prefix.size() - 1);
+                    hostModRctCount = static_cast<uint32_t>(rctPrefix.size() - 1);
+                    groupsFromHost = true;
+                    timer.mark("modular ac groups (cpu)");
+                    if (prefix.back() > 0) hostModCopy_.dispatch(batch, {prefix.back(), 1, 1}, bindSections);
+                    if (rctPrefix.back() > 0) hostModRct_.dispatch(batch, {rctPrefix.back(), 1, 1}, bindSections);
+                } else {
+                    log::debug("decoder: a modular group uses a transform the CPU port leaves out; the GPU decodes the groups");
+                }
+            }
+        }
+        if (!groupsFromHost) modularAcGroups_.dispatch(batch, {numGroups, 1, 1}, bindSections);
         timer.mark("modular ac groups");
         modularFinalize_.dispatch(batch, {1, 1, 1}, bindSections);
         timer.mark("modular finalize");
@@ -466,7 +563,7 @@ Result<Decoder::FrameOutput> Decoder::run(const codestream::Parsed& parsed, cons
     globals_.dispatch(batch, {1, 1, 1}, bindSections);
     if (!frame.singleSection) finishOrders_.dispatch(batch, {kCoeffOrderLimit * 64, frame.header.numPasses, 1}, bindSections);
     timer.mark("globals");
-    if (!useDcFrame && numEc == 0 && !frame.singleSection && platform::env("SJXL_DC_CPU") != "0") {
+    if (!useDcFrame && numEc == 0 && !frame.singleSection && cpuAllowed) {
         // The DC groups' serial chains on CPU cores (the project's one exception to GPU-only
         // coded data, docs/decisions.md "M5"): wait for the globals, decode, upload.
         SJXL_TRY(batch.submit(true));
@@ -947,7 +1044,7 @@ Result<Decoder::FrameOutput> Decoder::run(const codestream::Parsed& parsed, cons
     stats_.dcGlobalBits = header[45];
     stats_.usedAcs = header[47];
     if (modular && !platform::env("SJXL_DEBUG").empty()) {
-        log::info("decoder: modular global tree {} nodes", header[kGsTreeNumNodesIndex]);
+        log::info("decoder: modular global tree {} nodes, {} leaves, from bit {}", header[kGsTreeNumNodesIndex], header[kGsTreeNumNodesIndex + 1], header[kGsGlobalTreeBitIndex]);
         if (!platform::env("SJXL_DEBUG_TREE").empty()) {
             // The nodes: property (-1 leaf), split value, children, predictor, offset, multiplier, leaf id.
             const uint32_t numNodes = header[kGsTreeNumNodesIndex];

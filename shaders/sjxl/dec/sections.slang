@@ -28,6 +28,11 @@ RWStructuredBuffer<int>   coeffs;
 StructuredBuffer<int>     hostDc;         // DC groups decoded on the CPU (DcGroupCpu.cpp): per group extraPrecision, count, usedAcs, numVarblocks, the channels, the varblock triplets
 StructuredBuffer<uint>    hostDcBase;     // [g]: word offset of DC group g in hostDc; [numDcGroups + g]: its first varblock index (numDcGroups + 1 entries)
 RWStructuredBuffer<uint>  naturalOrders;  // kCoeffOrderLimit * 64: the natural coefficient orders in libjxl's slot layout (built once per decoder)
+StructuredBuffer<int>     hostMod;        // Modular groups decoded on the CPU (DcGroupCpu.cpp decodeModularGroups): every rectangle's samples
+StructuredBuffer<uint4>   hostModRects;   // per rectangle: {arena origin, stride, w, h}, {first sample in hostMod, 0, 0, 0}
+StructuredBuffer<uint>    hostModPrefix;  // per rectangle: its first sample index over all rectangles (numRects + 1 entries)
+StructuredBuffer<uint4>   hostModRctTab;  // per group with an RCT: {origin0, origin1, origin2, stride}, {w, h, rct type, 0}
+StructuredBuffer<uint>    hostModRctPrefix;   // per such group: its first pixel index (count + 1 entries)
 
 #include "sjxl/dec/dcgroup.slangh"
 #include "sjxl/dec/acgroup.slangh"
@@ -63,6 +68,8 @@ struct SectionParams {
     int4  passMinC;
     uint  perfSkip;       // SJXL_PERF_SKIP timing experiments (entropy.slangh gPerfSkip)
     uint  wideSamples;    // 1: samples beyond 16 bits (the 64-bit modular arithmetic)
+    uint  hostModRects;   // modular groups decoded on the CPU: rectangles in hostModRects (0: none)
+    uint  hostModRctGroups;   // groups with an RCT in hostModRctTab
     int4  passMaxA;
     int4  passMaxB;
     int4  passMaxC;
@@ -257,6 +264,72 @@ void finishOrders(uint3 tid: SV_DispatchThreadID) {
     const uint usedOrders = arena[t + 2];
     if ((usedOrders & (1u << ord)) == 0) arena[ordersOff + w] = naturalOrders[w];
     else arena[ordersOff + w] = naturalOrders[kCoeffOrderOffset[slot] * 64 + arena[ordersOff + w]];
+}
+
+// --- Modular groups decoded on the CPU ----------------------------------------------------------
+// The CPU decoded every group's rectangles (DcGroupCpu.cpp decodeModularGroups); these
+// kernels put them into the full-image channels and undo the groups' RCTs, per sample.
+
+uint hostModRectCount() { return params.hostModRects; }
+uint hostModRctCount() { return params.hostModRctGroups; }
+
+uint prefixFind(StructuredBuffer<uint> prefix, uint count, uint i) {
+    uint lo = 0, hi = count;   // the last r with prefix[r] <= i
+    while (lo + 1 < hi) {
+        const uint mid = (lo + hi) / 2;
+        if (prefix[mid] <= i) lo = mid; else hi = mid;
+    }
+    return lo;
+}
+
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void hostModCopy(uint3 tid: SV_DispatchThreadID) {
+    const uint numRects = hostModRectCount();
+    const uint i = tid.x;
+    if (i >= hostModPrefix[numRects] || arena[kGsError] != kErrNone) return;
+    const uint r = prefixFind(hostModPrefix, numRects, i);
+    const uint k = i - hostModPrefix[r];
+    const uint4 a = hostModRects[2 * r], b = hostModRects[2 * r + 1];
+    const uint lx = k % a.z, ly = k / a.z;
+    arena[a.x + ly * a.y + lx] = uint(hostMod[b.x + k]);
+}
+
+int pixelAddHost(int a, int b) { return int(uint(a) + uint(b)); }
+
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void hostModRct(uint3 tid: SV_DispatchThreadID) {
+    const uint numGroups = hostModRctCount();
+    const uint i = tid.x;
+    if (numGroups == 0 || i >= hostModRctPrefix[numGroups] || arena[kGsError] != kErrNone) return;
+    const uint r = prefixFind(hostModRctPrefix, numGroups, i);
+    const uint k = i - hostModRctPrefix[r];
+    const uint4 o = hostModRctTab[2 * r], d = hostModRctTab[2 * r + 1];
+    const uint x = k % d.x, y = k / d.x;
+    const uint at = y * o.w + x;
+    const uint rctType = d.z;
+    const uint permutation = rctType / 7;
+    const uint custom = rctType % 7;
+    int v0 = int(arena[o.x + at]), v1 = int(arena[o.y + at]), v2 = int(arena[o.z + at]);
+    if (custom == 6) {   // YCoCg
+        const int tmp = pixelAddHost(v0, -(v2 >> 1));
+        const int G = pixelAddHost(v2, tmp);
+        const int B = pixelAddHost(tmp, -(v1 >> 1));
+        const int R = pixelAddHost(B, v1);
+        v0 = R; v1 = G; v2 = B;
+    } else if (custom != 0) {
+        const uint second = custom >> 1;
+        const uint third = custom & 1;
+        if (third != 0) v2 = pixelAddHost(v2, v0);
+        if (second == 1) v1 = pixelAddHost(v1, v0);
+        else if (second == 2) v1 = pixelAddHost(v1, pixelAddHost(v0, v2) >> 1);
+    }
+    // The channel permutation (invRct permutes the descriptors; here the values move).
+    const uint origins[3] = {o.x, o.y, o.z};
+    arena[origins[permutation % 3] + at] = uint(v0);
+    arena[origins[(permutation + 1 + permutation / 3) % 3] + at] = uint(v1);
+    arena[origins[(permutation + 2 - permutation / 3) % 3] + at] = uint(v2);
 }
 
 // --- DC groups decoded on the CPU -----------------------------------------------------------
