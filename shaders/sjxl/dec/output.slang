@@ -18,7 +18,7 @@ struct OutputParams {
     float negBiasCbrt[4];
     uint  transfer;            // 0 sRGB, 1 linear, 2 power (gamma)
     float gamma;               // the exponent for transfer 2 (e.g. 1/2.2)
-    uint  mode;                // 0: XYB planes; 1: planes already hold the output encoding in [0, 1]
+    uint  mode;                // 0: XYB planes; 1: planes already hold the output encoding in [0, 1]; 2: YCbCr (Cb, Y, Cr planes)
     uint  channels;            // 3 (RGB) or 4 (RGBA)
     uint  alphaPlane;          // plane index of the alpha channel within `alpha`
     uint  pad2, pad3;
@@ -41,6 +41,11 @@ uint byteFor(uint index) {
     const uint at = y * params.paddedWidth + x;
     if (c == 3) return uint(round(clamp(alpha[params.alphaPlane * plane + at], 0.0f, 1.0f) * 255.0f));
     if (params.mode == 1) return uint(round(clamp(xyb[c * plane + at], 0.0f, 1.0f) * 255.0f));
+    if (params.mode == 2) {   // stage_ycbcr.cc
+        const float yv = xyb[plane + at] + 128.0f / 255.0f, cb = xyb[at], cr = xyb[2 * plane + at];
+        const float v = c == 0 ? yv + 1.402f * cr : c == 1 ? yv + (-0.114f * 1.772f / 0.587f) * cb + (-0.299f * 1.402f / 0.587f) * cr : yv + 1.772f * cb;
+        return uint(round(clamp(v, 0.0f, 1.0f) * 255.0f));
+    }
     const float ox = xyb[at], oy = xyb[plane + at], ob = xyb[2 * plane + at];
     float gr = oy + ox - params.negBiasCbrt[0];
     float gg = oy - ox - params.negBiasCbrt[1];

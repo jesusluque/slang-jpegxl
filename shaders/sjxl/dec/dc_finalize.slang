@@ -22,6 +22,8 @@ struct DcFinalizeParams {
     float constantInvSigma;   // modular frames: kInvSigmaNum / epf_sigma_for_modular for every block
     uint  useConstantSigma;
     uint  dcFramePaddedWidth; // kUseDcFrame: the DC frame's planes, one pixel per block
+    uint4 hshift;             // chroma subsampling per channel: smoothing runs per channel on its own grid
+    uint4 vshift;
 };
 ConstantBuffer<DcFinalizeParams> params;
 
@@ -48,6 +50,10 @@ static const float kW0 = 1.0f - 4.0f * (kW1 + kW2);
 static const float kInvSigmaNum = -1.1715728752538099024f;
 
 float dcAt(uint c, uint x, uint y) { return dc[c * params.blocksX * params.blocksY + y * params.blocksX + x]; }
+uint hsOf(uint c) { return c == 0 ? params.hshift.x : c == 1 ? params.hshift.y : params.hshift.z; }
+uint vsOf(uint c) { return c == 0 ? params.vshift.x : c == 1 ? params.vshift.y : params.vshift.z; }
+/// A subsampled channel's value at its grid position (sx, sy): the co-located full-grid block.
+float dcAtC(uint c, uint sx, uint sy) { return dcAt(c, sx << hsOf(c), sy << vsOf(c)); }
 
 [shader("compute")]
 [numthreads(16, 16, 1)]
@@ -56,6 +62,29 @@ void smoothDc(uint3 tid: SV_DispatchThreadID) {
     if (x >= params.blocksX || y >= params.blocksY) return;
     const uint nblocks = params.blocksX * params.blocksY;
     const uint at = y * params.blocksX + x;
+    const bool subsampled = (params.hshift.x | params.hshift.y | params.hshift.z | params.vshift.x | params.vshift.y | params.vshift.z) != 0;
+    if (subsampled && params.skipSmoothing == 0) {
+        // compressed_dc.cc, the per-channel variant: each channel on its own grid.
+        for (uint c = 0; c < 3; ++c) {
+            const uint hs = hsOf(c), vs = vsOf(c);
+            if ((x & ((1u << hs) - 1)) != 0 || (y & ((1u << vs) - 1)) != 0) continue;   // not a position of this channel
+            const uint sx = x >> hs, sy = y >> vs;
+            const uint gw = params.blocksX >> hs, gh = params.blocksY >> vs;
+            if (gw <= 2 || gh <= 2 || sx == 0 || sy == 0 || sx + 1 == gw || sy + 1 == gh) {
+                dcSmooth[c * nblocks + at] = dc[c * nblocks + at];
+                continue;
+            }
+            const float tl = dcAtC(c, sx - 1, sy - 1), tc = dcAtC(c, sx, sy - 1), tr = dcAtC(c, sx + 1, sy - 1);
+            const float ml = dcAtC(c, sx - 1, sy), mr = dcAtC(c, sx + 1, sy);
+            const float bl = dcAtC(c, sx - 1, sy + 1), bc = dcAtC(c, sx, sy + 1), br = dcAtC(c, sx + 1, sy + 1);
+            const float mc = dcAtC(c, sx, sy);
+            const float sm = ((tl + tr) + (bl + br)) * kW2 + ((ml + mr) + (tc + bc)) * kW1 + mc * kW0;
+            const float gap = max(0.5f, abs((mc - sm) / asfloat(arena[kGsMulDc + c])));
+            const float factor = max(0.0f, 3.0f - 4.0f * gap);
+            dcSmooth[c * nblocks + at] = mc + (sm - mc) * factor;
+        }
+        return;
+    }
     if (params.skipSmoothing != 0 || x == 0 || y == 0 || x + 1 == params.blocksX || y + 1 == params.blocksY) {
         for (uint c = 0; c < 3; ++c) dcSmooth[c * nblocks + at] = dc[c * nblocks + at];
         return;

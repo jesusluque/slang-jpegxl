@@ -54,12 +54,12 @@ per subsystem or milestone, appended to as the work goes. Dates are absolute.
 - **M3 encoder quality**: inverse Gaborish + default LoopFilter, EPF sharpness,
   CfL per tile, adaptive quant field, DCT16/32 strategy search, context
   clustering (≤ 32, fixed-point costs as cujpegxl), ANS for AC.
-- **M4 decoder completeness**: splines, >8-bit output, ICC, animation,
-  JPEG recompression, extra channel blending in patches, premultiplied
-  alpha handling. (64–256 px transforms, Modular frames with
-  RCT/palette/Squeeze, lossy modular, patches, progressive passes, DC
-  frames, permuted TOCs, upsampling, noise, extra channels with alpha
-  output: done.)
+- **M4 decoder completeness**: splines, >8-bit output, ICC profiles,
+  animation, grey JPEG transcodes, loop filters on YCbCr frames, extra
+  channel blending in patches, premultiplied alpha handling. (64–256 px
+  transforms, Modular frames with RCT/palette/Squeeze, lossy modular,
+  patches, progressive passes, DC frames, permuted TOCs, upsampling, noise,
+  extra channels with alpha output, JPEG recompression: done.)
 - **M5 platforms and speed**: Linux CUDA/Vulkan, async readback, batching,
   per-stage timings here.
 
@@ -394,3 +394,40 @@ in every channel; lossless bit-exact.
 Not done: alpha blending in patches, premultiplied alpha (`alpha_associated`:
 samples pass through as stored), extra channels of more than 8 bits in the
 output, more than 4 extra channels.
+
+## JPEG recompression (2026-10-29)
+
+`cjxl in.jpg` transcodes losslessly into a VarDCT frame in YCbCr (not XYB)
+with the JPEG's chroma subsampling and its quantisation tables as RAW
+dequant matrices. Decoding it to pixels (not back to a JPEG) needed:
+
+- **Raw quant tables** (`readQuantEncoding` mode 7): a denominator (F16) and
+  a 3-channel modular image of 8·size_x × 8·size_y, stream QuantTable(kind)
+  with the frame's global tree; the table is den × q in the image's linear
+  order (`tables.slang`), the same linear index the formula modes use.
+- **Chroma subsampling** (`YCbCrChromaSubsampling`): channel modes map to
+  shifts `maxhs − kHShift[mode]`; block counts round up to multiples of
+  2^shift (`frameDim`). A subsampled channel codes one block per 2×2 of the
+  Y grid; its DC values, non-zero counts, coefficients and dequantised
+  values live at the *co-located full-grid block* (sbx << hshift, sby <<
+  vshift), which is exactly where libjxl reads the Y coefficients for the
+  chroma-from-luma term and the strategy / quant field, so the per-coefficient
+  dequantisation needs no change. The AC group keeps a non-zero grid per
+  channel at the channel's resolution (replacing the two alternating rows),
+  the IDCT locates a chroma pixel's block on the chroma grid, DC smoothing
+  runs per channel on its own grid (compressed_dc.cc's single-channel
+  variant), and only DCT8 is allowed when not 4:4:4.
+- **Chroma upsampling** (`filters.slang chromaUpsample`), the first pipeline
+  stage: horizontal then vertical, 0.75 of the sample and 0.25 of the
+  neighbour towards the output side, mirrored at the channel's visible size.
+- **YCbCr → RGB** in the output stage (mode 2, stage_ycbcr.cc constants,
+  +128/255 on Y).
+
+Measured: JPEGs from `sips` (4:2:0) at qualities 75 and 92 of three images,
+transcoded by cjxl, decode within 1 LSB of djxl (`[jpeg]` test). The AC
+group arena grew to 32 KB for the per-channel grids.
+
+Not done: grey JPEGs (one component), JPEGs with an embedded ICC profile (the
+ICC stream is entropy coded and must be decoded to be skipped), loop filters
+on YCbCr frames (cjxl writes none for transcodes), reconstruction of the
+original JPEG file (jbrd box).

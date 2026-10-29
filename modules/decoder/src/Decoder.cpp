@@ -21,7 +21,7 @@ namespace {
 constexpr uint32_t kGsHeaderSize = 64;
 constexpr uint32_t kGlobalsWords = 4u << 20;      // 16 MB: AC code sets, orders, matrices encodings
 constexpr uint32_t kDcGroupWords = 1u << 20;      // 4 MB per DC group
-constexpr uint32_t kAcGroupWords = 1024;
+constexpr uint32_t kAcGroupWords = 1u << 13;        // per-channel non-zero grids (3 x 32 x 32 words) and reader state
 constexpr uint32_t kModularGroupWords = 1u << 19;   // a group's local trees, histograms and predictor state
 constexpr float    kInvSigmaNum = -1.1715728752538099024f;
 constexpr uint32_t kMaxPatchPositions = 1u << 16;     // frame.slangh kMaxPatchPositions
@@ -69,6 +69,7 @@ Result<std::unique_ptr<Decoder>> Decoder::create(std::shared_ptr<gpu::ShaderLibr
     SJXL_ASSIGN(dec->ecToPlanes_, gpu::ComputeKernel::create(lib, "sjxl/dec/modular_out", "ecToPlanes"));
     SJXL_ASSIGN(dec->tocPermutation_, gpu::ComputeKernel::create(lib, "sjxl/dec/toc", "decodeTocPermutation"));
     SJXL_ASSIGN(dec->upsample_, gpu::ComputeKernel::create(lib, "sjxl/dec/upsample", "upsample"));
+    SJXL_ASSIGN(dec->chromaUpsample_, gpu::ComputeKernel::create(lib, "sjxl/dec/filters", "chromaUpsample"));
     SJXL_ASSIGN(dec->noiseRandom_, gpu::ComputeKernel::create(lib, "sjxl/dec/noise", "noiseRandom"));
     SJXL_ASSIGN(dec->noiseConvolve_, gpu::ComputeKernel::create(lib, "sjxl/dec/noise", "noiseConvolve"));
     SJXL_ASSIGN(dec->noiseAdd_, gpu::ComputeKernel::create(lib, "sjxl/dec/noise", "noiseAdd"));
@@ -232,6 +233,12 @@ Result<image::Rgb8> Decoder::run(const codestream::Parsed& parsed, const codestr
         if (alphaIndex == numEc && m.extraChannels[e].type == 0) alphaIndex = e;
     }
     const uint32_t outChannels = alphaIndex < numEc ? 4u : 3u;
+    // YCbCr chroma subsampling (JPEG recompression): per-channel shifts, zero for XYB.
+    const bool ycbcr = !modular && frame.header.colorTransform == 2;
+    std::array<uint32_t, 4> hshift{}, vshift{};
+    if (ycbcr) {
+        for (size_t c = 0; c < 3; ++c) { hshift[c] = frame.header.hshift[c]; vshift[c] = frame.header.vshift[c]; }
+    }
     const uint32_t outBytes = outWidth * outHeight * outChannels;
     SJXL_ASSIGN(auto rgb8, gpu::Buffer::ofType<uint32_t>(dev, (outBytes + 3) / 4, "dec.rgb8"));
     SJXL_ASSIGN(auto dummy, gpu::Buffer::ofType<float>(dev, 4, "dec.dummy"));   // stands in for absent optional inputs
@@ -273,6 +280,8 @@ Result<image::Rgb8> Decoder::run(const codestream::Parsed& parsed, const codestr
         c["params"]["frameFlags"].setData(static_cast<uint32_t>(frame.header.flags));
         c["params"]["numPasses"].setData(frame.header.numPasses);
         c["params"]["numEc"].setData(numEc);
+        c["params"]["hshift"].setData(hshift);
+        c["params"]["vshift"].setData(vshift);
         c["params"]["ecW"].setData(ecW);
         c["params"]["ecH"].setData(ecH);
         c["params"]["ecShift"].setData(ecShift);
@@ -344,6 +353,8 @@ Result<image::Rgb8> Decoder::run(const codestream::Parsed& parsed, const codestr
                 c["params"]["constantInvSigma"].setData(kInvSigmaNum / lf.epfSigmaForModular);
                 c["dcFrame"].setBinding(dummy.rhi());
                 c["params"]["dcFramePaddedWidth"].setData(0u);
+                c["params"]["hshift"].setData(hshift);
+                c["params"]["vshift"].setData(vshift);
             });
         }
     } else {
@@ -372,6 +383,8 @@ Result<image::Rgb8> Decoder::run(const codestream::Parsed& parsed, const codestr
         c["params"]["constantInvSigma"].setData(0.0f);
         c["dcFrame"].setBinding(dcSource ? dcSource->planes->rhi() : dummy.rhi());
         c["params"]["dcFramePaddedWidth"].setData(dcSource ? dcSource->paddedWidth : 0u);
+        c["params"]["hshift"].setData(hshift);
+        c["params"]["vshift"].setData(vshift);
     };
     if (useDcFrame) dcFromFrame_.dispatch(batch, {nblocks, 1, 1}, bindFinalize);   // no smoothing with a DC frame (FinalizeDC)
     else smoothDc_.dispatch(batch, {dim.xsizeBlocks, dim.ysizeBlocks, 1}, bindFinalize);
@@ -396,6 +409,8 @@ Result<image::Rgb8> Decoder::run(const codestream::Parsed& parsed, const codestr
         c["params"]["paddedWidth"].setData(dim.xsizePadded);
         c["params"]["paddedHeight"].setData(dim.ysizePadded);
         c["params"]["tilesX"].setData(tilesX);
+        c["params"]["hshift"].setData(hshift);
+        c["params"]["vshift"].setData(vshift);
         c["params"]["xDm"].setData(static_cast<float>(std::pow(1.25, 2 - static_cast<int>(frame.header.xQmScale))));
         c["params"]["bDm"].setData(static_cast<float>(std::pow(1.25, 2 - static_cast<int>(frame.header.bQmScale))));
         for (int i = 0; i < 4; ++i) c["params"]["quantBias"][i].setData(m.quantBiases[static_cast<size_t>(i)]);
@@ -466,7 +481,10 @@ Result<image::Rgb8> Decoder::run(const codestream::Parsed& parsed, const codestr
     // Loop filters, ping-pong between the two XYB buffers.
     gpu::Buffer* src = &xybA;
     gpu::Buffer* dst = &xybB;
+    std::array<uint32_t, 4> chromaShift{}, chromaIn{};
     const auto bindFilter = [&](rhi::ShaderCursor c, uint32_t stage, float sigmaScale) {
+        c["params"]["chromaShift"].setData(chromaShift);
+        c["params"]["chromaIn"].setData(chromaIn);
         c["src"].setBinding(src->rhi());
         c["dst"].setBinding(dst->rhi());
         c["sigma"].setBinding(sigma.rhi());
@@ -489,6 +507,22 @@ Result<image::Rgb8> Decoder::run(const codestream::Parsed& parsed, const codestr
             c["params"]["gabWeights"][ch * 4 + 3].setData(0.0f);
         }
     };
+    // Chroma upsampling first (render pipeline order), horizontal then vertical.
+    for (uint32_t dir = 0; dir < 2 && ycbcr; ++dir) {
+        bool any = false;
+        for (size_t c = 0; c < 3; ++c) {
+            const uint32_t sh = dir == 0 ? hshift[c] : vshift[c];
+            chromaShift[c] = sh;
+            const uint32_t full = dir == 0 ? dim.xsize : dim.ysize;
+            chromaIn[c] = (full + (1u << sh) - 1) >> sh;
+            any = any || sh != 0;
+        }
+        if (!any) continue;
+        chromaUpsample_.dispatch(batch, {dim.xsizePadded, dim.ysizePadded, 1}, [&](rhi::ShaderCursor c) { bindFilter(c, dir, 0.0f); });
+        std::swap(src, dst);
+    }
+    chromaShift = {};
+    chromaIn = {};
     if (lf.gab) {
         gaborish_.dispatch(batch, {dim.xsize, dim.ysize, 1}, [&](rhi::ShaderCursor c) { bindFilter(c, 0, 0.0f); });
         std::swap(src, dst);
@@ -615,7 +649,7 @@ Result<image::Rgb8> Decoder::run(const codestream::Parsed& parsed, const codestr
         }
         c["params"]["transfer"].setData(transfer);
         c["params"]["gamma"].setData(gamma);
-        c["params"]["mode"].setData(uint32_t{(modular && !modularXyb) ? 1u : 0u});
+        c["params"]["mode"].setData(uint32_t{ycbcr ? 2u : (modular && !modularXyb) ? 1u : 0u});
         c["params"]["channels"].setData(outChannels);
         c["params"]["alphaPlane"].setData(alphaIndex < numEc ? alphaIndex : 0u);
         c["alpha"].setBinding(ecOut ? ecOut->rhi() : dummy.rhi());

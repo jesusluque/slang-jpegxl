@@ -42,7 +42,11 @@ struct AcGroupGeom {
     uint blocksX;
     uint nblocks;
     uint group;
+    uint4 hshift, vshift;   // chroma subsampling per channel (X, Y, B)
 };
+
+uint acShift(uint4 v, uint c) { return c == 0 ? v.x : c == 1 ? v.y : v.z; }
+static const uint kNzGrid = 32;   // group-local non-zero grid per channel (groupDim / 8 <= 128 would need more)
 
 /// One pass of one AC group: coefficients are added, shifted by the pass's shift.
 void decodeAcGroup(inout Dec d, AcGroupGeom g, uint pass, uint shift, uint windowOff) {
@@ -60,14 +64,13 @@ void decodeAcGroup(inout Dec d, AcGroupGeom g, uint pass, uint shift, uint windo
     if (d.error != kErrNone) return;
     const uint ordersOff = arena[passTable(pass) + 0];
     const int scale = int(1u << shift);
-    // Group-local non-zero counts per channel, this row and the one above.
-    const uint nzOff = alloc(d, 3 * 2 * 32);
+    // Group-local non-zero counts per channel at the channel's resolution (num_nzeroes).
+    const uint gridW = max(g.w, 1u), gridH = max(g.h, 1u);
+    const uint nzOff = alloc(d, 3 * gridW * gridH);
     if (d.error != kErrNone) return;
-    for (uint i = 0; i < 3 * 2 * 32; ++i) arena[nzOff + i] = 0;
+    for (uint i = 0; i < 3 * gridW * gridH; ++i) arena[nzOff + i] = 0;
     const uint physical[3] = {1, 0, 2};
     for (uint by = 0; by < g.h; ++by) {
-        const uint curRow = by & 1;
-        const uint topRow = curRow ^ 1;
         for (uint bx = 0; bx < g.w;) {
             const uint block = (g.y0 + by) * g.blocksX + g.x0 + bx;
             const uint acsEntry = acs[block];
@@ -87,13 +90,15 @@ void decodeAcGroup(inout Dec d, AcGroupGeom g, uint pass, uint shift, uint windo
             const uint dcIdx = quantDcBucket[block];
             for (uint ci = 0; ci < 3; ++ci) {
                 const uint c = physical[ci];
-                // PredictFromTopAndLeft over the group-local grid, default 32.
-                const uint rowCur = nzOff + (c * 2 + curRow) * 32;
-                const uint rowTop = nzOff + (c * 2 + topRow) * 32;
+                const uint hs = acShift(g.hshift, c), vs = acShift(g.vshift, c);
+                const uint sbx = bx >> hs, sby = by >> vs;
+                if ((sbx << hs) != bx || (sby << vs) != by) continue;   // a subsampled channel codes one block per 2x2
+                // PredictFromTopAndLeft over the channel's group-local grid, default 32.
+                const uint grid = nzOff + c * gridW * gridH;
                 uint predicted;
-                if (bx == 0) predicted = by == 0 ? 32 : arena[rowTop + bx];
-                else if (by == 0) predicted = arena[rowCur + bx - 1];
-                else predicted = (arena[rowTop + bx] + arena[rowCur + bx - 1] + 1) / 2;
+                if (sbx == 0) predicted = sby == 0 ? 32 : arena[grid + (sby - 1) * gridW + sbx];
+                else if (sby == 0) predicted = arena[grid + sby * gridW + sbx - 1];
+                else predicted = (arena[grid + (sby - 1) * gridW + sbx] + arena[grid + sby * gridW + sbx - 1] + 1) / 2;
                 const uint blockCtx = blockContext(dcIdx, qfv, ord, c);
                 const uint nzeroCtx = nonZeroContext(predicted, blockCtx) + ctxOffset;
                 uint nzeros = readHybridUint(d, r, nzeroCtx);
@@ -101,9 +106,7 @@ void decodeAcGroup(inout Dec d, AcGroupGeom g, uint pass, uint shift, uint windo
                 const uint normalized = (nzeros + covered - 1) >> log2Covered;
                 for (uint y = 0; y < cy; ++y) {
                     for (uint x = 0; x < cx; ++x) {
-                        // rows below this one take the top-row slot when by+y is odd relative to by
-                        const uint rowIdx = nzOff + (c * 2 + ((by + y) & 1)) * 32;
-                        arena[rowIdx + bx + x] = normalized;
+                        if (sby + y < gridH && sbx + x < gridW) arena[grid + (sby + y) * gridW + sbx + x] = normalized;
                     }
                 }
                 const uint histoOffset = ctxOffset + numCtxs * kNonZeroBuckets + kZeroDensityContextCount * blockCtx;

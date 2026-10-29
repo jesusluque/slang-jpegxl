@@ -53,6 +53,7 @@ struct FrameDim {
     [[nodiscard]] uint32_t numSections() const { return 2 + numDcGroups() + numGroups(); }
 };
 /// `groupSizeShift` is the frame header field (1 for 256 px groups).
-[[nodiscard]] FrameDim frameDim(uint32_t xsize, uint32_t ysize, uint32_t groupSizeShift = 1);
+/// `maxHShift`/`maxVShift`: the largest chroma subsampling shifts (block counts round up to their multiples).
+[[nodiscard]] FrameDim frameDim(uint32_t xsize, uint32_t ysize, uint32_t groupSizeShift = 1, uint32_t maxHShift = 0, uint32_t maxVShift = 0);
 
 }   // namespace sjxl::codestream

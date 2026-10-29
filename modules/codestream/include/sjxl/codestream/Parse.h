@@ -112,6 +112,9 @@ struct FrameHeader {
     bool     isModular = false;
     uint64_t flags = 0;
     uint32_t colorTransform = 0; // 0 XYB, 1 none, 2 YCbCr
+    std::array<uint32_t, 3> chromaMode{};   // YCbCr: channel_mode per channel (X/Cb, Y, B/Cr)
+    std::array<uint32_t, 3> hshift{}, vshift{};   // derived: maxhs - kHShift[mode] etc.
+    uint32_t maxHShift = 0, maxVShift = 0;
     uint32_t upsampling = 1;
     std::vector<uint32_t> ecUpsampling;
     uint32_t groupSizeShift = 1;

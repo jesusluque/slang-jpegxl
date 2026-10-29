@@ -64,6 +64,8 @@ struct SectionParams {
     uint4 ecW;            // extra channel sizes (ceil(output size / ec_upsampling)) and shifts
     uint4 ecH;
     uint4 ecShift;
+    uint4 hshift;         // YCbCr chroma subsampling per channel (x: X/Cb, y: Y, z: B/Cr); zeros for 4:4:4 and XYB
+    uint4 vshift;
 };
 
 StructuredBuffer<uint2>   sections;   // bit start, bit end of each TOC entry, codestream order
@@ -120,6 +122,8 @@ DcGroupGeom dcGeom(uint g) {
     geom.groupBlocks = groupBlocks();
     geom.useDcFrame = (params.frameFlags & 32u) != 0 ? 1u : 0u;
     geom.windowOff = windowFor(1 + g);
+    geom.hshift = params.hshift;
+    geom.vshift = params.vshift;
     return geom;
 }
 
@@ -135,6 +139,8 @@ AcGroupGeom acGeom(uint g) {
     geom.blocksX = params.blocksX;
     geom.nblocks = params.blocksX * params.blocksY;
     geom.group = g;
+    geom.hshift = params.hshift;
+    geom.vshift = params.vshift;
     return geom;
 }
 
@@ -194,7 +200,7 @@ void decodeGlobals(uint3 tid: SV_DispatchThreadID) {
             d.br.pos = sections[1 + params.numDcGroups].x;
             d.br.end = sections[1 + params.numDcGroups].y;
         }
-        decodeAcGlobal(d, params.numGroups, params.numPasses, window);
+        decodeAcGlobal(d, params.numGroups, params.numDcGroups, params.numPasses, window);
         arena[kGsAcGlobalBits] = d.br.pos;
     }
     if (d.error == kErrNone && params.singleSection != 0) {

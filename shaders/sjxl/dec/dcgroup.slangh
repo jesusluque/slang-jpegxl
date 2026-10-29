@@ -26,18 +26,27 @@ struct DcGroupGeom {
     uint groupBlocks;    // AC group size in blocks (groupDim / 8)
     uint useDcFrame;     // kUseDcFrame: the DC comes from a DC frame, nothing of it is coded here
     uint windowOff;      // LZ77 window of this thread (for the modular group)
+    uint4 hshift, vshift;   // chroma subsampling per channel (XYB order X, Y, B)
 };
+
+uint shiftOf(uint4 v, uint c) { return c == 0 ? v.x : c == 1 ? v.y : v.z; }
 
 void decodeDcGroup(inout Dec d, DcGroupGeom g, uint windowOff) {
     const GlobalTree global = globalTree();
     const uint chansOff = alloc(d, kMaxChannels * kChanWords);
     if (d.error != kErrNone) return;
     uint numChannels = 3;
+    const bool is444 = (g.hshift.x | g.hshift.y | g.hshift.z | g.vshift.x | g.vshift.y | g.vshift.z) == 0;
     if (g.useDcFrame == 0) {
     // VarDCT DC: extra precision, three channels in Y, X, B order.
     const uint extraPrecision = brRead(d.br, 2);
     const float mul = 1.0f / float(1u << extraPrecision);
-    for (uint i = 0; i < 3; ++i) storeChannel(chansOff, i, newChannel(d, g.w, g.h, 0, 0));
+    // Channels in Y, X, B order, each at its subsampled size (DecodeVarDCTDC shrink).
+    const uint phys[3] = {1, 0, 2};
+    for (uint i = 0; i < 3; ++i) {
+        const uint c = phys[i];
+        storeChannel(chansOff, i, newChannel(d, g.w >> shiftOf(g.hshift, c), g.h >> shiftOf(g.vshift, c), 0, 0));
+    }
     if (d.error != kErrNone) return;
     decodeModularStream(d, chansOff, numChannels, 1 + g.group, global, windowOff, 8);
     if (d.error != kErrNone) return;
@@ -53,16 +62,24 @@ void decodeDcGroup(inout Dec d, DcGroupGeom g, uint windowOff) {
     const float cflB = gsF(kGsCflDcFactorB);
     const uint nblocks = g.blocksX * 0 + arena[kGsHeaderSize - 1];   // see decodeDcGroup caller: nblocks stored there
     const uint numDcCtxs = arena[kGsBctxNumDcCtxs];
+    // DequantDC. Subsampled channels keep their values at the co-located full-grid
+    // block (sbx << hshift, sby << vshift), where the AC decode and the IDCT find them.
     for (uint y = 0; y < g.h; ++y) {
         for (uint x = 0; x < g.w; ++x) {
             const uint block = (g.y0 + y) * g.blocksX + g.x0 + x;
-            const int qx = px(chX, x, y);
-            const int qy = px(chY, x, y);
-            const int qb = px(chB, x, y);
+            const int qx = px(chX, x >> shiftOf(g.hshift, 0), y >> shiftOf(g.vshift, 0));
+            const int qy = px(chY, x >> shiftOf(g.hshift, 1), y >> shiftOf(g.vshift, 1));
+            const int qb = px(chB, x >> shiftOf(g.hshift, 2), y >> shiftOf(g.vshift, 2));
             const float fy = float(qy) * facY;
-            dc[1 * nblocks + block] = fy;
-            dc[0 * nblocks + block] = float(qx) * facX + fy * cflX;
-            dc[2 * nblocks + block] = float(qb) * facB + fy * cflB;
+            if (is444) {
+                dc[1 * nblocks + block] = fy;
+                dc[0 * nblocks + block] = float(qx) * facX + fy * cflX;
+                dc[2 * nblocks + block] = float(qb) * facB + fy * cflB;
+            } else {
+                dc[1 * nblocks + block] = fy;
+                dc[0 * nblocks + block] = float(qx) * facX;
+                dc[2 * nblocks + block] = float(qb) * facB;
+            }
             uint bucket = 0;
             if (numDcCtxs > 1) {
                 uint bx = 0, by = 0, bb = 0;
@@ -126,6 +143,7 @@ void decodeDcGroup(inout Dec d, DcGroupGeom g, uint windowOff) {
             usedAcs |= 1u << strategy;
             const uint cx = kCoveredX[strategy];
             const uint cy = kCoveredY[strategy];
+            if ((cx > 1 || cy > 1) && !is444) { fail(d, kErrCorrupt); return; }   // only 8x8 with chroma subsampling
             const uint nextXGroup = (x / g.groupBlocks + 1) * g.groupBlocks;
             const uint nextYGroup = (y / g.groupBlocks + 1) * g.groupBlocks;
             if (x + cx > nextXGroup || x + cx > g.x0 + g.w || y + cy > nextYGroup || y + cy > g.y0 + g.h) {

@@ -59,7 +59,7 @@ int info(int argc, char** argv) {
             const auto& h = f.header;
             const char* type = h.frameType == 0 ? "regular" : h.frameType == 1 ? "DC" : h.frameType == 2 ? "reference-only" : "skip-progressive";
             std::printf("  frame %zu %s %s %ux%u, groups %u px (%u AC, %u DC), %zu sections, %u pass%s%s%s%s%s, gab %d, epf %u%s\n", i, type,
-                        h.isModular ? "Modular" : "VarDCT", f.dim.xsize, f.dim.ysize, f.dim.groupDim, f.dim.numGroups(), f.dim.numDcGroups(),
+                        h.isModular ? "Modular" : h.colorTransform == 2 ? "VarDCT YCbCr" : "VarDCT", f.dim.xsize, f.dim.ysize, f.dim.groupDim, f.dim.numGroups(), f.dim.numDcGroups(),
                         f.sections.size(), h.numPasses, h.numPasses == 1 ? "" : "es", (h.flags & sjxl::codestream::FrameHeader::kPatches) ? ", patches" : "",
                         (h.flags & sjxl::codestream::FrameHeader::kSplines) ? ", splines" : "", (h.flags & sjxl::codestream::FrameHeader::kNoise) ? ", noise" : "",
                         h.frameType == 2 ? (h.saveBeforeColorTransform ? ", saved before the colour transform" : ", saved after the colour transform")

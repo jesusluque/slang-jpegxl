@@ -1,6 +1,7 @@
 // Copyright (c) 2026 jesus luque.
 #include "sjxl/codestream/Parse.h"
 
+#include <algorithm>
 #include <array>
 #include <format>
 #include <cmath>
@@ -286,8 +287,17 @@ Result<void> readFrameHeader(BitReader& br, const ImageMetadata& m, FrameHeader&
         f.colorTransform = br.readBool() ? 2 : 1;
     }
     if (f.colorTransform == 2 && (f.flags & FrameHeader::kUseDcFrame) == 0) {
-        // YCbCrChromaSubsampling: 3 x Bits(2)
-        for (int c = 0; c < 3; ++c) (void)br.read(2);
+        // YCbCrChromaSubsampling: 3 x Bits(2); kHShift = {0, 1, 1, 0}, kVShift = {0, 1, 0, 1}
+        constexpr uint32_t kH[4] = {0, 1, 1, 0}, kV[4] = {0, 1, 0, 1};
+        for (uint32_t& mode : f.chromaMode) mode = br.read(2);
+        for (uint32_t c = 0; c < 3; ++c) {
+            f.maxHShift = std::max(f.maxHShift, kH[f.chromaMode[c]]);
+            f.maxVShift = std::max(f.maxVShift, kV[f.chromaMode[c]]);
+        }
+        for (uint32_t c = 0; c < 3; ++c) {
+            f.hshift[c] = f.maxHShift - kH[f.chromaMode[c]];
+            f.vshift[c] = f.maxVShift - kV[f.chromaMode[c]];
+        }
     }
     if ((f.flags & FrameHeader::kUseDcFrame) == 0) {
         f.upsampling = br.readU32(U32Enc{{Val(1), Val(2), Val(4), Val(8)}});
@@ -502,7 +512,8 @@ Result<void> parseFramesFrom(Parsed& p, size_t startByte) {
             if (m.colorSpace != 0 && m.colorSpace != 1) return unsupported("Modular frames in a colour space other than RGB or grey");
             if (m.floatingPointSample) return unsupported("floating point samples");
         } else {
-            if (!m.xybEncoded || f.colorTransform != 0) return unsupported("VarDCT frames not encoded in XYB");
+            if (f.colorTransform == 1) return unsupported("VarDCT frames in RGB without a colour transform");
+            if (f.colorTransform == 2 && (f.loopFilter.gab || f.loopFilter.epfIters != 0)) return unsupported("loop filters on YCbCr frames");
             if (referenceOnly) return unsupported("VarDCT reference-only frames");
             if (dcFrame) return unsupported("VarDCT DC frames");
         }
@@ -539,7 +550,7 @@ Result<void> parseFramesFrom(Parsed& p, size_t startByte) {
         // FrameDimensions::Set: the frame is coded at 1 / upsampling of its size.
         fx = (fx + f.upsampling - 1) / f.upsampling;
         fy = (fy + f.upsampling - 1) / f.upsampling;
-        frame.dim = frameDim(fx, fy, f.groupSizeShift);
+        frame.dim = frameDim(fx, fy, f.groupSizeShift, f.maxHShift, f.maxVShift);
         // toc.h NumTocEntries: one entry for one group and one pass; else DcGlobal,
         // DC groups, AcGlobal, then the AC groups of every pass.
         frame.singleSection = frame.dim.numGroups() == 1 && f.numPasses == 1;

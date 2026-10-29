@@ -276,6 +276,11 @@ void computeDequantTable(uint3 tid: SV_DispatchThreadID) {
     const uint y = i / cols;
     const uint x = i % cols;
     const Enc e = loadEncoding(kind, c);
+    if (e.mode == 7) {   // RAW: table = den * q, in the table's linear order
+        const uint qe = arena[kGsQuantEncOff] + kind * kQeWords;
+        dequant[entry] = asfloat(arena[qe + kQeRawDen]) * float(arena[arena[qe + kQeRawOff] + rel]);
+        return;
+    }
     const float w = weightAt(kind, c, x, y, e);
     dequant[entry] = 1.0f / w;
 }

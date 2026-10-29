@@ -37,7 +37,12 @@ struct TransformParams {
     float bDm;
     uint  pad0;
     float quantBias[4];
+    uint4 hshift;       // chroma subsampling per channel (X, Y, B); the channel's blocks sit at (sbx << hshift, sby << vshift)
+    uint4 vshift;
 };
+
+uint hshiftOf(uint c) { return c == 0 ? params.hshift.x : c == 1 ? params.hshift.y : params.hshift.z; }
+uint vshiftOf(uint c) { return c == 0 ? params.vshift.x : c == 1 ? params.vshift.y : params.vshift.z; }
 ConstantBuffer<TransformParams> params;
 
 static const uint kGsInvGlobalScale = 3;
@@ -163,6 +168,10 @@ void llfFromDc(uint3 tid: SV_DispatchThreadID) {
     const uint first = firstBlock[block];
     const uint strategy = acs[first] >> 1;
     if (strategy >= 27 || !isDctFamily(strategy)) return;
+    {
+        const uint hs = hshiftOf(c), vs = vshiftOf(c);
+        if (((block % params.blocksX) & ((1u << hs) - 1)) != 0 || ((block / params.blocksX) & ((1u << vs) - 1)) != 0) return;
+    }
     const uint cx = kCoveredX[strategy];
     const uint cy = kCoveredY[strategy];
     const uint fbx = first % params.blocksX;
@@ -189,7 +198,17 @@ struct PixelBlock {
     uint fpx, fpy;   // pixel origin of the varblock
 };
 
-bool locate(uint px, uint py, out PixelBlock pb) {
+bool locate(uint c, uint px, uint py, out PixelBlock pb) {
+    const uint hs = hshiftOf(c), vs = vshiftOf(c);
+    if (hs != 0 || vs != 0) {
+        // A subsampled channel: DCT8 blocks on its own grid, stored at the co-located full-grid block.
+        pb.cx = 1; pb.cy = 1; pb.strategy = 0;
+        pb.fpx = (px / 8) * 8;
+        pb.fpy = (py / 8) * 8;
+        pb.first = ((py / 8) << vs) * params.blocksX + ((px / 8) << hs);
+        if (px >= (params.paddedWidth >> hs) || py >= (params.paddedHeight >> vs)) return false;
+        return acs[pb.first] != 0xFFu;
+    }
     const uint block = (py / 8) * params.blocksX + px / 8;
     pb.first = firstBlock[block];
     const uint entry = acs[pb.first];
@@ -214,7 +233,7 @@ void idctRows(uint3 tid: SV_DispatchThreadID) {
     const uint px = p % params.paddedWidth;
     const uint py = p / params.paddedWidth;
     PixelBlock pb;
-    if (!locate(px, py, pb)) return;
+    if (!locate(c, px, py, pb)) return;
     const uint nx = pb.cx * 8, ny = pb.cy * 8;
     const uint v = py - pb.fpy;
     const uint tx = px - pb.fpx;
@@ -236,7 +255,7 @@ void idctCols(uint3 tid: SV_DispatchThreadID) {
     const uint px = p % params.paddedWidth;
     const uint py = p / params.paddedWidth;
     PixelBlock pb;
-    if (!locate(px, py, pb)) return;
+    if (!locate(c, px, py, pb)) return;
     const uint ny = pb.cy * 8;
     const uint ty = py - pb.fpy;
     float sum = 0.0f;

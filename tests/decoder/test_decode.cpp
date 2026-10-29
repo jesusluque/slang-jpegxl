@@ -354,3 +354,39 @@ TEST_CASE("the decoder matches djxl on images with alpha", "[decoder][conformanc
     WARN(std::format("alpha {}: vs djxl PSNR {:.2f} dB, max diff {} (channel {})", options, metrics->psnr, metrics->maxAbsDiff, metrics->maxAtChannel));
     CHECK(metrics->maxAbsDiff <= (options == "-d 0 -e 7" ? 0 : 1));
 }
+
+TEST_CASE("the decoder matches djxl on recompressed JPEGs", "[decoder][conformance][cjxl][jpeg]") {
+    const std::filesystem::path djxl = test::findTool("djxl");
+    const std::filesystem::path cjxl = test::findTool("cjxl");
+    const std::filesystem::path sips = test::findTool("sips");   // macOS: makes 4:2:0 JPEGs from the PNGs
+    if (djxl.empty() || cjxl.empty()) SKIP("cjxl/djxl are not installed");
+    if (sips.empty()) SKIP("no JPEG encoder (sips) to make test JPEGs");
+    const std::string name = GENERATE(std::string("berlin_200.png"), std::string("sveti_stefan_320.png"), std::string("sveti_crop_257x129.png"));
+    const int quality = GENERATE(75, 92);
+    CAPTURE(name, quality);
+    const std::filesystem::path jpg = test::scratchDir() / std::format("dec_jpeg_{}_q{}.jpg", name, quality);
+    const std::filesystem::path jxl = test::scratchDir() / std::format("dec_jpeg_{}_q{}.jxl", name, quality);
+    const std::filesystem::path png = test::scratchDir() / std::format("dec_jpeg_{}_q{}.djxl.png", name, quality);
+    REQUIRE(test::run(std::format("\"{}\" -s format jpeg -s formatOptions {} \"{}\" --out \"{}\" >/dev/null 2>&1", sips.string(), quality,
+                                  test::testData(name).string(), jpg.string())));
+    REQUIRE(test::run(std::format("\"{}\" \"{}\" \"{}\" >/dev/null 2>&1", cjxl.string(), jpg.string(), jxl.string())));   // lossless transcode
+    REQUIRE(test::run(std::format("\"{}\" \"{}\" \"{}\" >/dev/null 2>&1", djxl.string(), jxl.string(), png.string())));
+    auto bytes = image::readFile(jxl);
+    REQUIRE(bytes);
+    auto parsed = dec::Decoder::info(*bytes);
+    REQUIRE(parsed);
+    REQUIRE(parsed->frame.header.colorTransform == 2);   // YCbCr, as a JPEG transcode is
+    auto reference = image::readRgb8(png);
+    REQUIRE(reference);
+    auto ours = decoder().decode(*bytes);
+    if (!ours && ours.error().code() == ErrorCode::Unsupported) {
+        WARN(std::format("jpeg {} q{}: unsupported: {}", name, quality, ours.error().message()));
+        SUCCEED();
+        return;
+    }
+    REQUIRE(ours);
+    auto metrics = test::compare(*reference, *ours);
+    REQUIRE(metrics);
+    WARN(std::format("jpeg {} q{}: vs djxl PSNR {:.2f} dB, max diff {}", name, quality, metrics->psnr, metrics->maxAbsDiff));
+    CHECK(metrics->maxAbsDiff <= 1);
+}

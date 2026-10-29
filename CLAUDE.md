@@ -135,6 +135,9 @@ in the finalise thread. Patches: reference-only Modular frames come first in
 the codestream and keep their planes; the displayed frame's globals thread
 decodes the dictionary, and `patches.slang` blends the rectangles per pixel
 after the filters (`docs/decisions.md`, "Patches and multiple frames").
+JPEG recompression: YCbCr frames with chroma subsampling keep a subsampled
+channel's data at the co-located full-grid block; raw quant tables are modular
+streams; `chromaUpsample` runs first, the output stage converts YCbCr (mode 2).
 Extra channels are modular in every frame (the globals thread builds the
 modular image, DC/AC groups decode their modular groups, `ecToPlanes` makes
 planes, the output stage writes RGBA when there is alpha).

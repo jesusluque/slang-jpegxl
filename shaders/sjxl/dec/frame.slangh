@@ -391,7 +391,7 @@ void readDctParams(inout Dec d, uint qe, uint numBandsField, uint bandsField) {
 }
 
 /// jxl::Decode of one QuantEncoding.
-void readQuantEncoding(inout Dec d, uint qe, uint kind) {
+void readQuantEncoding(inout Dec d, uint qe, uint kind, uint numDcGroups, uint windowOff) {
     const uint requiredSize = kTableSizeX[kind] * kTableSizeY[kind];
     const uint mode = brRead(d.br, 3);
     arena[qe + kQeMode] = mode;
@@ -456,23 +456,50 @@ void readQuantEncoding(inout Dec d, uint qe, uint kind) {
     case 6:
         readDctParams(d, qe, kQeNumBands, kQeBands);
         break;
-    case 7:
-        fail(d, kErrUnsupported);   // RAW quant tables (JPEG recompression, M4)
+    case 7: {
+        // kQuantModeRAW (ModularFrameDecoder::DecodeQuantTable): a denominator and a
+        // 3-channel modular image of 8 size_x by 8 size_y, stream QuantTable(kind).
+        const float den = brF16(d.br);
+        if (den < 1e-8f) { fail(d, kErrCorrupt); return; }
+        arena[qe + kQeRawDen] = asuint(den);
+        const uint w = 8 * kTableSizeX[kind], h = 8 * kTableSizeY[kind];
+        const uint chans = alloc(d, kMaxChannels * kChanWords);
+        if (d.error != kErrNone) return;
+        uint numChannels = 3;
+        for (uint c = 0; c < 3; ++c) storeChannel(chans, c, newChannel(d, w, h, 0, 0));
+        if (d.error != kErrNone) return;
+        decodeModularStream(d, chans, numChannels, 1 + 3 * numDcGroups + kind, globalTree(), windowOff, 8);
+        if (d.error != kErrNone) return;
+        if (numChannels != 3) { fail(d, kErrCorrupt); return; }
+        const uint raw = alloc(d, 3 * w * h);
+        if (d.error != kErrNone) return;
+        for (uint c = 0; c < 3; ++c) {
+            const Channel ch = loadChannel(chans, c);
+            for (uint y = 0; y < h; ++y) {
+                for (uint x = 0; x < w; ++x) {
+                    const int v = px(ch, x, y);
+                    if (v <= 0) { fail(d, kErrCorrupt); return; }
+                    arena[raw + c * w * h + y * w + x] = uint(v);
+                }
+            }
+        }
+        arena[qe + kQeRawOff] = raw;
         break;
+    }
     default:
         fail(d, kErrCorrupt);
     }
 }
 
 /// DequantMatrices::Decode: 17 encodings (all library when all_default).
-void readDequantMatrices(inout Dec d) {
+void readDequantMatrices(inout Dec d, uint numDcGroups, uint windowOff) {
     const uint encOff = alloc(d, kNumQuantTables * kQeWords);
     arena[kGsQuantEncOff] = encOff;
     if (d.error != kErrNone) return;
     for (uint i = 0; i < kNumQuantTables * kQeWords; ++i) arena[encOff + i] = 0;
     if (brRead(d.br, 1) != 0) return;   // all_default
     for (uint i = 0; i < kNumQuantTables; ++i) {
-        readQuantEncoding(d, encOff + i * kQeWords, i);
+        readQuantEncoding(d, encOff + i * kQeWords, i, numDcGroups, windowOff);
         if (d.error != kErrNone) return;
     }
 }
@@ -633,8 +660,8 @@ uint passTable(uint p) { return arena[kGsPassTableOff] + p * kPassWords; }
 
 /// The whole AcGlobal section: dequant matrices, the histogram count, then per
 /// pass the coefficient orders and the AC histograms (ProcessACGlobal).
-void decodeAcGlobal(inout Dec d, uint numGroups, uint numPasses, uint windowOff) {
-    readDequantMatrices(d);
+void decodeAcGlobal(inout Dec d, uint numGroups, uint numDcGroups, uint numPasses, uint windowOff) {
+    readDequantMatrices(d, numDcGroups, windowOff);
     if (d.error != kErrNone) return;
     const uint numHistograms = 1 + brRead(d.br, ceilLog2Nonzero(numGroups));
     arena[kGsNumHistograms] = numHistograms;

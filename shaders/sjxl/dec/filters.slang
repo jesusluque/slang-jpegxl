@@ -21,6 +21,8 @@ struct FilterParams {
     float channelScale[3];
     float pad0;
     float gabWeights[12];   // per channel: w0, w1, w2 normalised (3 used of 4)
+    uint4 chromaShift;      // chromaUpsample: per channel shift in the pass's direction (1 = expand 2x)
+    uint4 chromaIn;         // chromaUpsample: per channel visible input size along the pass's direction
 };
 ConstantBuffer<FilterParams> params;
 
@@ -137,4 +139,36 @@ void epf(uint3 tid: SV_DispatchThreadID) {
     put(0, tid.x, tid.y, X * inv);
     put(1, tid.x, tid.y, Y * inv);
     put(2, tid.x, tid.y, B * inv);
+}
+
+/// Chroma upsampling (stage_chroma_upsampling.cc), one pass per direction: a channel
+/// with the pass's shift set is expanded 2x (0.75 of the sample, 0.25 of its neighbour,
+/// mirrored at the channel's visible size); the others are copied. Stage 0: horizontal,
+/// 1: vertical. Works on the coded planes before the loop filters; the subsampled
+/// channel occupies the top-left region of its plane.
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void chromaUpsample(uint3 tid: SV_DispatchThreadID) {
+    if (tid.x >= params.paddedWidth || tid.y >= params.paddedHeight) return;
+    const uint plane = params.paddedWidth * params.paddedHeight;
+    for (uint c = 0; c < 3; ++c) {
+        const uint shift = c == 0 ? params.chromaShift.x : c == 1 ? params.chromaShift.y : params.chromaShift.z;
+        const uint n = c == 0 ? params.chromaIn.x : c == 1 ? params.chromaIn.y : params.chromaIn.z;   // input length along the direction
+        const uint o = c * plane + tid.y * params.paddedWidth + tid.x;
+        if (shift == 0) { dst[o] = src[o]; continue; }
+        const int pos = int(params.stage == 0 ? tid.x : tid.y);   // output position along the direction
+        const int i = pos >> 1;
+        if (uint(i) >= n) { dst[o] = 0.0f; continue; }
+        const int nb = (pos & 1) == 0 ? i - 1 : i + 1;
+        const int nbm = mirror(nb, int(n));
+        float cur, nei;
+        if (params.stage == 0) {
+            cur = src[c * plane + tid.y * params.paddedWidth + uint(i)];
+            nei = src[c * plane + tid.y * params.paddedWidth + uint(nbm)];
+        } else {
+            cur = src[c * plane + uint(i) * params.paddedWidth + tid.x];
+            nei = src[c * plane + uint(nbm) * params.paddedWidth + tid.x];
+        }
+        dst[o] = 0.75f * cur + 0.25f * nei;
+    }
 }
