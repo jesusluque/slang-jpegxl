@@ -16,8 +16,9 @@ struct ModularOutParams {
     uint  paddedWidth;
     uint  paddedHeight;
     uint  xybMode;        // 1: Y, X, B channels with the DC dequant factors (kGsDcQuant)
-    float sampleScale;    // 1 / (2^bits - 1) for RGB / grey
-    uint  pad0, pad1;
+    float sampleScale;    // 1 / (2^bits - 1) for RGB / grey, or for the extra channel (ecToPlanes)
+    uint  ecChannel;      // ecToPlanes: index in the channel list
+    uint  ecPlane;        // ecToPlanes: destination plane index
 };
 ConstantBuffer<ModularOutParams> params;
 
@@ -57,4 +58,18 @@ void modularToPlanes(uint3 tid: SV_DispatchThreadID) {
         const int v = sample(chansOff, colorChannels == 1 ? 0 : c, x, y);
         xyb[c * plane + at] = float(v) * params.sampleScale;
     }
+}
+
+/// One extra channel (integers) to its plane in `xyb` (here: the extra channel planes
+/// buffer), width x height at the channel's own size, scaled by 1 / (2^bits - 1).
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void ecToPlanes(uint3 tid: SV_DispatchThreadID) {
+    const uint n = params.width * params.height;
+    if (tid.x >= n) return;
+    const uint x = tid.x % params.width;
+    const uint y = tid.x / params.width;
+    const uint chansOff = arena[kGsModChansOff];
+    const uint plane = params.paddedWidth * params.paddedHeight;
+    xyb[params.ecPlane * plane + y * params.paddedWidth + x] = float(sample(chansOff, params.ecChannel, x, y)) * params.sampleScale;
 }

@@ -44,6 +44,13 @@ private:
     size_t                   pos_;
 };
 
+struct ExtraChannelInfo {
+    uint32_t type = 0;              // 0 alpha, 1 depth, 2 spot colour, 3 selection mask, 4 black, 5 CFA, 6 thermal
+    uint32_t bitsPerSample = 8;
+    uint32_t dimShift = 0;
+    bool     alphaAssociated = false;
+};
+
 struct ImageMetadata {
     uint32_t xsize = 0, ysize = 0;
     uint32_t orientation = 1;
@@ -52,6 +59,7 @@ struct ImageMetadata {
     uint32_t bitsPerSample = 8, exponentBitsPerSample = 0;
     bool     modular16BitBufferSufficient = true;
     uint32_t numExtraChannels = 0;
+    std::vector<ExtraChannelInfo> extraChannels;
     bool     xybEncoded = true;
     // ColorEncoding
     bool     wantIcc = false;

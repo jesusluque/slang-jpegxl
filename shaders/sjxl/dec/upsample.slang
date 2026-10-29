@@ -18,7 +18,9 @@ struct UpsampleParams {
     uint outWidth, outHeight;         // upsampled size
     uint outPaddedWidth, outPaddedHeight;
     uint shift;                       // 1, 2 or 3
-    uint pad0, pad1, pad2;
+    uint channels;                    // planes to process (3 for colour, 1 for an extra channel)
+    uint srcPlane;                    // first source plane index
+    uint dstPlane;                    // first destination plane index
 };
 ConstantBuffer<UpsampleParams> params;
 
@@ -33,7 +35,7 @@ int mirror(int v, int size) {
 float at(uint c, int x, int y) {
     const int mx = mirror(x, int(params.width));
     const int my = mirror(y, int(params.height));
-    return src[c * params.paddedWidth * params.paddedHeight + uint(my) * params.paddedWidth + uint(mx)];
+    return src[(params.srcPlane + c) * params.paddedWidth * params.paddedHeight + uint(my) * params.paddedWidth + uint(mx)];
 }
 
 /// Weight of input tap (py, px) of the kernel for output sub-position (oy, ox).
@@ -62,7 +64,7 @@ void upsample(uint3 tid: SV_DispatchThreadID) {
     const uint ox = tid.x & (n - 1);
     const uint oy = tid.y & (n - 1);
     const uint plane = params.outPaddedWidth * params.outPaddedHeight;
-    for (uint c = 0; c < 3; ++c) {
+    for (uint c = 0; c < params.channels; ++c) {
         float lo = 1e30f, hi = -1e30f, sum = 0.0f;
         for (uint py = 0; py < 5; ++py) {
             for (uint px = 0; px < 5; ++px) {
@@ -72,6 +74,6 @@ void upsample(uint3 tid: SV_DispatchThreadID) {
                 sum += v * kernelWeight(oy, ox, py, px);
             }
         }
-        dst[c * plane + tid.y * params.outPaddedWidth + tid.x] = clamp(sum, lo, hi);
+        dst[(params.dstPlane + c) * plane + tid.y * params.outPaddedWidth + tid.x] = clamp(sum, lo, hi);
     }
 }

@@ -97,7 +97,7 @@ Modules are static libraries `sjxl_<name>` aliased `sjxl::<name>`
 | core | `Result`/`Error`, `log::*`, `platform::{env,cacheDirectory,executableDir}` |
 | gpu | `Device` (backend choice, Slang session, disk shader cache), `ShaderLibrary`, `ComputeKernel`, `CommandBatch` (one encoder per stage; `clear`, `copy`, `submit`), `Buffer` (Device/Upload/Readback), `algo::PrefixSum` (exclusive uint32 scan, 3 dispatches, no atomics) |
 | codestream | CPU-side syntax only: `BitWriter`, U32/U64/F16 field coders, SizeHeader, ImageMetadata, FrameHeader, LoopFilter, TOC (`Headers.h`); `Tables.h`: quantizer params from a distance, DCT8 dequant weights, natural order, computed from libjxl formulas |
-| image | file I/O only: PNG/PPM/JPEG via stb (`readRgb8`, `writePng`, `readFile`, `writeFile`) |
+| image | file I/O only: PNG/PPM/JPEG via stb (`readRgb8` drops alpha, `readImage8` keeps it; `Rgb8::channels` is 3 or 4; `writePng`, `readFile`, `writeFile`) |
 | metrics | `metrics::compare`: PSNR, largest difference and where, measured by `shaders/sjxl/metrics/compare.slang`; what tests and `sjxl compare` use |
 | encoder | `enc::Encoder::encode(Rgb8, Options{distance})`: the GPU encode pipeline (`shaders/sjxl/enc/`): xyb → dct_quant → items (mode 0 histogram, 1 count, 2 emit) → codes (Huffman + headers per DC group, globals) → prefix sums → layout → emit |
 | decoder | `dec::Decoder::decode(bytes)`: `codestream::parse` on the CPU, then `shaders/sjxl/dec/`: sections (one thread per section: globals, DC groups, AC groups; libraries entropy/modular/frame/modframe .slangh over one `arena` buffer) → VarDCT: tables → dc_finalize → transforms; Modular: finalise (inverse transforms) → modular_out (channels to planes) → filters → output |
@@ -135,6 +135,9 @@ in the finalise thread. Patches: reference-only Modular frames come first in
 the codestream and keep their planes; the displayed frame's globals thread
 decodes the dictionary, and `patches.slang` blends the rectangles per pixel
 after the filters (`docs/decisions.md`, "Patches and multiple frames").
+Extra channels are modular in every frame (the globals thread builds the
+modular image, DC/AC groups decode their modular groups, `ecToPlanes` makes
+planes, the output stage writes RGBA when there is alpha).
 Upsampling (`upsample.slang`) runs after the filters at the output size, then
 patches, then noise (`noise.slang`: per-tile xorshift128+, 5×5 convolution,
 strength LUT), then the colour transform.

@@ -54,10 +54,12 @@ per subsystem or milestone, appended to as the work goes. Dates are absolute.
 - **M3 encoder quality**: inverse Gaborish + default LoopFilter, EPF sharpness,
   CfL per tile, adaptive quant field, DCT16/32 strategy search, context
   clustering (≤ 32, fixed-point costs as cujpegxl), ANS for AC.
-- **M4 decoder completeness**: splines, alpha and extra channels, >8-bit
-  output, ICC, animation, JPEG recompression. (64–256 px transforms, Modular
-  frames with RCT/palette/Squeeze, lossy modular, patches, progressive
-  passes, DC frames, permuted TOCs, upsampling, noise: done.)
+- **M4 decoder completeness**: splines, >8-bit output, ICC, animation,
+  JPEG recompression, extra channel blending in patches, premultiplied
+  alpha handling. (64–256 px transforms, Modular frames with
+  RCT/palette/Squeeze, lossy modular, patches, progressive passes, DC
+  frames, permuted TOCs, upsampling, noise, extra channels with alpha
+  output: done.)
 - **M5 platforms and speed**: Linux CUDA/Vulkan, async readback, batching,
   per-stage timings here.
 
@@ -362,3 +364,33 @@ LSB, lossless bit-exact (`[progressive]` test).
 Measured (`[features]` test): resampling 2, 4 and 8 at distance 1, lossless
 with resampling 2, photon noise at ISO 800–6400, and noise with resampling, on
 three images: within 1 LSB of djxl.
+
+## Extra channels and alpha (2026-10-29)
+
+Extra channels are modular in every frame (`DecodeGlobalInfo` with
+`do_color` false for VarDCT): the globals thread builds the modular image
+(colour channels for Modular frames, none for VarDCT, then one channel per
+extra channel at ⌈output size / ec_upsampling⌉ with shift log2(ec_upsampling)
+− log2(upsampling)) and decodes the global stream; the DC groups decode the
+ModularDC group between the VarDCT DC and AcMetadata, the AC groups the
+ModularAC group of each pass after the coefficients (ProcessDCGroup /
+ProcessACGroup order); the finalise thread undoes the transforms. So the
+Modular machinery written for lossless now runs inside VarDCT frames too, and
+the AC/DC group arenas take the modular size when a frame has extra channels
+(the 4 KB VarDCT budget overflowed in a progressive stream).
+
+Output: `ecToPlanes` scales each extra channel to [0, 1] by 1 / (2^bits − 1)
+into its own plane at the output size (upsampled with the same kernel as the
+colour when coded smaller); the output stage writes RGBA when an alpha channel
+exists (`Rgb8::channels` is 3 or 4; `readImage8` keeps a PNG's alpha, the
+compare kernel takes the channel count). Other channel types are decoded and
+ignored, as djxl's PNG output does. The patch dictionary parses one blending
+per extra channel; a non-trivial one is reported Unsupported.
+
+Measured (`[alpha]` test, berlin_200 with a gradient alpha and a hole): VarDCT
+at efforts 5 and 7, lossy modular, resampling 2 and progressive within 1 LSB
+in every channel; lossless bit-exact.
+
+Not done: alpha blending in patches, premultiplied alpha (`alpha_associated`:
+samples pass through as stored), extra channels of more than 8 bits in the
+output, more than 4 extra channels.

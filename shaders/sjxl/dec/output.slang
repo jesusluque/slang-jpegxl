@@ -5,7 +5,8 @@
 module dec_output;
 
 StructuredBuffer<float>  xyb;     // 3 planes, paddedWidth * paddedHeight
-RWStructuredBuffer<uint> rgb8;    // width * height * 3 bytes, packed
+StructuredBuffer<float>  alpha;   // the alpha plane (channels == 4), same layout, at plane `alphaPlane`
+RWStructuredBuffer<uint> rgb8;    // width * height * channels bytes, packed
 
 struct OutputParams {
     uint  width;
@@ -18,7 +19,9 @@ struct OutputParams {
     uint  transfer;            // 0 sRGB, 1 linear, 2 power (gamma)
     float gamma;               // the exponent for transfer 2 (e.g. 1/2.2)
     uint  mode;                // 0: XYB planes; 1: planes already hold the output encoding in [0, 1]
-    uint  pad1;
+    uint  channels;            // 3 (RGB) or 4 (RGBA)
+    uint  alphaPlane;          // plane index of the alpha channel within `alpha`
+    uint  pad2, pad3;
 };
 ConstantBuffer<OutputParams> params;
 
@@ -30,12 +33,13 @@ float encodeFromLinear(float v) {
 }
 
 uint byteFor(uint index) {
-    const uint pixel = index / 3;
-    const uint c = index % 3;
+    const uint pixel = index / params.channels;
+    const uint c = index % params.channels;
     const uint x = pixel % params.width;
     const uint y = pixel / params.width;
     const uint plane = params.paddedWidth * params.paddedHeight;
     const uint at = y * params.paddedWidth + x;
+    if (c == 3) return uint(round(clamp(alpha[params.alphaPlane * plane + at], 0.0f, 1.0f) * 255.0f));
     if (params.mode == 1) return uint(round(clamp(xyb[c * plane + at], 0.0f, 1.0f) * 255.0f));
     const float ox = xyb[at], oy = xyb[plane + at], ob = xyb[2 * plane + at];
     float gr = oy + ox - params.negBiasCbrt[0];
@@ -51,7 +55,7 @@ uint byteFor(uint index) {
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void xybToSrgb8(uint3 tid: SV_DispatchThreadID) {
-    const uint total = params.width * params.height * 3;
+    const uint total = params.width * params.height * params.channels;
     const uint word = tid.x;
     if (word * 4 >= total) return;
     uint packed = 0;

@@ -66,6 +66,7 @@ Result<std::unique_ptr<Decoder>> Decoder::create(std::shared_ptr<gpu::ShaderLibr
     SJXL_ASSIGN(dec->modularAcGroups_, gpu::ComputeKernel::create(lib, "sjxl/dec/sections", "decodeModularAcGroups"));
     SJXL_ASSIGN(dec->modularFinalize_, gpu::ComputeKernel::create(lib, "sjxl/dec/sections", "modularFinalizeFrame"));
     SJXL_ASSIGN(dec->modularToPlanes_, gpu::ComputeKernel::create(lib, "sjxl/dec/modular_out", "modularToPlanes"));
+    SJXL_ASSIGN(dec->ecToPlanes_, gpu::ComputeKernel::create(lib, "sjxl/dec/modular_out", "ecToPlanes"));
     SJXL_ASSIGN(dec->tocPermutation_, gpu::ComputeKernel::create(lib, "sjxl/dec/toc", "decodeTocPermutation"));
     SJXL_ASSIGN(dec->upsample_, gpu::ComputeKernel::create(lib, "sjxl/dec/upsample", "upsample"));
     SJXL_ASSIGN(dec->noiseRandom_, gpu::ComputeKernel::create(lib, "sjxl/dec/noise", "noiseRandom"));
@@ -173,6 +174,11 @@ Result<image::Rgb8> Decoder::run(const codestream::Parsed& parsed, const codestr
     // finalise step in the AC groups' region.
     uint32_t globalsWords = kGlobalsWords, dcGroupWords = kDcGroupWords, acGroupWords = kAcGroupWords;
     if (!modular && frame.header.numPasses > 1) globalsWords += (frame.header.numPasses - 1) * 6156u * 64u;   // one order table per pass
+    if (!modular && m.numExtraChannels > 0) {   // the AC and DC groups also decode the extra channels' modular groups
+        acGroupWords = std::max(acGroupWords, kModularGroupWords);
+        dcGroupWords = std::max(dcGroupWords, kModularGroupWords);
+        globalsWords += static_cast<uint32_t>((m.numExtraChannels + 1) * uint64_t{frame.outXsize} * frame.outYsize);
+    }
     if (modular) {
         const uint64_t pixels = uint64_t{dim.xsize} * dim.ysize;
         if (pixels * (colorChannels + 2) > (uint64_t{1} << 31)) return Error(ErrorCode::Unsupported, "modular frames above 512 Mpixel");
@@ -213,10 +219,23 @@ Result<image::Rgb8> Decoder::run(const codestream::Parsed& parsed, const codestr
     const uint32_t upShift = upsampling == 8 ? 3 : upsampling == 4 ? 2 : upsampling == 2 ? 1 : 0;
     const uint32_t outWidth = frame.outXsize, outHeight = frame.outYsize;
     const uint32_t outPaddedWidth = dim.xsizePadded * upsampling, outPaddedHeight = dim.ysizePadded * upsampling;
-    const uint32_t outBytes = outWidth * outHeight * 3;
+    // Extra channels: modular in every frame, at ceil(output size / ec_upsampling).
+    const uint32_t numEc = m.numExtraChannels;
+    std::array<uint32_t, 4> ecW{}, ecH{}, ecShift{}, ecUps{};
+    uint32_t alphaIndex = numEc;   // first alpha channel, numEc when none
+    for (uint32_t e = 0; e < numEc; ++e) {
+        ecUps[e] = frame.header.ecUpsampling[e];
+        ecW[e] = (outWidth + ecUps[e] - 1) / ecUps[e];
+        ecH[e] = (outHeight + ecUps[e] - 1) / ecUps[e];
+        const uint32_t ecLog = ecUps[e] == 8 ? 3 : ecUps[e] == 4 ? 2 : ecUps[e] == 2 ? 1 : 0;
+        ecShift[e] = ecLog - upShift;
+        if (alphaIndex == numEc && m.extraChannels[e].type == 0) alphaIndex = e;
+    }
+    const uint32_t outChannels = alphaIndex < numEc ? 4u : 3u;
+    const uint32_t outBytes = outWidth * outHeight * outChannels;
     SJXL_ASSIGN(auto rgb8, gpu::Buffer::ofType<uint32_t>(dev, (outBytes + 3) / 4, "dec.rgb8"));
     SJXL_ASSIGN(auto dummy, gpu::Buffer::ofType<float>(dev, 4, "dec.dummy"));   // stands in for absent optional inputs
-    std::optional<gpu::Buffer> weightsKeep;   // the upsampling weights live until the batch ran
+    std::optional<gpu::Buffer> weightsKeep, ecWeightsKeep;   // upsampling weights live until the batch ran
 
     gpu::CommandBatch batch(dev);
 
@@ -253,6 +272,10 @@ Result<image::Rgb8> Decoder::run(const codestream::Parsed& parsed, const codestr
         c["params"]["bitDepth"].setData(m.bitsPerSample);
         c["params"]["frameFlags"].setData(static_cast<uint32_t>(frame.header.flags));
         c["params"]["numPasses"].setData(frame.header.numPasses);
+        c["params"]["numEc"].setData(numEc);
+        c["params"]["ecW"].setData(ecW);
+        c["params"]["ecH"].setData(ecH);
+        c["params"]["ecShift"].setData(ecShift);
         {
             // passes.shift and GetDownsamplingBracket per pass, 12 slots as three vectors.
             std::array<uint32_t, 12> shift{};
@@ -302,6 +325,8 @@ Result<image::Rgb8> Decoder::run(const codestream::Parsed& parsed, const codestr
             c["params"]["paddedHeight"].setData(dim.ysizePadded);
             c["params"]["xybMode"].setData(uint32_t{modularXyb ? 1u : 0u});
             c["params"]["sampleScale"].setData(1.0f / static_cast<float>((uint64_t{1} << m.bitsPerSample) - 1));
+            c["params"]["ecChannel"].setData(0u);
+            c["params"]["ecPlane"].setData(0u);
         });
         if (lf.epfIters > 0) {
             computeSigma_.dispatch(batch, {nblocks, 1, 1}, [&](rhi::ShaderCursor c) {
@@ -352,6 +377,7 @@ Result<image::Rgb8> Decoder::run(const codestream::Parsed& parsed, const codestr
     else smoothDc_.dispatch(batch, {dim.xsizeBlocks, dim.ysizeBlocks, 1}, bindFinalize);
     computeSigma_.dispatch(batch, {nblocks, 1, 1}, bindFinalize);
     acGroups_.dispatch(batch, {numGroups, 1, 1}, bindSections);
+    if (numEc > 0) modularFinalize_.dispatch(batch, {1, 1, 1}, bindSections);   // the extra channels' inverse transforms
     const auto bindTransforms = [&](rhi::ShaderCursor c) {
         c["arena"].setBinding(arena.rhi());
         c["coeffs"].setBinding(coeffs.rhi());
@@ -380,6 +406,62 @@ Result<image::Rgb8> Decoder::run(const codestream::Parsed& parsed, const codestr
     idctCols_.dispatch(batch, {static_cast<uint32_t>(3 * planePixels), 1, 1}, bindTransforms);
     transformSpecial_.dispatch(batch, {3 * nblocks, 1, 1}, bindTransforms);
     }   // VarDCT
+
+    // Extra channel planes at the output size: integers scaled by 1 / (2^bits - 1), upsampled when coded smaller.
+    std::optional<gpu::Buffer> ecCoded, ecOut;
+    if (numEc > 0) {
+        SJXL_ASSIGN(ecOut, gpu::Buffer::ofType<float>(dev, uint64_t{numEc} * outPaddedWidth * outPaddedHeight, "dec.ecOut"));
+        bool anyUps = false;
+        for (uint32_t e = 0; e < numEc; ++e) anyUps = anyUps || ecUps[e] > 1;
+        if (anyUps) { SJXL_ASSIGN(ecCoded, gpu::Buffer::ofType<float>(dev, uint64_t{numEc} * outPaddedWidth * outPaddedHeight, "dec.ecCoded")); }
+        std::optional<gpu::Buffer> ecWeights;
+        for (uint32_t e = 0; e < numEc; ++e) {
+            const bool ups = ecUps[e] > 1;
+            ecToPlanes_.dispatch(batch, {ecW[e] * ecH[e], 1, 1}, [&](rhi::ShaderCursor c) {
+                c["arena"].setBinding(arena.rhi());
+                c["xyb"].setBinding(ups ? ecCoded->rhi() : ecOut->rhi());
+                c["params"]["width"].setData(ecW[e]);
+                c["params"]["height"].setData(ecH[e]);
+                c["params"]["paddedWidth"].setData(outPaddedWidth);
+                c["params"]["paddedHeight"].setData(outPaddedHeight);
+                c["params"]["xybMode"].setData(0u);
+                c["params"]["sampleScale"].setData(1.0f / static_cast<float>((uint64_t{1} << m.extraChannels[e].bitsPerSample) - 1));
+                c["params"]["ecChannel"].setData(colorChannels * (modular ? 1u : 0u) + e);
+                c["params"]["ecPlane"].setData(e);
+            });
+            if (ups) {
+                if (!ecWeights) {
+                    std::vector<float> w(280);
+                    std::copy(codestream::kUpsampling2.begin(), codestream::kUpsampling2.end(), w.begin());
+                    std::copy(codestream::kUpsampling4.begin(), codestream::kUpsampling4.end(), w.begin() + 15);
+                    std::copy(codestream::kUpsampling8.begin(), codestream::kUpsampling8.end(), w.begin() + 70);
+                    if (m.customWeightsMask & 1) std::copy(m.upsamplingWeights2.begin(), m.upsamplingWeights2.end(), w.begin());
+                    if (m.customWeightsMask & 2) std::copy(m.upsamplingWeights4.begin(), m.upsamplingWeights4.end(), w.begin() + 15);
+                    if (m.customWeightsMask & 4) std::copy(m.upsamplingWeights8.begin(), m.upsamplingWeights8.end(), w.begin() + 70);
+                    SJXL_ASSIGN(ecWeights, gpu::Buffer::fromSpan<float>(dev, w, "dec.ecUpsWeights"));
+                }
+                const uint32_t shift = ecUps[e] == 8 ? 3 : ecUps[e] == 4 ? 2 : 1;
+                upsample_.dispatch(batch, {outWidth, outHeight, 1}, [&](rhi::ShaderCursor c) {
+                    c["src"].setBinding(ecCoded->rhi());
+                    c["dst"].setBinding(ecOut->rhi());
+                    c["weights"].setBinding(ecWeights->rhi());
+                    c["params"]["width"].setData(ecW[e]);
+                    c["params"]["height"].setData(ecH[e]);
+                    c["params"]["paddedWidth"].setData(outPaddedWidth);
+                    c["params"]["paddedHeight"].setData(outPaddedHeight);
+                    c["params"]["outWidth"].setData(outWidth);
+                    c["params"]["outHeight"].setData(outHeight);
+                    c["params"]["outPaddedWidth"].setData(outPaddedWidth);
+                    c["params"]["outPaddedHeight"].setData(outPaddedHeight);
+                    c["params"]["shift"].setData(shift);
+                    c["params"]["channels"].setData(1u);
+                    c["params"]["srcPlane"].setData(e);
+                    c["params"]["dstPlane"].setData(e);
+                });
+            }
+        }
+        ecWeightsKeep = std::move(ecWeights);
+    }
 
     // Loop filters, ping-pong between the two XYB buffers.
     gpu::Buffer* src = &xybA;
@@ -448,6 +530,9 @@ Result<image::Rgb8> Decoder::run(const codestream::Parsed& parsed, const codestr
             c["params"]["outPaddedWidth"].setData(outPaddedWidth);
             c["params"]["outPaddedHeight"].setData(outPaddedHeight);
             c["params"]["shift"].setData(upShift);
+            c["params"]["channels"].setData(3u);
+            c["params"]["srcPlane"].setData(0u);
+            c["params"]["dstPlane"].setData(0u);
         });
         weightsKeep = std::move(weights);
         src = &*upsampled;
@@ -531,6 +616,9 @@ Result<image::Rgb8> Decoder::run(const codestream::Parsed& parsed, const codestr
         c["params"]["transfer"].setData(transfer);
         c["params"]["gamma"].setData(gamma);
         c["params"]["mode"].setData(uint32_t{(modular && !modularXyb) ? 1u : 0u});
+        c["params"]["channels"].setData(outChannels);
+        c["params"]["alphaPlane"].setData(alphaIndex < numEc ? alphaIndex : 0u);
+        c["alpha"].setBinding(ecOut ? ecOut->rhi() : dummy.rhi());
     });
     SJXL_TRY(batch.submit(true));
 
@@ -654,6 +742,7 @@ Result<image::Rgb8> Decoder::run(const codestream::Parsed& parsed, const codestr
     image::Rgb8 out;
     out.width = outWidth;
     out.height = outHeight;
+    out.channels = outChannels;
     out.pixels.resize(outBytes);
     std::memcpy(out.pixels.data(), words.data(), outBytes);
     return out;

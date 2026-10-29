@@ -15,26 +15,38 @@
 
 namespace sjxl::image {
 
-Result<Rgb8> readRgb8(const std::filesystem::path& path) {
+namespace {
+
+Result<Rgb8> readWithChannels(const std::filesystem::path& path, bool keepAlpha) {
     int w = 0, h = 0, channels = 0;
-    stbi_uc* data = stbi_load(path.string().c_str(), &w, &h, &channels, 3);
+    if (!stbi_info(path.string().c_str(), &w, &h, &channels)) {
+        return Error::make(ErrorCode::IoFailure, "cannot read image '{}': {}", path.string(), stbi_failure_reason());
+    }
+    const int want = (keepAlpha && (channels == 2 || channels == 4)) ? 4 : 3;
+    stbi_uc* data = stbi_load(path.string().c_str(), &w, &h, &channels, want);
     if (data == nullptr) {
         return Error::make(ErrorCode::IoFailure, "cannot read image '{}': {}", path.string(), stbi_failure_reason());
     }
     Rgb8 image;
     image.width = static_cast<uint32_t>(w);
     image.height = static_cast<uint32_t>(h);
-    image.pixels.assign(data, data + static_cast<size_t>(w) * static_cast<size_t>(h) * 3);
+    image.channels = static_cast<uint32_t>(want);
+    image.pixels.assign(data, data + static_cast<size_t>(w) * static_cast<size_t>(h) * static_cast<size_t>(want));
     stbi_image_free(data);
     return image;
 }
 
+}   // namespace
+
+Result<Rgb8> readRgb8(const std::filesystem::path& path) { return readWithChannels(path, false); }
+Result<Rgb8> readImage8(const std::filesystem::path& path) { return readWithChannels(path, true); }
+
 Result<void> writePng(const std::filesystem::path& path, const Rgb8& image) {
-    if (image.pixels.size() != size_t{image.width} * image.height * 3) {
+    if ((image.channels != 3 && image.channels != 4) || image.pixels.size() != size_t{image.width} * image.height * image.channels) {
         return Error(ErrorCode::InvalidArgument, "image pixel count does not match its size");
     }
-    if (stbi_write_png(path.string().c_str(), static_cast<int>(image.width), static_cast<int>(image.height), 3,
-                       image.pixels.data(), static_cast<int>(image.width * 3)) == 0) {
+    if (stbi_write_png(path.string().c_str(), static_cast<int>(image.width), static_cast<int>(image.height), static_cast<int>(image.channels),
+                       image.pixels.data(), static_cast<int>(image.width * image.channels)) == 0) {
         return Error::make(ErrorCode::IoFailure, "cannot write '{}'", path.string());
     }
     return ok();

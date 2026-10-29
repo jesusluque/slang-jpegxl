@@ -20,28 +20,41 @@ static const uint kGsModColorChannels = 52;   // 1 (grey) or 3
 static const uint kGsModBitDepth = 53;
 
 struct ModularFrameGeom {
-    uint xsize, ysize;      // pixels
+    uint xsize, ysize;      // pixels (coded)
     uint groupDim;          // pixels
-    uint colorChannels;     // 1 or 3
+    uint colorChannels;     // 1 or 3 for a Modular frame, 0 for VarDCT (only the extra channels are modular)
     uint bitDepth;
+    uint numEc;             // extra channels (<= 4)
+    uint4 ecW, ecH;         // their sizes: ceil(output size / ec_upsampling)
+    uint4 ecShift;          // log2(ec_upsampling) - log2(upsampling)
 };
 
-/// DcGlobal of a modular frame.
-void decodeModularGlobal(inout Dec d, ModularFrameGeom g, uint windowOff) {
-    readDequantDc(d);
-    if (d.error != kErrNone) return;
-    readGlobalModular(d, windowOff);
-    if (d.error != kErrNone) return;
-    // The full image: colour channels at the frame size (no chroma subsampling, no
-    // extra channels in this profile).
+uint quadAt(uint4 v, uint i) { return i == 0 ? v.x : i == 1 ? v.y : i == 2 ? v.z : v.w; }
+
+/// DecodeGlobalInfo's modular image: the colour channels at the coded size, then the
+/// extra channels, then the global stream (GroupHeader, transforms, the channels that
+/// fit a group). Called after the frame's global tree was read.
+void decodeModularImage(inout Dec d, ModularFrameGeom g, uint windowOff) {
     const uint chansOff = alloc(d, kMaxChannels * kChanWords);
     if (d.error != kErrNone) return;
-    uint numChannels = g.colorChannels;
-    for (uint c = 0; c < numChannels; ++c) {
+    uint numChannels = 0;
+    for (uint c = 0; c < g.colorChannels; ++c) {
         const Channel ch = newChannelUncleared(d, g.xsize, g.ysize, 0, 0);
         if (d.error != kErrNone) return;
-        storeChannel(chansOff, c, ch);
+        storeChannel(chansOff, numChannels++, ch);
     }
+    for (uint e = 0; e < g.numEc; ++e) {
+        const int shift = int(quadAt(g.ecShift, e));
+        const Channel ch = newChannelUncleared(d, quadAt(g.ecW, e), quadAt(g.ecH, e), shift, shift);
+        if (d.error != kErrNone) return;
+        storeChannel(chansOff, numChannels++, ch);
+    }
+    arena[kGsModChansOff] = chansOff;
+    arena[kGsModNumChannels] = numChannels;
+    arena[kGsModBeginC] = numChannels;
+    arena[kGsModColorChannels] = g.colorChannels;
+    arena[kGsModBitDepth] = g.bitDepth;
+    if (numChannels == 0) return;   // ModularDecode: nothing follows an empty image
     const uint headerOff = alloc(d, kStreamHeaderWords);
     if (d.error != kErrNone) return;
     StreamHeader h = readStreamHeader(d, chansOff, numChannels);
@@ -49,12 +62,18 @@ void decodeModularGlobal(inout Dec d, ModularFrameGeom g, uint windowOff) {
     const uint beginC = decodeStreamChannels(d, h, chansOff, numChannels, 0, globalTree(), windowOff, g.groupDim);
     if (d.error != kErrNone) return;
     storeStreamHeader(headerOff, h);
-    arena[kGsModChansOff] = chansOff;
     arena[kGsModNumChannels] = numChannels;
     arena[kGsModBeginC] = beginC;
     arena[kGsModHeaderOff] = headerOff;
-    arena[kGsModColorChannels] = g.colorChannels;
-    arena[kGsModBitDepth] = g.bitDepth;
+}
+
+/// DcGlobal of a Modular frame.
+void decodeModularGlobal(inout Dec d, ModularFrameGeom g, uint windowOff) {
+    readDequantDc(d);
+    if (d.error != kErrNone) return;
+    readGlobalModular(d, windowOff);
+    if (d.error != kErrNone) return;
+    decodeModularImage(d, g, windowOff);
 }
 
 /// ModularFrameDecoder::DecodeGroup for the rectangle (x0, y0, w, h) in pixels:
@@ -93,6 +112,7 @@ void decodeModularGroup(inout Dec d, uint x0, uint y0, uint w, uint h, int minSh
 void modularFinalize(inout Dec d) {
     const uint chansOff = arena[kGsModChansOff];
     uint numChannels = arena[kGsModNumChannels];
+    if (numChannels == 0) return;
     const StreamHeader h = loadStreamHeader(arena[kGsModHeaderOff]);
     undoTransforms(d, h, chansOff, numChannels, arena[kGsModBitDepth]);
     arena[kGsModNumChannels] = numChannels;

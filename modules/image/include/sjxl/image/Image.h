@@ -13,17 +13,20 @@
 
 namespace sjxl::image {
 
-/// 8-bit sRGB, interleaved, 3 channels, row-major, top-left origin.
+/// 8-bit sRGB, interleaved, 3 (RGB) or 4 (RGBA) channels, row-major, top-left origin.
 struct Rgb8 {
     uint32_t             width = 0;
     uint32_t             height = 0;
-    std::vector<uint8_t> pixels;   ///< width * height * 3
+    uint32_t             channels = 3;
+    std::vector<uint8_t> pixels;   ///< width * height * channels
 
     [[nodiscard]] size_t bytes() const { return pixels.size(); }
 };
 
 /// PNG, PPM/PGM, JPEG, BMP, TGA through stb_image; alpha is dropped, grey expanded.
 [[nodiscard]] Result<Rgb8> readRgb8(const std::filesystem::path& path);
+/// The same, keeping alpha when the file has it (4 channels).
+[[nodiscard]] Result<Rgb8> readImage8(const std::filesystem::path& path);
 [[nodiscard]] Result<void> writePng(const std::filesystem::path& path, const Rgb8& image);
 
 [[nodiscard]] Result<std::vector<uint8_t>> readFile(const std::filesystem::path& path);

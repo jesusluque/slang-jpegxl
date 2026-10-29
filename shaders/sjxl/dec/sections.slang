@@ -49,7 +49,7 @@ struct SectionParams {
     uint bitDepth;        // modular: bits per sample
     uint frameFlags;      // FrameHeader flags (bit 1: patches)
     uint numPasses;       // 1..11; AC group g of pass p is section 2 + nDC + p * nAC + g
-    uint pad2;
+    uint numEc;           // extra channels (<= 4): modular in every frame
     uint4 refW;           // reference frame sizes per slot (0: none)
     uint4 refH;
     uint4 passShiftA;     // passes.shift[0..3], [4..7], [8..11]
@@ -61,6 +61,9 @@ struct SectionParams {
     int4  passMaxA;
     int4  passMaxB;
     int4  passMaxC;
+    uint4 ecW;            // extra channel sizes (ceil(output size / ec_upsampling)) and shifts
+    uint4 ecH;
+    uint4 ecShift;
 };
 
 StructuredBuffer<uint2>   sections;   // bit start, bit end of each TOC entry, codestream order
@@ -116,6 +119,7 @@ DcGroupGeom dcGeom(uint g) {
     geom.group = g;
     geom.groupBlocks = groupBlocks();
     geom.useDcFrame = (params.frameFlags & 32u) != 0 ? 1u : 0u;
+    geom.windowOff = windowFor(1 + g);
     return geom;
 }
 
@@ -134,6 +138,38 @@ AcGroupGeom acGeom(uint g) {
     return geom;
 }
 
+// --- Modular ------------------------------------------------------------------------------
+
+ModularFrameGeom modularGeom(uint colorChannels) {
+    ModularFrameGeom g;
+    g.xsize = params.xsize;
+    g.ysize = params.ysize;
+    g.groupDim = params.groupDim;
+    g.colorChannels = colorChannels;
+    g.bitDepth = params.bitDepth;
+    g.numEc = params.numEc;
+    g.ecW = params.ecW;
+    g.ecH = params.ecH;
+    g.ecShift = params.ecShift;
+    return g;
+}
+
+/// Pixel rectangle of DC group g (groupDim * 8 pixels) or AC group g (groupDim pixels).
+/// Unclipped, as libjxl's mrect: each (shifted) channel clips it to its own size,
+/// which is not the same as shifting the clipped rectangle for odd sizes.
+void groupRect(uint g, bool dcGroup, out uint x0, out uint y0, out uint w, out uint h) {
+    const uint dim = dcGroup ? params.groupDim * 8 : params.groupDim;
+    const uint perRow = (params.xsize + dim - 1) / dim;
+    x0 = (g % perRow) * dim;
+    y0 = (g / perRow) * dim;
+    w = dim;
+    h = dim;
+}
+
+/// Stream ids (ModularStreamId): ModularDC(g) = 1 + nDC + g; ModularAC(g, pass) = 1 + 3 nDC + 17 + nAC * pass + g.
+uint modularDcStream(uint g) { return 1 + params.numDcGroups + g; }
+uint modularAcStream(uint g, uint pass) { return 1 + 3 * params.numDcGroups + 17 + params.numGroups * pass + g; }
+
 // --- VarDCT -------------------------------------------------------------------------------
 
 [shader("compute")]
@@ -145,7 +181,8 @@ void decodeGlobals(uint3 tid: SV_DispatchThreadID) {
     Dec d = makeDec(0, kGsHeaderSize, params.globalsCap);
     const uint window = windowFor(0);
     uint stage = 1;
-    decodeDcGlobal(d, window, params.frameFlags, params.xsize, params.ysize, params.refW, params.refH);
+    decodeDcGlobal(d, window, params.frameFlags, params.xsize, params.ysize, params.refW, params.refH, params.numEc);
+    if (d.error == kErrNone) decodeModularImage(d, modularGeom(0), window);   // the extra channels
     arena[kGsDcGlobalBits] = d.br.pos - sections[0].x;
     if (d.error == kErrNone && params.singleSection != 0) {
         stage = 2;
@@ -163,6 +200,7 @@ void decodeGlobals(uint3 tid: SV_DispatchThreadID) {
     if (d.error == kErrNone && params.singleSection != 0) {
         stage = 4;
         decodeAcGroup(d, acGeom(0), 0, passShift(0), window);
+        if (d.error == kErrNone) decodeModularGroup(d, 0, 0, params.groupDim, params.groupDim, passMinShift(0), passMaxShift(0), modularAcStream(0, 0), window);
     }
     status[0] = d.error | (d.error != kErrNone ? (stage << 8) : 0);
     arena[kGsError] = d.error;
@@ -189,41 +227,18 @@ void decodeAcGroups(uint3 tid: SV_DispatchThreadID) {
     if (arena[kGsError] != kErrNone) { status[1 + params.numDcGroups + g] = arena[kGsError]; return; }
     const uint base = params.acArenaBase + g * params.acArenaWords;
     Dec d = makeDec(acSection(0, g), base, base + params.acArenaWords);
+    uint x0, y0, w, h;
+    groupRect(g, false, x0, y0, w, h);
     for (uint pass = 0; pass < params.numPasses && d.error == kErrNone; ++pass) {
         d.br.pos = sections[acSection(pass, g)].x;
         d.br.end = sections[acSection(pass, g)].y;
         decodeAcGroup(d, acGeom(g), pass, passShift(pass), windowFor(1 + params.numDcGroups + g));
+        if (d.error == kErrNone) {   // the extra channels' modular group of this pass (ProcessACGroup)
+            decodeModularGroup(d, x0, y0, w, h, passMinShift(pass), passMaxShift(pass), modularAcStream(g, pass), windowFor(1 + params.numDcGroups + g));
+        }
     }
     status[1 + params.numDcGroups + g] = d.error;
 }
-
-// --- Modular ------------------------------------------------------------------------------
-
-ModularFrameGeom modularGeom() {
-    ModularFrameGeom g;
-    g.xsize = params.xsize;
-    g.ysize = params.ysize;
-    g.groupDim = params.groupDim;
-    g.colorChannels = params.colorChannels;
-    g.bitDepth = params.bitDepth;
-    return g;
-}
-
-/// Pixel rectangle of DC group g (groupDim * 8 pixels) or AC group g (groupDim pixels).
-/// Unclipped, as libjxl's mrect: each (shifted) channel clips it to its own size,
-/// which is not the same as shifting the clipped rectangle for odd sizes.
-void groupRect(uint g, bool dcGroup, out uint x0, out uint y0, out uint w, out uint h) {
-    const uint dim = dcGroup ? params.groupDim * 8 : params.groupDim;
-    const uint perRow = (params.xsize + dim - 1) / dim;
-    x0 = (g % perRow) * dim;
-    y0 = (g / perRow) * dim;
-    w = dim;
-    h = dim;
-}
-
-/// Stream ids (ModularStreamId): ModularDC(g) = 1 + nDC + g; ModularAC(g, pass) = 1 + 3 nDC + 17 + nAC * pass + g.
-uint modularDcStream(uint g) { return 1 + params.numDcGroups + g; }
-uint modularAcStream(uint g, uint pass) { return 1 + 3 * params.numDcGroups + 17 + params.numGroups * pass + g; }
 
 [shader("compute")]
 [numthreads(1, 1, 1)]
@@ -234,10 +249,10 @@ void decodeModularGlobals(uint3 tid: SV_DispatchThreadID) {
     const uint window = windowFor(0);
     uint stage = 1;
     if ((params.frameFlags & kFramePatches) != 0) {
-        readPatchDictionary(d, params.xsize, params.ysize, params.refW, params.refH, window);
+        readPatchDictionary(d, params.xsize, params.ysize, params.refW, params.refH, params.numEc, window);
     }
     if (d.error == kErrNone && (params.frameFlags & kFrameNoise) != 0) readNoise(d);
-    if (d.error == kErrNone) decodeModularGlobal(d, modularGeom(), window);
+    if (d.error == kErrNone) decodeModularGlobal(d, modularGeom(params.colorChannels), window);
     arena[kGsDcGlobalBits] = d.br.pos - sections[0].x;
     if (d.error == kErrNone && params.singleSection != 0) {
         // One section: DC group 0, (an empty AcGlobal), AC group 0 follow in the same bits.

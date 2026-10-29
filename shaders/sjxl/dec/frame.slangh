@@ -281,7 +281,7 @@ GlobalTree globalTree() {
 /// rejected those flags).
 /// PatchDictionary::Decode (no extra channels: one blending per position). The
 /// reference frame sizes come from the host, which decoded those frames first.
-void readPatchDictionary(inout Dec d, uint xsize, uint ysize, uint4 refW, uint4 refH, uint windowOff) {
+void readPatchDictionary(inout Dec d, uint xsize, uint ysize, uint4 refW, uint4 refH, uint numEc, uint windowOff) {
     const uint codeSet = decodeHistograms(d, 10, false, windowOff);
     if (d.error != kErrNone) return;
     SymReader r = makeSymReader(d, codeSet, windowOff, 0);
@@ -321,11 +321,17 @@ void readPatchDictionary(inout Dec d, uint xsize, uint ysize, uint4 refW, uint4 
                 py = uint(int(py) + dy);
             }
             if (px + w > xsize || py + h > ysize) { fail(d, kErrCorrupt); return; }
-            const uint mode = readHybridUint(d, r, 5);
-            if (mode >= 8) { fail(d, kErrCorrupt); return; }
-            // Alpha channels are never chosen without extra channels; clamp is read for mul and the alpha modes.
-            uint clampBit = 0;
-            if (mode == 3 || mode >= 4) clampBit = readHybridUint(d, r, 9) != 0 ? 1u : 0u;
+            // One blending for the colour channels, then one per extra channel (blendings_stride).
+            uint mode = 0, clampBit = 0;
+            for (uint j = 0; j <= numEc; ++j) {
+                const uint m = readHybridUint(d, r, 5);
+                if (m >= 8) { fail(d, kErrCorrupt); return; }
+                if (m >= 4 && numEc > 1) (void)readHybridUint(d, r, 8);   // alpha channel choice
+                uint cl = 0;
+                if (m == 3 || m >= 4) cl = readHybridUint(d, r, 9) != 0 ? 1u : 0u;
+                if (j == 0) { mode = m; clampBit = cl; }
+                else if (m != 0 || (mode >= 4)) { fail(d, kErrUnsupported); return; }   // extra channel blending, alpha-weighted modes
+            }
             const uint po = posOff + numPos * kPatchPosWords;
             arena[po + 0] = px; arena[po + 1] = py; arena[po + 2] = id; arena[po + 3] = mode | (clampBit << 8);
             ++numPos;
@@ -350,9 +356,9 @@ void readNoise(inout Dec d) {
     arena[kGsNoiseLutOff] = lut;
 }
 
-void decodeDcGlobal(inout Dec d, uint windowOff, uint frameFlags, uint xsize, uint ysize, uint4 refW, uint4 refH) {
+void decodeDcGlobal(inout Dec d, uint windowOff, uint frameFlags, uint xsize, uint ysize, uint4 refW, uint4 refH, uint numEc) {
     if ((frameFlags & kFramePatches) != 0) {
-        readPatchDictionary(d, xsize, ysize, refW, refH, windowOff);
+        readPatchDictionary(d, xsize, ysize, refW, refH, numEc, windowOff);
         if (d.error != kErrNone) return;
     }
     if ((frameFlags & kFrameNoise) != 0) {

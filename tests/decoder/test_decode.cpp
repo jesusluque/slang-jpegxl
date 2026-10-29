@@ -293,3 +293,64 @@ TEST_CASE("the decoder matches djxl on cjxl's upsampled and noisy output", "[dec
     WARN(std::format("{} {}: vs djxl PSNR {:.2f} dB, max diff {}", name, options, metrics->psnr, metrics->maxAbsDiff));
     CHECK(metrics->maxAbsDiff <= 1);
 }
+
+namespace {
+
+/// berlin_200 with a gradient alpha and a transparent hole, as an RGBA PNG.
+std::filesystem::path alphaImage() {
+    const std::filesystem::path path = test::scratchDir() / "berlin_alpha.png";
+    auto base = image::readRgb8(test::testData("berlin_200.png"));
+    REQUIRE(base);
+    image::Rgb8 rgba;
+    rgba.width = base->width;
+    rgba.height = base->height;
+    rgba.channels = 4;
+    rgba.pixels.resize(size_t{rgba.width} * rgba.height * 4);
+    for (uint32_t y = 0; y < rgba.height; ++y) {
+        for (uint32_t x = 0; x < rgba.width; ++x) {
+            const size_t src = (size_t{y} * rgba.width + x) * 3, dst = (size_t{y} * rgba.width + x) * 4;
+            rgba.pixels[dst] = base->pixels[src];
+            rgba.pixels[dst + 1] = base->pixels[src + 1];
+            rgba.pixels[dst + 2] = base->pixels[src + 2];
+            const bool hole = (x > 60 && x < 100 && y > 30 && y < 70);
+            rgba.pixels[dst + 3] = hole ? 0 : static_cast<uint8_t>(40 + (x * 215) / rgba.width);
+        }
+    }
+    REQUIRE(image::writePng(path, rgba));
+    return path;
+}
+
+}   // namespace
+
+TEST_CASE("the decoder matches djxl on images with alpha", "[decoder][conformance][cjxl][alpha]") {
+    const std::filesystem::path djxl = test::findTool("djxl");
+    const std::filesystem::path cjxl = test::findTool("cjxl");
+    if (djxl.empty() || cjxl.empty()) SKIP("cjxl/djxl are not installed");
+    const std::filesystem::path png0 = alphaImage();
+    const std::string options = GENERATE(std::string("-d 1 -e 5"), std::string("-d 1 -e 7"), std::string("-d 0 -e 7"), std::string("-m 1 -d 1 -e 7"),
+                                         std::string("-d 1 -e 5 --resampling=2"), std::string("-d 1 -e 7 -p"));
+    CAPTURE(options);
+    std::string tag = options;
+    for (char& ch : tag) if (ch == ' ' || ch == '-' || ch == '=') ch = '_';
+    const std::filesystem::path jxl = test::scratchDir() / std::format("dec_alpha{}.jxl", tag);
+    const std::filesystem::path png = test::scratchDir() / std::format("dec_alpha{}.djxl.png", tag);
+    REQUIRE(test::run(std::format("\"{}\" \"{}\" \"{}\" {} >/dev/null 2>&1", cjxl.string(), png0.string(), jxl.string(), options)));
+    REQUIRE(test::run(std::format("\"{}\" \"{}\" \"{}\" >/dev/null 2>&1", djxl.string(), jxl.string(), png.string())));
+    auto bytes = image::readFile(jxl);
+    REQUIRE(bytes);
+    auto reference = image::readImage8(png);
+    REQUIRE(reference);
+    REQUIRE(reference->channels == 4);
+    auto ours = decoder().decode(*bytes);
+    if (!ours && ours.error().code() == ErrorCode::Unsupported) {
+        WARN(std::format("alpha {}: unsupported: {}", options, ours.error().message()));
+        SUCCEED();
+        return;
+    }
+    REQUIRE(ours);
+    REQUIRE(ours->channels == 4);
+    auto metrics = test::compare(*reference, *ours);
+    REQUIRE(metrics);
+    WARN(std::format("alpha {}: vs djxl PSNR {:.2f} dB, max diff {} (channel {})", options, metrics->psnr, metrics->maxAbsDiff, metrics->maxAtChannel));
+    CHECK(metrics->maxAbsDiff <= (options == "-d 0 -e 7" ? 0 : 1));
+}

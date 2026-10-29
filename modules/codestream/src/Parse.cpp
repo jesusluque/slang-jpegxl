@@ -178,19 +178,22 @@ Result<void> readImageMetadata(BitReader& br, ImageMetadata& m) {
     SJXL_TRY(readBitDepth(br, m));
     m.modular16BitBufferSufficient = br.readBool();
     m.numExtraChannels = br.readU32(U32Enc{{Val(0), Val(1), BitsOffset(4, 2), BitsOffset(12, 1)}});
-    for (uint32_t i = 0; i < m.numExtraChannels; ++i) {
+    m.extraChannels.resize(m.numExtraChannels);
+    for (ExtraChannelInfo& ec : m.extraChannels) {
         // ExtraChannelInfo
-        if (br.readBool()) continue;   // all_default: 8-bit alpha
-        const uint32_t type = br.readEnum();
+        if (br.readBool()) continue;   // all_default: 8-bit alpha, not associated
+        ec.type = br.readEnum();
         ImageMetadata depth;
         SJXL_TRY(readBitDepth(br, depth));
-        const uint32_t dimShift = br.readU32(U32Enc{{Val(0), Val(3), Val(4), BitsOffset(3, 1)}});
-        (void)dimShift;
+        if (depth.floatingPointSample) return Error(ErrorCode::Unsupported, "floating point extra channels");
+        ec.bitsPerSample = depth.bitsPerSample;
+        ec.dimShift = br.readU32(U32Enc{{Val(0), Val(3), Val(4), BitsOffset(3, 1)}});
+        if ((1u << ec.dimShift) > 8) return Error(ErrorCode::Corrupt, "extra channel dim_shift");
         const uint32_t nameLength = br.readU32(U32Enc{{Val(0), Bits(4), BitsOffset(5, 16), BitsOffset(10, 48)}});
         for (uint32_t k = 0; k < nameLength; ++k) (void)br.read(8);
-        if (type == 0) (void)br.readBool();            // alpha_associated
-        if (type == 2) for (int k = 0; k < 4; ++k) { SJXL_TRY(br.readF16()); }   // spot color
-        if (type == 5) (void)br.readU32(U32Enc{{Val(1), Bits(2), BitsOffset(4, 3), BitsOffset(8, 19)}});   // CFA
+        if (ec.type == 0) ec.alphaAssociated = br.readBool();
+        if (ec.type == 2) for (int k = 0; k < 4; ++k) { SJXL_TRY(br.readF16()); }   // spot color
+        if (ec.type == 5) (void)br.readU32(U32Enc{{Val(1), Bits(2), BitsOffset(4, 3), BitsOffset(8, 19)}});   // CFA
     }
     m.xybEncoded = br.readBool();
     SJXL_TRY(readColorEncoding(br, m));
@@ -289,7 +292,10 @@ Result<void> readFrameHeader(BitReader& br, const ImageMetadata& m, FrameHeader&
     if ((f.flags & FrameHeader::kUseDcFrame) == 0) {
         f.upsampling = br.readU32(U32Enc{{Val(1), Val(2), Val(4), Val(8)}});
         f.ecUpsampling.resize(m.numExtraChannels);
-        for (uint32_t& u : f.ecUpsampling) u = br.readU32(U32Enc{{Val(1), Val(2), Val(4), Val(8)}});
+        for (uint32_t i = 0; i < m.numExtraChannels; ++i) {
+            // Coded relative to the channel's dim_shift (frame_header.cc).
+            f.ecUpsampling[i] = br.readU32(U32Enc{{Val(1), Val(2), Val(4), Val(8)}}) << m.extraChannels[i].dimShift;
+        }
     }
     if (f.isModular) {
         f.groupSizeShift = br.read(2);
@@ -503,6 +509,10 @@ Result<void> parseFramesFrom(Parsed& p, size_t startByte) {
         if (f.frameType == 3) return unsupported("skip-progressive frames");
         if (f.flags & FrameHeader::kSplines) return unsupported("splines");
         if (f.upsampling != 1 && f.upsampling != 2 && f.upsampling != 4 && f.upsampling != 8) return corrupt("upsampling factor");
+        if (m.numExtraChannels > 4) return unsupported("more than 4 extra channels");
+        for (uint32_t u : f.ecUpsampling) {
+            if (u < f.upsampling || u > 8) return corrupt("extra channel upsampling");
+        }
         if (f.customSizeOrOrigin && !referenceOnly) return unsupported("frames with a custom size or origin");
         if (referenceOnly) {
             if (!f.saveBeforeColorTransform) return unsupported("reference frames saved after the colour transform");
@@ -583,7 +593,6 @@ Result<Parsed> parse(std::span<const uint8_t> file) {
 
     // What M2 does not do yet.
     if (m.wantIcc) return unsupported("ICC colour profiles");
-    if (m.numExtraChannels != 0) return unsupported("extra channels (alpha, depth, ...)");
     if (m.havePreview) return unsupported("preview frames");
     if (m.haveAnimation) return unsupported("animation");
     if (m.orientation != 1) return unsupported("orientation other than identity");

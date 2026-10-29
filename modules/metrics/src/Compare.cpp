@@ -13,6 +13,9 @@
 namespace sjxl::metrics {
 
 Result<Metrics> compare(gpu::ShaderLibrary& library, const image::Rgb8& a, const image::Rgb8& b) {
+    if (a.channels != b.channels) {
+        return Error::make(ErrorCode::InvalidArgument, "channel counts differ: {} vs {}", a.channels, b.channels);
+    }
     if (a.width != b.width || a.height != b.height) {
         return Error::make(ErrorCode::InvalidArgument, "sizes differ: {}x{} vs {}x{}", a.width, a.height, b.width,
                            b.height);
@@ -46,9 +49,9 @@ Result<Metrics> compare(gpu::ShaderLibrary& library, const image::Rgb8& a, const
     // The kernel packs diff << 24 | byte index, so the max carries its place.
     m.maxAbsDiff = maxHost[0] >> 24;
     const uint32_t at = maxHost[0] & 0xFFFFFFu;
-    m.maxAtChannel = at % 3;
-    m.maxAtX = (at / 3) % a.width;
-    m.maxAtY = (at / 3) / a.width;
+    m.maxAtChannel = at % a.channels;
+    m.maxAtX = (at / a.channels) % a.width;
+    m.maxAtY = (at / a.channels) / a.width;
     if (m.sumSquares == 0) {
         m.psnr = std::numeric_limits<double>::infinity();
     } else {

@@ -25,6 +25,7 @@ struct DcGroupGeom {
     uint group;
     uint groupBlocks;    // AC group size in blocks (groupDim / 8)
     uint useDcFrame;     // kUseDcFrame: the DC comes from a DC frame, nothing of it is coded here
+    uint windowOff;      // LZ77 window of this thread (for the modular group)
 };
 
 void decodeDcGroup(inout Dec d, DcGroupGeom g, uint windowOff) {
@@ -77,7 +78,9 @@ void decodeDcGroup(inout Dec d, DcGroupGeom g, uint windowOff) {
         }
     }
     }   // VarDCT DC
-    // ModularDC group: no channels without extra channels, nothing to read.
+    // ModularDC group: the extra channels with shift >= 3 in this DC group's rectangle.
+    decodeModularGroup(d, g.x0 * 8, g.y0 * 8, g.groupBlocks * 64, g.groupBlocks * 64, 3, 1000, 1 + g.numDcGroups + g.group, g.windowOff);
+    if (d.error != kErrNone) return;
 
     // AcMetadata.
     const uint upperBound = g.w * g.h;
