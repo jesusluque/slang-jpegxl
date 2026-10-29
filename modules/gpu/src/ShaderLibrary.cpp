@@ -5,6 +5,7 @@
 #include <string_view>
 
 #include "sjxl/core/Log.h"
+#include "sjxl/core/Platform.h"
 #include "sjxl/gpu/Device.h"
 
 namespace sjxl::gpu {
@@ -100,6 +101,7 @@ Result<std::shared_ptr<const Program>> ShaderLibrary::link(const std::string& ke
         }
     }
 
+    if (!platform::env("SJXL_DEBUG").empty()) log::info("shaders: compiling '{}' [{}]", module, entries.empty() ? std::string() : entries.front());
     rhi::ShaderProgramDesc desc;
     desc.slangGlobalScope = program->linked.get();
     if (SLANG_FAILED(device_->rhi()->createShaderProgram(desc, program->program.writeRef(), diag.writeRef()))) {

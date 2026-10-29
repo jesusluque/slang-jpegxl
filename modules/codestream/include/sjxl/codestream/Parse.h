@@ -49,6 +49,7 @@ struct ExtraChannelInfo {
     uint32_t bitsPerSample = 8;
     uint32_t dimShift = 0;
     bool     alphaAssociated = false;
+    std::array<float, 4> spotColor{};   // spot colour channels: RGB and solidity
 };
 
 struct ImageMetadata {

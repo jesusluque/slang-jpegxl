@@ -1,5 +1,8 @@
 // Copyright (c) 2026 jesus luque.
 #include "sjxl/gpu/ComputeKernel.h"
+#include <chrono>
+#include "sjxl/core/Platform.h"
+#include "sjxl/core/Log.h"
 
 #include "sjxl/gpu/CommandBatch.h"
 #include "sjxl/gpu/Device.h"
@@ -17,9 +20,14 @@ Result<ComputeKernel> ComputeKernel::create(ShaderLibrary& library, const std::s
     kernel.program_ = *program;
     rhi::ComputePipelineDesc desc;
     desc.program = kernel.program_->program.get();
+    const auto t0 = std::chrono::steady_clock::now();
     if (SLANG_FAILED(library.device().rhi()->createComputePipeline(desc, kernel.pipeline_.writeRef()))) {
         return Error::make(ErrorCode::ShaderFailure, "cannot make a pipeline for {}", kernel.name_);
     }
+    // The backend compile (Metal's AGX compiler) can take seconds on the biggest single-thread
+    // kernels; SJXL_DEBUG lists the slow ones so they get split before they become hangs.
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    if (ms > 500.0 && !platform::env("SJXL_DEBUG").empty()) log::info("shaders: pipeline {} took {:.0f} ms", kernel.name_, ms);
     return kernel;
 }
 
@@ -33,6 +41,8 @@ void ComputeKernel::dispatchGroups(CommandBatch& batch, std::array<uint32_t, 3> 
     if (groups[0] == 0 || groups[1] == 0 || groups[2] == 0) {
         return;
     }
+    static const bool traceDispatch = !platform::env("SJXL_DEBUG_DISPATCH").empty();
+    if (traceDispatch) log::info("dispatch {}", name_);
     rhi::IComputePassEncoder* pass = batch.encoder()->beginComputePass();
     rhi::IShaderObject* root = pass->bindPipeline(pipeline_.get());
     if (bind) {

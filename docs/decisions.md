@@ -1440,3 +1440,67 @@ Not done: libjxl's pixel-domain loss (the inverse transform of the
 quantisation error weighted by the 1×1 masking field, 8th norm), which needs
 the per-pixel masking output of the adaptive quantisation; the first CfL pass
 costs one extra DCT8 of the frame.
+
+## Splines, the conformance suite and the decoder's remaining gaps (2026-10-29)
+
+**Splines** (`dec/splines.slang`, `frame.slangh readSplines`): the globals
+thread decodes the spline set (6 contexts: starting points as deltas, the
+quantization adjustment, per spline the control point delta-deltas and the
+four 32-point DCTs, all ints in the arena). One thread per spline dequantises
+(kChannelWeight, the adjusted quant, X and B offset by the colour correlation
+bases times Y), walks the centripetal Catmull-Rom curve (16 points per
+interval, mirrored end points) at unit arc length and turns every point into a
+Gaussian segment (centre, maximum distance from the 5th-power threshold,
+1/sigma, sigma/4 x intensity, colour from the continuous IDCTs with libjxl's
+FastCosf), counted then written after a serial prefix over the splines. The
+segments are bucketed by row (difference array, serial scan, scatter) and one
+thread per pixel adds the segments of its row that reach it, with libjxl's
+FastErff, before upsampling. Capacities (4096 splines, 2^18 control points,
+2^16 segments, 2^20 row entries) are read back as counters and exceed with
+`Unsupported`. Test files come from `jxl_from_tree` (Homebrew): two splines
+on a flat 160x120 image decode within 1 LSB of djxl (`[splines]`), six random
+splines on a 640x400 XYB modular frame too.
+
+**The conformance suite.** The 27 `input.jxl` of github.com/libjxl/conformance
+were pulled into the scratchpad and decoded against djxl. 14 passed at once;
+the rest exposed real gaps, all fixed except CMYK:
+
+| test case | problem | fix |
+|---|---|---|
+| grayscale, patches, progressive | XYB images with an ICC profile: djxl writes linear sRGB (dec_xyb.cc: an ICC-only encoding cannot be output to), we applied the sRGB curve | `wantIcc && xyb` → linear; grey images take the luminance of the linear RGB (srgb_to_luma rows) and are written as one-channel PNGs |
+| blendmodes | the alpha channel under kAlphaWeightedAdd must stay the background's (alpha.cc: fg == fga copies bg) | `blend.slang` |
+| spot | modular frames with extra channels sized their group arena for the colour channels only; spot colours were not rendered | arena per channel count plus a fixed overhead; `stage_spot.cc` mixing in the output stage from the canvas planes |
+| bench_oriented_brg, sunset_logo | orientation | the output stage maps each oriented pixel to its source (UndoOrientation inverted), sizes swap for 5..8 |
+| bike | BT.709 transfer function | `encodeFromLinear` transfer 3 |
+| animation_* | a 16-frame cap in the parser | 65536 |
+| lossless_pfm | 32-bit float samples: `int_to_float` was missing, and three 64-bit details of libjxl's pixel arithmetic (`pixel_type_w`): ClampedGradient and the reference-channel properties in int64, the weighted predictor's error-row sum in uint32 and its error update fed the stored (truncated) sample | `modular_out.slang intToFloat`, `modular.slangh` |
+| cmyk_layers | a Black extra channel: djxl converts CMYK to RGB through the embedded ICC profile (a CMM) | reported as `Unsupported` |
+
+The float fixtures (`jxl_from_tree` `Bitdepth 32 FloatExpBits 8`, `Bitdepth 16
+FloatExpBits 5`, weighted predictors with offsets up to 2e9) decode bit-exact.
+26 of 27 inputs now decode within 1 LSB of djxl (lossless ones exact); the ten
+small ones are in `tests/data/conformance` (`[suite]` test, djxl as oracle).
+
+**Metal's backend compiler and inlining.** The 1080p lossless timing exposed
+that `codes.slang`'s single-thread blob kernels took 12-35 s to compile cold
+in `newComputePipelineState`, sometimes never finishing (the DC group blob
+kernel inlined two ANS histogram writers). Marking the heavy functions
+`[noinline]` (`ansWriteHistogramAt`, `ansWriteBestHistogram`,
+`writeContextMapStream`, `writeHistogramSetLz77`, `writeTreeFromNodes`) brought
+every kernel under half a second; the DC group kernel was also split in two
+(`buildDcGroupPre`/`Mid`). `SJXL_DEBUG` now logs every pipeline that takes
+more than 500 ms to build and `SJXL_DEBUG_DISPATCH=1` traces dispatches.
+
+Timings on the M5 Pro for a 1920x1080 photo (debug build, warm shader cache):
+lossy d=1 encode 0.55 s (324 KB) and decode 0.63 s; lossless encode 2.9 s
+(1.74 MB) and decode 1.2 s; cjxl -e 5 / djxl take 0.09-0.12 s for each. The
+M5 slice is next.
+
+Not done: CMYK (needs an ICC colour management module), PQ/HLG transfer
+functions (no oracle file yet), extra-channel blending modes inside patches
+other than kNone (cjxl writes only kNone; libjxl's formulas are in
+blending.cc), writing the ICC profile into the PNG (`UnpredictICC` is a
+300-line byte transform worth a kernel), Modular frames in YCbCr, loop
+filters on YCbCr VarDCT frames. Tiny files that expand to 1024 px modular
+groups (blendmodes, sunset_logo) take 14-20 s: the single-thread group decode
+is the M5 target.

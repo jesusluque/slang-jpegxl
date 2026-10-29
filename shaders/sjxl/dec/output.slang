@@ -17,13 +17,18 @@ struct OutputParams {
     float inverseMatrix[12];   // 3x3 row-major, scaled by 255 / intensity_target, padded rows of 4
     float negBias[4];          // opsin biases (negative) and padding
     float negBiasCbrt[4];
-    uint  transfer;            // 0 sRGB, 1 linear, 2 power (gamma)
+    uint  transfer;            // 0 sRGB, 1 linear, 2 power (gamma), 3 BT.709
     float gamma;               // the exponent for transfer 2 (e.g. 1/2.2)
     uint  mode;                // 0: XYB planes; 1: planes already hold the output encoding in [0, 1]; 2: YCbCr (Cb, Y, Cr planes)
-    uint  channels;            // 3 (RGB) or 4 (RGBA)
+    uint  channels;            // output samples per pixel: colour channels (3, or 1 for grey) plus the alpha channel
     uint  alphaPlane;          // plane index of the alpha channel within `alpha`
     uint  bytesPerSample;      // 1: 8-bit, 2: 16-bit little-endian
-    uint  pad3;
+    uint  hasAlpha;            // 1: the last output channel is the alpha plane
+    uint  grey;                // 1: one colour channel: XYB gives the luminance of the linear RGB (dec_xyb.cc srgb_to_luma)
+    uint  orientation;         // 1..8 (EXIF): the output image is the canvas undone of it (sizes swap for 5..8)
+    uint  numSpot;             // spot colour extra channels mixed into the colour (stage_spot.cc), from the canvas planes
+    uint4 spotPlane;           // their planes within `alpha`
+    float4 spotColor[4];       // RGB and solidity of each
 };
 ConstantBuffer<OutputParams> params;
 
@@ -33,6 +38,7 @@ ConstantBuffer<OutputParams> params;
 float encodeFromLinear(float v) {
     if (params.transfer == 1) return v;
     if (params.transfer == 2) return v <= 0.0f ? 0.0f : pow(v, params.gamma);
+    if (params.transfer == 3) return v < 0.018f ? 4.5f * v : 1.099f * pow(v, 0.45f) - 0.099f;   // TF_709
     const float a = abs(v);
     const float e = a <= 0.0031308f ? 12.92f * a : 1.055f * pow(a, 1.0f / 2.4f) - 0.055f;
     return v < 0.0f ? -e : e;
@@ -54,9 +60,34 @@ float outputValue(uint c, uint x, uint y) {
     const float mr = gr * gr * gr + params.negBias[0];
     const float mg = gg * gg * gg + params.negBias[1];
     const float mb = gb * gb * gb + params.negBias[2];
+    if (params.grey != 0) {   // every colour channel is the luminance of the linear RGB
+        float lum = 0.0f;
+        const float kLuminance[3] = {0.2126f, 0.7152f, 0.0722f};
+        for (uint k = 0; k < 3; ++k) {
+            lum += kLuminance[k] * (params.inverseMatrix[k * 4 + 0] * mr + params.inverseMatrix[k * 4 + 1] * mg + params.inverseMatrix[k * 4 + 2] * mb);
+        }
+        return encodeFromLinear(lum);
+    }
     const float lin = params.inverseMatrix[c * 4 + 0] * mr + params.inverseMatrix[c * 4 + 1] * mg + params.inverseMatrix[c * 4 + 2] * mb;
     return encodeFromLinear(lin);
 }
+
+/// The source pixel of output pixel (ox, oy) under the orientation (dec_external_image.cc UndoOrientation inverted).
+void sourcePixel(uint ox, uint oy, out uint x, out uint y) {
+    const uint w = params.width, h = params.height;
+    switch (params.orientation) {
+    case 2: x = w - 1 - ox; y = oy; break;             // flip horizontal
+    case 3: x = w - 1 - ox; y = h - 1 - oy; break;     // rotate 180
+    case 4: x = ox; y = h - 1 - oy; break;             // flip vertical
+    case 5: x = oy; y = ox; break;                     // transpose
+    case 6: x = oy; y = h - 1 - ox; break;             // rotate 90 clockwise
+    case 7: x = w - 1 - oy; y = h - 1 - ox; break;     // anti-transpose
+    case 8: x = w - 1 - oy; y = ox; break;             // rotate 270
+    default: x = ox; y = oy;
+    }
+}
+
+uint outWidth() { return params.orientation >= 5 ? params.height : params.width; }
 
 /// One thread per pixel: the three output-encoding planes (for blending and canvases).
 [shader("compute")]
@@ -73,12 +104,19 @@ uint sampleFor(uint index) {
     const float peak = params.bytesPerSample == 2 ? 65535.0f : 255.0f;
     const uint pixel = index / params.channels;
     const uint c = index % params.channels;
-    const uint x = pixel % params.width;
-    const uint y = pixel / params.width;
+    uint x, y;
+    sourcePixel(pixel % outWidth(), pixel / outWidth(), x, y);
     const uint plane = params.paddedWidth * params.paddedHeight;
     const uint at = y * params.paddedWidth + x;
-    if (c == 3) return uint(round(clamp(alpha[params.alphaPlane * plane + at], 0.0f, 1.0f) * peak));
-    return uint(round(clamp(outputValue(c, x, y), 0.0f, 1.0f) * peak));
+    if (params.hasAlpha != 0 && c + 1 == params.channels) return uint(round(clamp(alpha[params.alphaPlane * plane + at], 0.0f, 1.0f) * peak));
+    float v = outputValue(c, x, y);
+    for (uint sidx = 0; sidx < params.numSpot; ++sidx) {   // stage_spot.cc: mix = solidity x the channel's value
+        const uint sp = sidx == 0 ? params.spotPlane.x : sidx == 1 ? params.spotPlane.y : sidx == 2 ? params.spotPlane.z : params.spotPlane.w;
+        const float4 sc = params.spotColor[sidx];
+        const float mix = sc.w * alpha[sp * plane + at];
+        v = mix * sc[c] + (1.0f - mix) * v;
+    }
+    return uint(round(clamp(v, 0.0f, 1.0f) * peak));
 }
 
 uint byteFor(uint index) {

@@ -12,9 +12,11 @@ the test images, lossy and lossless: VarDCT with every transform size, Modular
 with RCT, palettes and Squeeze, chroma-from-luma, adaptive quantisation,
 Gaborish and EPF, noise, upsampling, patches, progressive passes and DC frames,
 permuted TOCs, extra channels with alpha, 16-bit output, ICC-tagged images,
-JPEG recompression and animation with blending. Pixels match within one 8-bit
-step (lossless bit-exact); the conformance tests in `tests/decoder` are the
-record. The encoder is VarDCT with transforms from 8×8 to 64×64 chosen by
+JPEG recompression, splines, orientation, spot colours, float samples and
+animation with blending. Pixels match within one 8-bit step (lossless
+bit-exact); 26 of the 27 inputs of libjxl's conformance suite decode within
+one step of djxl (CMYK is the exception: it needs ICC colour management). The
+conformance tests in `tests/decoder` are the record. The encoder is VarDCT with transforms from 8×8 to 64×64 chosen by
 libjxl's entropy model, libjxl's adaptive quant field, chroma-from-luma,
 Gaborish + EPF, the weighted predictor and fixed trees for the DC, and ANS
 with clustered contexts throughout: at the file size `cjxl -e 5` produces it

@@ -85,6 +85,12 @@ Result<std::unique_ptr<Decoder>> Decoder::create(std::shared_ptr<gpu::ShaderLibr
     SJXL_ASSIGN(dec->dcFromFrame_, gpu::ComputeKernel::create(lib, "sjxl/dec/dc_finalize", "dcFromFrame"));
     SJXL_ASSIGN(dec->bucketPatches_, gpu::ComputeKernel::create(lib, "sjxl/dec/patches", "bucketPatches"));
     SJXL_ASSIGN(dec->applyPatches_, gpu::ComputeKernel::create(lib, "sjxl/dec/patches", "applyPatches"));
+    SJXL_ASSIGN(dec->splineSegments_, gpu::ComputeKernel::create(lib, "sjxl/dec/splines", "splineSegments"));
+    SJXL_ASSIGN(dec->splineOffsets_, gpu::ComputeKernel::create(lib, "sjxl/dec/splines", "splineOffsets"));
+    SJXL_ASSIGN(dec->splineRowCounts_, gpu::ComputeKernel::create(lib, "sjxl/dec/splines", "splineRowCounts"));
+    SJXL_ASSIGN(dec->splineRowStarts_, gpu::ComputeKernel::create(lib, "sjxl/dec/splines", "splineRowStarts"));
+    SJXL_ASSIGN(dec->splineScatter_, gpu::ComputeKernel::create(lib, "sjxl/dec/splines", "splineScatter"));
+    SJXL_ASSIGN(dec->splineDraw_, gpu::ComputeKernel::create(lib, "sjxl/dec/splines", "splineDraw"));
     SJXL_ASSIGN(dec->gaborish_, gpu::ComputeKernel::create(lib, "sjxl/dec/filters", "gaborish"));
     SJXL_ASSIGN(dec->epf_, gpu::ComputeKernel::create(lib, "sjxl/dec/filters", "epf"));
     SJXL_ASSIGN(dec->output_, gpu::ComputeKernel::create(lib, "sjxl/dec/output", "xybToSrgb8"));
@@ -226,12 +232,13 @@ Result<Decoder::FrameOutput> Decoder::run(const codestream::Parsed& parsed, cons
     }
     if (modular) {
         const uint64_t pixels = uint64_t{dim.xsize} * dim.ysize;
-        if (pixels * (colorChannels + 2) > (uint64_t{1} << 31)) return Error(ErrorCode::Unsupported, "modular frames above 512 Mpixel");
-        globalsWords = kGlobalsWords + static_cast<uint32_t>((colorChannels + 1) * pixels);
+        const uint32_t channels = colorChannels + m.numExtraChannels;   // the extra channels are channels of the same modular image
+        if (pixels * (channels + 2) > (uint64_t{1} << 31)) return Error(ErrorCode::Unsupported, "modular frames above 512 Mpixel");
+        globalsWords = kGlobalsWords + static_cast<uint32_t>((channels + 1) * pixels);
         dcGroupWords = kModularGroupWords;
-        acGroupWords = std::max(kModularGroupWords, 4u * dim.groupDim * dim.groupDim);
-        if (uint64_t{acGroupWords} * numGroups < (colorChannels + 1) * pixels) {
-            acGroupWords = static_cast<uint32_t>(((colorChannels + 1) * pixels + numGroups - 1) / numGroups);
+        acGroupWords = kModularGroupWords + (channels + 1) * dim.groupDim * dim.groupDim;   // the group's trees, histograms and tables, then its channels
+        if (uint64_t{acGroupWords} * numGroups < (channels + 1) * pixels) {
+            acGroupWords = static_cast<uint32_t>(((channels + 1) * pixels + numGroups - 1) / numGroups);
         }
     }
     const uint32_t dcArenaBase = globalsWords;
@@ -276,14 +283,16 @@ Result<Decoder::FrameOutput> Decoder::run(const codestream::Parsed& parsed, cons
         ecShift[e] = ecLog - upShift;
         if (alphaIndex == numEc && m.extraChannels[e].type == 0) alphaIndex = e;
     }
-    const uint32_t outChannels = alphaIndex < numEc ? 4u : 3u;
+    const bool greyOut = m.colorSpace == 1;   // kGray: one colour channel (djxl writes grey PNGs)
+    const uint32_t outChannels = (greyOut ? 1u : 3u) + (alphaIndex < numEc ? 1u : 0u);
+    const bool orientationSwaps = m.orientation >= 5;
     // YCbCr chroma subsampling (JPEG recompression): per-channel shifts, zero for XYB.
     const bool ycbcr = !modular && frame.header.colorTransform == 2;
     std::array<uint32_t, 4> hshift{}, vshift{};
     if (ycbcr) {
         for (size_t c = 0; c < 3; ++c) { hshift[c] = frame.header.hshift[c]; vshift[c] = frame.header.vshift[c]; }
     }
-    const uint32_t outDepth = m.bitsPerSample > 8 ? 16u : 8u;   // djxl writes 16-bit files for deeper images
+    const uint32_t outDepth = m.bitsPerSample > 8 ? 16u : 8u;   // djxl writes 16-bit files for deeper images (floats included)
     // Displayed frames compose onto a canvas of the image's size (frames may be partial).
     const bool displayed = frame.header.frameType == 0 || frame.header.frameType == 3;
     const uint32_t canvasW = m.xsize, canvasH = m.ysize;
@@ -398,7 +407,9 @@ Result<Decoder::FrameOutput> Decoder::run(const codestream::Parsed& parsed, cons
             c["params"]["paddedWidth"].setData(dim.xsizePadded);
             c["params"]["paddedHeight"].setData(dim.ysizePadded);
             c["params"]["xybMode"].setData(uint32_t{modularXyb ? 1u : 0u});
-            c["params"]["sampleScale"].setData(1.0f / static_cast<float>((uint64_t{1} << m.bitsPerSample) - 1));
+            c["params"]["sampleScale"].setData(m.floatingPointSample ? 1.0f : 1.0f / static_cast<float>((uint64_t{1} << m.bitsPerSample) - 1));
+            c["params"]["floatBits"].setData(m.floatingPointSample && !modularXyb ? m.bitsPerSample : 0u);
+            c["params"]["floatExpBits"].setData(m.exponentBitsPerSample);
             c["params"]["ecChannel"].setData(0u);
             c["params"]["ecPlane"].setData(0u);
         });
@@ -604,6 +615,48 @@ Result<Decoder::FrameOutput> Decoder::run(const codestream::Parsed& parsed, cons
         epf_.dispatch(batch, {dim.xsize, dim.ysize, 1}, [&](rhi::ShaderCursor c) { bindFilter(c, 2, lf.epfPass2SigmaScale * 1.65f); });
         std::swap(src, dst);
     }
+    // Splines, after the loop filters at the frame's size (render pipeline order).
+    if (frame.header.flags & codestream::FrameHeader::kSplines) {
+        constexpr uint32_t kMaxSplines = 4096, kMaxControlPoints = 1u << 18, kMaxSegments = 1u << 16, kMaxRowEntries = 1u << 20, kSegWords = 10;
+        SJXL_ASSIGN(auto ctrl, gpu::Buffer::ofType<float>(dev, uint64_t{2} * kMaxControlPoints, "dec.splineCtrl"));
+        SJXL_ASSIGN(auto segCount, gpu::Buffer::ofType<uint32_t>(dev, kMaxSplines, "dec.splineCount"));
+        SJXL_ASSIGN(auto segments, gpu::Buffer::ofType<float>(dev, uint64_t{kMaxSegments} * kSegWords, "dec.splineSegments"));
+        SJXL_ASSIGN(auto rowDiff, gpu::Buffer::ofType<uint32_t>(dev, dim.ysize + 2, "dec.splineRowDiff"));
+        SJXL_ASSIGN(auto rowStart, gpu::Buffer::ofType<uint32_t>(dev, dim.ysize + 2, "dec.splineRowStart"));
+        SJXL_ASSIGN(auto rowFill, gpu::Buffer::ofType<uint32_t>(dev, dim.ysize + 2, "dec.splineRowFill"));
+        SJXL_ASSIGN(auto segIdx, gpu::Buffer::ofType<uint32_t>(dev, kMaxRowEntries, "dec.splineRowEntries"));
+        SJXL_ASSIGN(auto splineStatus, gpu::Buffer::ofType<uint32_t>(dev, 4, "dec.splineStatus"));
+        const auto bindSplines = [&](rhi::ShaderCursor c, uint32_t mode) {
+            c["arena"].setBinding(arena.rhi());
+            c["xyb"].setBinding(src->rhi());
+            c["ctrl"].setBinding(ctrl.rhi());
+            c["segCount"].setBinding(segCount.rhi());
+            c["segments"].setBinding(segments.rhi());
+            c["rowDiff"].setBinding(rowDiff.rhi());
+            c["rowStart"].setBinding(rowStart.rhi());
+            c["rowFill"].setBinding(rowFill.rhi());
+            c["segIdx"].setBinding(segIdx.rhi());
+            c["status"].setBinding(splineStatus.rhi());
+            c["params"]["width"].setData(dim.xsize);
+            c["params"]["height"].setData(dim.ysize);
+            c["params"]["paddedWidth"].setData(dim.xsizePadded);
+            c["params"]["paddedHeight"].setData(dim.ysizePadded);
+            c["params"]["mode"].setData(mode);
+            c["params"]["maxSegments"].setData(kMaxSegments);
+            c["params"]["maxRowEntries"].setData(kMaxRowEntries);
+        };
+        splineSegments_.dispatch(batch, {kMaxSplines, 1, 1}, [&](rhi::ShaderCursor c) { bindSplines(c, 0); });
+        splineOffsets_.dispatch(batch, {1, 1, 1}, [&](rhi::ShaderCursor c) { bindSplines(c, 0); });
+        splineSegments_.dispatch(batch, {kMaxSplines, 1, 1}, [&](rhi::ShaderCursor c) { bindSplines(c, 1); });
+        splineRowCounts_.dispatch(batch, {kMaxSegments, 1, 1}, [&](rhi::ShaderCursor c) { bindSplines(c, 1); });
+        splineRowStarts_.dispatch(batch, {1, 1, 1}, [&](rhi::ShaderCursor c) { bindSplines(c, 1); });
+        splineScatter_.dispatch(batch, {kMaxSegments, 1, 1}, [&](rhi::ShaderCursor c) { bindSplines(c, 1); });
+        splineDraw_.dispatch(batch, {dim.xsize * dim.ysize, 1, 1}, [&](rhi::ShaderCursor c) { bindSplines(c, 1); });
+        SJXL_TRY(batch.submit(true));
+        SJXL_ASSIGN(const auto st, splineStatus.readAll<uint32_t>(dev));
+        if (st[2] != 0) return Error::make(ErrorCode::Unsupported, "splines with {} segments over {} rows (capacity {} / {})", st[0], st[1], kMaxSegments, kMaxRowEntries);
+        if (!platform::env("SJXL_DEBUG").empty()) log::info("dec debug: splines: {} segments, {} row entries", st[0], st[1]);
+    }
     // Upsampling (after the loop filters, before patches: render pipeline order).
     std::optional<gpu::Buffer> upsampled;
     if (upsampling > 1) {
@@ -705,7 +758,11 @@ Result<Decoder::FrameOutput> Decoder::run(const codestream::Parsed& parsed, cons
         // The transfer function of the declared colour encoding (dec_xyb.cc inverse_gamma).
         uint32_t transfer = 0;
         float gamma = 1.0f;
-        if (m.tfHaveGamma) {
+        if (m.wantIcc && m.xybEncoded) {
+            // dec_xyb.cc: an ICC-described encoding of an XYB image cannot be output to, so
+            // libjxl writes linear sRGB (grey when the ICC is grey).
+            transfer = 1;
+        } else if (m.tfHaveGamma) {
             transfer = 2;
             gamma = static_cast<float>(m.tfGamma) * 1e-7f;
         } else if (m.transferFunction == 8) {
@@ -713,6 +770,8 @@ Result<Decoder::FrameOutput> Decoder::run(const codestream::Parsed& parsed, cons
         } else if (m.transferFunction == 17) {   // DCI
             transfer = 2;
             gamma = 1.0f / 2.6f;
+        } else if (m.transferFunction == 1) {   // BT.709
+            transfer = 3;
         }
         c["params"]["transfer"].setData(transfer);
         c["params"]["gamma"].setData(gamma);
@@ -720,9 +779,28 @@ Result<Decoder::FrameOutput> Decoder::run(const codestream::Parsed& parsed, cons
         c["params"]["channels"].setData(outChannels);
         c["params"]["alphaPlane"].setData(fromCanvas ? (alphaIndex < numEc ? 3 + alphaIndex : 0u) : (alphaIndex < numEc ? alphaIndex : 0u));
         c["params"]["bytesPerSample"].setData(outDepth / 8);
+        c["params"]["hasAlpha"].setData(uint32_t{alphaIndex < numEc ? 1u : 0u});
+        c["params"]["grey"].setData(uint32_t{greyOut ? 1u : 0u});
+        c["params"]["orientation"].setData(fromCanvas ? m.orientation : 1u);
+        // Spot colours (stage_spot.cc), mixed in when packing the canvas.
+        uint32_t numSpot = 0;
+        std::array<uint32_t, 4> spotPlane{};
+        for (uint32_t e = 0; e < numEc && numSpot < 4; ++e) {
+            if (m.extraChannels[e].type != 2 || !fromCanvas) continue;
+            spotPlane[numSpot] = 3 + e;
+            for (int k = 0; k < 4; ++k) c["params"]["spotColor"][numSpot][k].setData(m.extraChannels[e].spotColor[static_cast<size_t>(k)]);
+            ++numSpot;
+        }
+        c["params"]["numSpot"].setData(numSpot);
+        c["params"]["spotPlane"].setData(spotPlane);
         c["alpha"].setBinding(fromCanvas ? canvas->rhi() : ecOut ? ecOut->rhi() : dummy.rhi());
     };
     const bool emitted = displayed && (frame.header.isLast || frame.header.duration > 0);
+    if (displayed && !platform::env("SJXL_DEBUG").empty()) {
+        std::string ecs;
+        for (uint32_t e = 0; e < numEc; ++e) ecs += std::format("[type {} assoc {} blend mode {} alpha {} clamp {}] ", m.extraChannels[e].type, m.extraChannels[e].alphaAssociated, frame.header.ecBlending[e].mode, frame.header.ecBlending[e].alphaChannel, frame.header.ecBlending[e].clamp);
+        log::info("dec debug: frame blend mode {} source {} alpha channel {} clamp {} (first alpha ec {}); origin ({},{}) {}x{}; ec {}", blending.mode, blending.source, blending.alphaChannel, blending.clamp, alphaIndex, frame.header.customSizeOrOrigin ? frame.header.x0 : 0, frame.header.customSizeOrOrigin ? frame.header.y0 : 0, outWidth, outHeight, ecs);
+    }
     if (displayed) {
         // The frame in the output encoding, composed onto the canvas (stage_blending.cc), then packed.
         toOutputPlanes_.dispatch(batch, {outWidth * outHeight, 1, 1}, [&](rhi::ShaderCursor c) { bindOutput(c, false); });
@@ -815,8 +893,8 @@ Result<Decoder::FrameOutput> Decoder::run(const codestream::Parsed& parsed, cons
         SJXL_ASSIGN(const std::vector<uint32_t> wordsOut, rgb8.readAll<uint32_t>(dev));
         FrameOutput fo;
         fo.emitted = true;
-        fo.image.width = canvasW;
-        fo.image.height = canvasH;
+        fo.image.width = orientationSwaps ? canvasH : canvasW;
+        fo.image.height = orientationSwaps ? canvasW : canvasH;
         fo.image.channels = outChannels;
         fo.image.bitDepth = outDepth;
         fo.image.pixels.resize(outBytes);
@@ -927,8 +1005,8 @@ Result<Decoder::FrameOutput> Decoder::run(const codestream::Parsed& parsed, cons
     SJXL_ASSIGN(const std::vector<uint32_t> words, rgb8.readAll<uint32_t>(dev));
     FrameOutput fo;
     fo.emitted = true;
-    fo.image.width = canvasW;
-    fo.image.height = canvasH;
+    fo.image.width = orientationSwaps ? canvasH : canvasW;
+    fo.image.height = orientationSwaps ? canvasW : canvasH;
     fo.image.channels = outChannels;
     fo.image.bitDepth = outDepth;
     fo.image.pixels.resize(outBytes);

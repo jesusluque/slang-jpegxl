@@ -193,7 +193,7 @@ Result<void> readImageMetadata(BitReader& br, ImageMetadata& m) {
         const uint32_t nameLength = br.readU32(U32Enc{{Val(0), Bits(4), BitsOffset(5, 16), BitsOffset(10, 48)}});
         for (uint32_t k = 0; k < nameLength; ++k) (void)br.read(8);
         if (ec.type == 0) ec.alphaAssociated = br.readBool();
-        if (ec.type == 2) for (int k = 0; k < 4; ++k) { SJXL_TRY(br.readF16()); }   // spot color
+        if (ec.type == 2) for (size_t k = 0; k < 4; ++k) { SJXL_ASSIGN(ec.spotColor[k], br.readF16()); }   // spot colour: RGB and solidity
         if (ec.type == 5) (void)br.readU32(U32Enc{{Val(1), Bits(2), BitsOffset(4, 3), BitsOffset(8, 19)}});   // CFA
     }
     m.xybEncoded = br.readBool();
@@ -504,7 +504,7 @@ Result<void> parseFramesFrom(Parsed& p, size_t startByte) {
     }
     size_t frameStartByte = startByte;
     for (;;) {
-        if (p.frames.size() >= 16) return unsupported("more than 16 frames");
+        if (p.frames.size() >= 65536) return unsupported("more than 65536 frames");
         if (frameStartByte >= p.codestream.size()) return corrupt("codestream ends before the last frame");
         BitReader fr(p.codestream, frameStartByte * 8);
         ParsedFrame frame;
@@ -517,14 +517,12 @@ Result<void> parseFramesFrom(Parsed& p, size_t startByte) {
         if (f.isModular) {
             if (f.colorTransform == 2) return unsupported("Modular frames in YCbCr");
             if (m.colorSpace != 0 && m.colorSpace != 1) return unsupported("Modular frames in a colour space other than RGB or grey");
-            if (m.floatingPointSample) return unsupported("floating point samples");
         } else {
             if (f.colorTransform == 1) return unsupported("VarDCT frames in RGB without a colour transform");
             if (f.colorTransform == 2 && (f.loopFilter.gab || f.loopFilter.epfIters != 0)) return unsupported("loop filters on YCbCr frames");
             if (referenceOnly) return unsupported("VarDCT reference-only frames");
         }
         if (f.frameType == 3) return unsupported("skip-progressive frames");
-        if (f.flags & FrameHeader::kSplines) return unsupported("splines");
         if (f.upsampling != 1 && f.upsampling != 2 && f.upsampling != 4 && f.upsampling != 8) return corrupt("upsampling factor");
         if (m.numExtraChannels > 4) return unsupported("more than 4 extra channels");
         for (uint32_t u : f.ecUpsampling) {
@@ -617,10 +615,13 @@ Result<Parsed> parse(std::span<const uint8_t> file) {
 
     // What M2 does not do yet.
     if (m.havePreview) return unsupported("preview frames");
-    if (m.orientation != 1) return unsupported("orientation other than identity");
-    if (m.bitsPerSample > 16 || m.floatingPointSample) return unsupported("floating point or >16-bit samples");
-    if (!m.tfHaveGamma && m.transferFunction != 13 && m.transferFunction != 8 && m.transferFunction != 17) {
-        return unsupported("transfer functions other than sRGB, linear, gamma and DCI (PQ/HLG/709)");
+    if (!m.floatingPointSample && m.bitsPerSample > 16) return unsupported("integer samples above 16 bits");
+    for (const ExtraChannelInfo& ec : m.extraChannels) {
+        if (ec.type == 4) return unsupported("CMYK (a Black extra channel: djxl converts it to RGB through the ICC profile)");
+    }
+    if (m.floatingPointSample && m.bitsPerSample != 32 && m.bitsPerSample != 16 && m.bitsPerSample != 24) return unsupported("float sample width");
+    if (!m.tfHaveGamma && m.transferFunction != 13 && m.transferFunction != 8 && m.transferFunction != 17 && m.transferFunction != 1) {
+        return unsupported("transfer functions other than sRGB, linear, gamma, DCI and 709 (PQ/HLG)");
     }
 
     if (m.wantIcc) {

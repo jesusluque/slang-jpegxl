@@ -164,8 +164,11 @@ WpState wpCreate(inout Dec d, WpHeader header, uint xsize) {
     return s;
 }
 
+/// ErrorWeight: FloorLog2Nonzero of the 64-bit sum (three 32-bit errors can exceed 2^32 with 32-bit samples).
 uint wpErrorWeight(uint64_t x, uint maxweight) {
-    int shift = int(firstbithigh(uint(min(x + 1, uint64_t(0xFFFFFFFFu))))) - 5;
+    const uint64_t x1 = x + 1;
+    const uint hi = uint(x1 >> 32), lo = uint(x1);
+    int shift = int(hi != 0 ? 32 + firstbithigh(hi) : firstbithigh(lo)) - 5;
     if (shift < 0) shift = 0;
     return 4 + uint((uint64_t(maxweight) * uint64_t(kWpDivLookup[uint(x >> shift)])) >> shift);
 }
@@ -198,9 +201,9 @@ int64_t wpPredict(inout WpState s, uint x, uint y, int64_t N, int64_t W, int64_t
     uint weights[4];
     const uint hw[4] = {s.header.w0, s.header.w1, s.header.w2, s.header.w3};
     for (uint i = 0; i < 4; ++i) {
-        const uint64_t sum = uint64_t(arena[s.predErrors + i * rowLen + posN]) + uint64_t(arena[s.predErrors + i * rowLen + posNE]) +
-                             uint64_t(arena[s.predErrors + i * rowLen + posNW]);
-        weights[i] = wpErrorWeight(sum, hw[i]);
+        // libjxl sums the three error rows in uint32 (wrapping), then widens.
+        const uint sum = arena[s.predErrors + i * rowLen + posN] + arena[s.predErrors + i * rowLen + posNE] + arena[s.predErrors + i * rowLen + posNW];
+        weights[i] = wpErrorWeight(uint64_t(sum), hw[i]);
     }
     N = wpAddBits(N);
     W = wpAddBits(W);
@@ -250,11 +253,13 @@ void wpUpdateErrors(inout WpState s, int64_t val, uint x, uint y) {
 
 // --- predictors ------------------------------------------------------------------------
 
-int clampedGradient(int n, int w, int l) {
-    const int m = min(n, w);
-    const int M = max(n, w);
-    const int grad = int(uint(n) + uint(w) - uint(l));
-    const int gradClampM = (l < m) ? M : grad;
+/// ClampedGradient in libjxl's 64-bit pixel arithmetic (pixel_type_w): 32-bit samples
+/// (float bit patterns) overflow the 32-bit form, and the result is truncated only when stored.
+int64_t clampedGradient(int64_t n, int64_t w, int64_t l) {
+    const int64_t m = min(n, w);
+    const int64_t M = max(n, w);
+    const int64_t grad = n + w - l;
+    const int64_t gradClampM = (l < m) ? M : grad;
     return (l > M) ? m : gradClampM;
 }
 
@@ -273,7 +278,7 @@ int64_t predictOne(uint p, int64_t left, int64_t top, int64_t toptop, int64_t to
     case kPredTop: return top;
     case kPredSelect: return selectPredictor(left, top, topleft);
     case kPredWeighted: return wpPred;
-    case kPredGradient: return int64_t(clampedGradient(int(left), int(top), int(topleft)));
+    case kPredGradient: return clampedGradient(left, top, topleft);
     case kPredTopLeft: return topleft;
     case kPredTopRight: return topright;
     case kPredLeftLeft: return leftleft;
@@ -693,8 +698,8 @@ void decodeChannel(inout Dec d, inout SymReader r, Tree tree, WpHeader wpHeader,
             const int toprightright = (x + 2 < ch.w && y > 0) ? px(ch, x + 2, y - 1) : topright;
             if (!singleLeaf) {
                 arena[propsOff + 3] = x;
-                arena[propsOff + 4] = uint(abs(top));
-                arena[propsOff + 5] = uint(abs(left));
+                arena[propsOff + 4] = uint(int(abs(int64_t(top))));
+                arena[propsOff + 5] = uint(int(abs(int64_t(left))));
                 arena[propsOff + 6] = uint(top);
                 arena[propsOff + 7] = uint(left);
                 arena[propsOff + 8] = uint(left - int(arena[propsOff + 9]));
@@ -719,11 +724,11 @@ void decodeChannel(inout Dec d, inout SymReader r, Tree tree, WpHeader wpHeader,
                     const int vleft = x > 0 ? px(cj, x - 1, y) : 0;
                     const int vtop = y > 0 ? px(cj, x, y - 1) : vleft;
                     const int vtopleft = (x > 0 && y > 0) ? px(cj, x - 1, y - 1) : vleft;
-                    const int vpred = clampedGradient(vleft, vtop, vtopleft);
-                    arena[propsOff + off + 0] = uint(abs(v));
+                    const int64_t vpred = clampedGradient(int64_t(vleft), int64_t(vtop), int64_t(vtopleft));   // PrecomputeReferences: 64-bit, truncated when stored
+                    arena[propsOff + off + 0] = uint(int(abs(int64_t(v))));
                     arena[propsOff + off + 1] = uint(v);
-                    arena[propsOff + off + 2] = uint(abs(v - vpred));
-                    arena[propsOff + off + 3] = uint(v - vpred);
+                    arena[propsOff + off + 2] = uint(int(abs(int64_t(v) - vpred)));
+                    arena[propsOff + off + 3] = uint(int(int64_t(v) - vpred));
                     off += 4;
                 }
             }
@@ -746,7 +751,7 @@ void decodeChannel(inout Dec d, inout SymReader r, Tree tree, WpHeader wpHeader,
             const uint token = readHybridUint(d, r, ctx);
             const int64_t value = int64_t(unpackSignedInt(token)) * int64_t(multiplier) + guess;
             setPx(ch, x, y, int(value));
-            if (tree.usesWp) wpUpdateErrors(wp, value, x, y);
+            if (tree.usesWp) wpUpdateErrors(wp, int64_t(int(value)), x, y);   // the stored (truncated) sample, as libjxl's UpdateErrors(r[x])
             if (d.error != kErrNone) return;
         }
     }

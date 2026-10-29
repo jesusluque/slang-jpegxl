@@ -848,3 +848,78 @@ TEST_CASE("the encoder's partial animation frames compose like full ones", "[enc
     REQUIRE(metrics);
     CHECK(metrics->maxAbsDiff <= 1);
 }
+
+TEST_CASE("the decoder matches djxl on splines", "[decoder][conformance][splines]") {
+    const std::filesystem::path djxl = test::findTool("djxl");
+    const std::filesystem::path fromTree = test::findTool("jxl_from_tree");
+    if (djxl.empty() || fromTree.empty()) SKIP("djxl or jxl_from_tree is not installed");
+    // Two splines over a flat image: a four-point curve with colour and width varying
+    // along the arc, and a straight thin one (jxl_from_tree's Spline syntax: the X, Y, B
+    // and sigma DCTs, then the control points).
+    const auto dct = [](float v0, float v1 = 0.0f) {
+        std::string s = std::format("{} {}", v0, v1);
+        for (int i = 2; i < 32; ++i) s += " 0";
+        return s;
+    };
+    std::string tree = "Width 160\nHeight 120\nSplineQuantizationAdjustment 0\n";
+    tree += "Spline\n" + dct(0.3f) + " " + dct(0.5f, -0.1f) + " " + dct(0.2f) + " " + dct(2.5f, 0.8f) + "\n12 15 60 90 100 30 150 100\nEndSpline\n";
+    tree += "Spline\n" + dct(0.1f) + " " + dct(0.6f) + " " + dct(-0.2f) + " " + dct(1.2f) + "\n20 100 140 20\nEndSpline\n";
+    tree += "- Set 0\n";
+    const std::filesystem::path treePath = test::scratchDir() / "splines.tree";
+    const std::filesystem::path jxl = test::scratchDir() / "splines.jxl";
+    const std::filesystem::path png = test::scratchDir() / "splines.djxl.png";
+    REQUIRE(image::writeFile(treePath, std::vector<uint8_t>(tree.begin(), tree.end())));
+    REQUIRE(test::run(std::format("\"{}\" \"{}\" \"{}\" >/dev/null 2>&1", fromTree.string(), treePath.string(), jxl.string())));
+    REQUIRE(test::run(std::format("\"{}\" \"{}\" \"{}\" >/dev/null 2>&1", djxl.string(), jxl.string(), png.string())));
+    auto bytes = image::readFile(jxl);
+    REQUIRE(bytes);
+    auto theirs = image::readRgb8(png);
+    REQUIRE(theirs);
+    auto ours = decoder().decode(*bytes);
+    REQUIRE(ours);
+    auto metrics = test::compare(*ours, *theirs);
+    REQUIRE(metrics);
+    WARN(std::format("splines: PSNR {:.2f} dB, max diff {}", metrics->psnr, metrics->maxAbsDiff));
+    CHECK(metrics->maxAbsDiff <= 1);
+}
+
+TEST_CASE("the decoder matches djxl on the JPEG XL conformance inputs", "[decoder][conformance][suite]") {
+    const std::filesystem::path djxl = test::findTool("djxl");
+    if (djxl.empty()) SKIP("djxl is not installed");
+    // The small inputs of github.com/libjxl/conformance (tests/data/conformance/LICENSE.txt):
+    // alpha, blend modes, orientation, grey XYB with an ICC profile, a grey JPEG, an
+    // animation with splines, upsampling. Each decodes within 1 LSB of djxl (an animation:
+    // its first frame, which djxl writes as an APNG that stb reads as one frame).
+    const std::string name = GENERATE(std::string("alpha_nonpremultiplied"), std::string("alpha_premultiplied"), std::string("alpha_triangles"),
+                                      std::string("animation_spline"), std::string("blendmodes"), std::string("grayscale"), std::string("grayscale_jpeg"),
+                                      std::string("mul_no_extra_channels"), std::string("sunset_logo"), std::string("upsampling"));
+    CAPTURE(name);
+    const std::filesystem::path jxl = test::testData("conformance/" + name + ".jxl");
+    const std::filesystem::path png = test::scratchDir() / ("conf_" + name + ".djxl.png");
+    REQUIRE(test::run(std::format("\"{}\" \"{}\" \"{}\" >/dev/null 2>&1", djxl.string(), jxl.string(), png.string())));
+    auto bytes = image::readFile(jxl);
+    REQUIRE(bytes);
+    auto theirs = image::readImage(png);   // depth and channels as djxl wrote them (12/16-bit, grey, alpha)
+    REQUIRE(theirs);
+    auto ours = decoder().decodeAll(*bytes);
+    REQUIRE(ours);
+    REQUIRE(!ours->empty());
+    image::Rgb8 mine = std::move(ours->front().image);
+    if (mine.channels < theirs->channels) {   // grey output (one or two channels): the PNG reader expands grey to RGB
+        image::Rgb8 wide = mine;
+        wide.channels = theirs->channels;
+        const uint32_t bps = mine.bitDepth / 8, grey = mine.channels - (mine.channels == 2 ? 1 : 0);
+        wide.pixels.assign(size_t{wide.width} * wide.height * wide.channels * bps, 0);
+        for (size_t p = 0; p < size_t{mine.width} * mine.height; ++p) {
+            for (uint32_t c = 0; c < wide.channels; ++c) {
+                const uint32_t src = c < wide.channels - (mine.channels == 2 ? 1 : 0) ? 0 : grey;   // colour channels from the grey, alpha from alpha
+                for (uint32_t b = 0; b < bps; ++b) wide.pixels[(p * wide.channels + c) * bps + b] = mine.pixels[(p * mine.channels + src) * bps + b];
+            }
+        }
+        mine = std::move(wide);
+    }
+    auto metrics = test::compare(mine, *theirs);
+    if (!metrics) FAIL(std::format("conformance {}: compare failed: {}", name, metrics.error().message()));
+    WARN(std::format("conformance {}: {} frame(s), PSNR {:.2f} dB, max diff {}", name, ours->size(), metrics->psnr, metrics->maxAbsDiff));
+    CHECK(metrics->maxAbsDiff <= 1);
+}

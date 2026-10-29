@@ -143,6 +143,7 @@ void ansPutVarLenUint8(RWStructuredBuffer<uint> buf, inout SerialWriter w, uint 
 /// ANSEncodingHistogram::Encode of gAnsCounts[0..length) normalised at
 /// `shift` (dry: only the size), with libjxl's run-length code for repeated
 /// counts. `flat` writes the flat form instead (counts 4096 / length).
+[noinline]
 void ansWriteHistogramAt(RWStructuredBuffer<uint> buf, inout SerialWriter w, uint length, uint shift, bool flat, bool dry) {
     uint numSymbols = 0;
     uint symbols[2] = {0, 0};
@@ -287,6 +288,7 @@ float ansBestHistogramCost(RWStructuredBuffer<uint> buf, uint length, uint numTr
 
 /// The raw counts in gAnsCounts[0..length) written in their cheapest form;
 /// gAnsCounts holds the normalised counts on exit for the alias tables.
+[noinline]
 void ansWriteBestHistogram(RWStructuredBuffer<uint> buf, inout SerialWriter w, uint length, uint numTries) {
     uint numSymbols = 0;
     for (uint s = 0; s < 256; ++s) {

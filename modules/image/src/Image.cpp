@@ -163,7 +163,7 @@ Result<void> writePng16(const std::filesystem::path& path, const Rgb8& image) {
     putBe32(ihdr, image.width);
     putBe32(ihdr, image.height);
     ihdr.push_back(16);
-    ihdr.push_back(image.channels == 4 ? 6 : 2);
+    ihdr.push_back(image.channels == 4 ? 6 : image.channels == 3 ? 2 : image.channels == 2 ? 4 : 0);   // RGBA, RGB, grey+alpha, grey
     ihdr.push_back(0); ihdr.push_back(0); ihdr.push_back(0);
     putChunk(png, "IHDR", ihdr);
     putChunk(png, "IDAT", z);
@@ -178,7 +178,7 @@ Result<Rgb8> readImage8(const std::filesystem::path& path) { return readWithChan
 Result<Rgb8> readImage(const std::filesystem::path& path) { return readWithChannels(path, true, true); }
 
 Result<void> writePng(const std::filesystem::path& path, const Rgb8& image) {
-    if ((image.channels != 3 && image.channels != 4) || (image.bitDepth != 8 && image.bitDepth != 16) ||
+    if ((image.channels < 1 || image.channels > 4) || (image.bitDepth != 8 && image.bitDepth != 16) ||
         image.pixels.size() != size_t{image.width} * image.height * image.channels * (image.bitDepth / 8)) {
         return Error(ErrorCode::InvalidArgument, "image pixel count does not match its size");
     }

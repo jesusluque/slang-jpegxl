@@ -186,7 +186,8 @@ Result<std::unique_ptr<Encoder>> Encoder::create(std::shared_ptr<gpu::ShaderLibr
     SJXL_ASSIGN(enc->remapTokens_, gpu::ComputeKernel::create(lib, "sjxl/enc/modular", "remapTokens"));
     SJXL_ASSIGN(enc->modGroupSections_, gpu::ComputeKernel::create(lib, "sjxl/enc/modular", "modGroupSections"));
     SJXL_ASSIGN(enc->modularGlobalBlob_, gpu::ComputeKernel::create(lib, "sjxl/enc/codes", "buildModularGlobalBlob"));
-    SJXL_ASSIGN(enc->dcGroupBlobs_, gpu::ComputeKernel::create(lib, "sjxl/enc/codes", "buildDcGroupBlobs"));
+    SJXL_ASSIGN(enc->dcGroupPre_, gpu::ComputeKernel::create(lib, "sjxl/enc/codes", "buildDcGroupPre"));
+    SJXL_ASSIGN(enc->dcGroupMid_, gpu::ComputeKernel::create(lib, "sjxl/enc/codes", "buildDcGroupMid"));
     SJXL_ASSIGN(enc->globalBlobs_, gpu::ComputeKernel::create(lib, "sjxl/enc/codes", "buildGlobalBlobs"));
     SJXL_ASSIGN(enc->quantTableBlob_, gpu::ComputeKernel::create(lib, "sjxl/enc/codes", "buildQuantTableBlob"));
     SJXL_ASSIGN(enc->layout_, gpu::ComputeKernel::create(lib, "sjxl/enc/layout", "layoutSections"));
@@ -1290,7 +1291,8 @@ Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, cons
         c["params"]["numChannels"].setData(1u);
         c["params"]["bitDepth"].setData(image.bitDepth);
     };
-    dcGroupBlobs_.dispatchGroups(batch, {numDcGroups, 1, 1}, bindCodes);
+    dcGroupPre_.dispatchGroups(batch, {numDcGroups, 1, 1}, bindCodes);
+    dcGroupMid_.dispatchGroups(batch, {numDcGroups, 1, 1}, bindCodes);
     globalBlobs_.dispatchGroups(batch, {1, 1, 1}, bindCodes);
     if (jpeg != nullptr) quantTableBlob_.dispatchGroups(batch, {1, 1, 1}, bindCodes);
 

@@ -88,6 +88,12 @@ cjxl in.png ref.jxl -d 1 -e 5 ; djxl out.jxl check.png      # Homebrew oracle (/
   run-length coded widths); single-thread kernels keep 256-entry scratch in
   groupshared arrays, never private ones (Metal's compiler hangs). Context maps over many
   contexts are MTF + ANS streams; the headers' MA trees use prefix codes.
+- **Big single-thread kernels compile slowly on Metal** (seconds to never in
+  `newComputePipelineState`) when they inline several copies of a large
+  function: mark such functions `[noinline]` (the ANS histogram writers,
+  context map and tree writers are), keep one copy per kernel, and check with
+  `SJXL_DEBUG=1`, which logs every pipeline that takes over 500 ms to build
+  (`SJXL_DEBUG_DISPATCH=1` traces dispatches).
 - **Metal buffers have no bounds checks**: a kernel writing past a buffer
   (e.g. a per-tile buffer indexed per block) corrupts whichever buffer the
   heap placed next, silently. Size and index every write by the same unit.
@@ -240,6 +246,15 @@ strength LUT), then the colour transform.
 Displayed frames compose onto a canvas (`output.slang toOutputPlanes` then
 `blend.slang`, blending modes incl. alpha) kept in a reference slot when the
 frame can be referenced; `Decoder::decodeAll` returns the emitted frames.
+Splines (`splines.slang`: segments per spline, row buckets, a Gaussian draw per
+pixel) are added after the filters. The output stage handles grey images (luma
+of the linear RGB, one-channel PNGs), orientation, spot colours, BT.709, and
+writes linear sRGB for XYB images whose colour encoding is an ICC profile (as
+djxl does); 32-bit float samples are rebuilt by `modular_out.slang intToFloat`
+and the modular predictor keeps libjxl's 64-bit arithmetic. CMYK (a Black
+extra channel) is reported as unsupported. `tests/data/conformance` holds the
+small inputs of libjxl's conformance suite (the `[suite]` test; the sweep over
+all 27 is in `docs/decisions.md`).
 Progressive: passes add shifted coefficients per AC group thread; a permuted
 TOC is decoded by `toc.slang` and the parser resumes (`Decoder::parseAll`); a
 DC frame's planes become the next frame's DC (`dcFromFrame`).

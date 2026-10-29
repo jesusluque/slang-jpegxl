@@ -1,0 +1,7 @@
+These files are the `input.jxl` of test cases of the JPEG XL conformance
+repository (https://github.com/libjxl/conformance, testcases/<name>/input.jxl),
+Copyright (c) the JPEG XL Project Authors, redistributed under its
+BSD-3-Clause licence. The remaining test cases of that repository (the large
+photos, patches, progressive, spot, lossless_pfm, cmyk_layers, the long
+animations) are not copied here for their size; `docs/decisions.md` records
+how the decoder fares on all of them.

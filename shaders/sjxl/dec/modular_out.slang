@@ -17,6 +17,8 @@ struct ModularOutParams {
     uint  paddedHeight;
     uint  xybMode;        // 1: Y, X, B channels with the DC dequant factors (kGsDcQuant)
     float sampleScale;    // 1 / (2^bits - 1) for RGB / grey, or for the extra channel (ecToPlanes)
+    uint  floatBits;      // floating point samples: their width (16, 24, 32; 0 for integers) ...
+    uint  floatExpBits;   // ... and exponent bits: the ints are the float's bit patterns (int_to_float)
     uint  ecChannel;      // ecToPlanes: index in the channel list
     uint  ecPlane;        // ecToPlanes: destination plane index
 };
@@ -32,6 +34,37 @@ static const uint kChanStride = 5;
 int sample(uint chansOff, uint c, uint x, uint y) {
     const uint o = chansOff + c * kChanWords;
     return int(arena[arena[o + kChanData] + y * arena[o + kChanStride] + x]);
+}
+
+/// dec_modular.cc int_to_float: a custom float of `floatBits` bits with `floatExpBits`
+/// exponent bits, stored as an int, back to binary32.
+float intToFloat(uint f) {
+    const uint bits = params.floatBits, expBits = params.floatExpBits;
+    if (bits == 32) return asfloat(f);
+    const int expBias = (1 << (expBits - 1)) - 1;
+    const uint signShift = bits - 1;
+    const uint mantBits = bits - expBits - 1;
+    const uint mantShift = 23 - mantBits;
+    const uint signbit = f >> signShift;
+    f &= (1u << signShift) - 1;
+    if (f == 0) return signbit != 0 ? -0.0f : 0.0f;
+    int exp = int(f >> mantBits);
+    uint mantissa = f & ((1u << mantBits) - 1);
+    if (exp == (1 << expBits) - 1) {   // inf / nan
+        return asfloat((signbit != 0 ? 0x80000000u : 0u) | (0xFFu << 23) | (mantissa << mantShift));
+    }
+    mantissa <<= mantShift;
+    if (exp == 0 && expBits < 8) {   // subnormal: normalise
+        while ((mantissa & 0x800000u) == 0) {
+            mantissa <<= 1;
+            --exp;
+        }
+        ++exp;
+        mantissa &= 0x7FFFFFu;
+    }
+    exp = exp - expBias + 127;
+    if (exp < 0) return 0.0f;
+    return asfloat((signbit != 0 ? 0x80000000u : 0u) | (uint(exp) << 23) | mantissa);
 }
 
 [shader("compute")]
@@ -56,7 +89,7 @@ void modularToPlanes(uint3 tid: SV_DispatchThreadID) {
     }
     for (uint c = 0; c < 3; ++c) {
         const int v = sample(chansOff, colorChannels == 1 ? 0 : c, x, y);
-        xyb[c * plane + at] = float(v) * params.sampleScale;
+        xyb[c * plane + at] = params.floatBits != 0 ? intToFloat(uint(v)) : float(v) * params.sampleScale;
     }
 }
 

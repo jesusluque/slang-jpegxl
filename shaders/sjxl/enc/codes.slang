@@ -479,6 +479,7 @@ static const uint kMapLogAlpha = 5;   // the context map's values are below 32
 /// The context map as a one-context ANS stream after the move-to-front
 /// transform (EncodeContextMap with use_mtf): its histogram set, then the
 /// tokens coded backwards and placed from the end as WriteTokens does.
+[noinline]
 void writeContextMapStream(RWStructuredBuffer<uint> buf, inout SerialWriter w, uint numContexts, uint numClusters, uint ctxBase) {
     uint mtf[kAcClusters];
     for (uint i = 0; i < kAcClusters; ++i) mtf[i] = i;
@@ -541,6 +542,7 @@ void writeContextMapStream(RWStructuredBuffer<uint> buf, inout SerialWriter w, u
 /// `lz77`: the set's streams carry run-length tokens: LZ77Params min_symbol 224,
 /// min_length 3, the length config (4, 2, 0) at alphabet 8; numContexts then
 /// includes the distance context.
+[noinline]
 void writeHistogramSetLz77(RWStructuredBuffer<uint> buf, inout SerialWriter w, uint numContexts, uint numClusters, uint logAlpha, uint set, bool lz77) {
     const uint ctxBase = setCtxBase(set);
     const uint regionBase = setRegionBase(set);
@@ -633,17 +635,18 @@ void writeLocalGroupHeader(RWStructuredBuffer<uint> buf, inout SerialWriter w) {
     serialWrite(buf, w, 2, 0);
 }
 
+// The two DC group blobs are separate kernels: each inlines one ANS histogram
+// writer (two in one kernel made Metal's backend compiler hang intermittently).
+
+/// "pre" of DC group g: extra_precision, the DC stream's header: the kWPFixedDC
+/// tree and its clustered ANS histograms (the group's DC set). Nothing with a DC frame.
 [shader("compute")]
 [numthreads(1, 1, 1)]
-void buildDcGroupBlobs(uint3 gid: SV_GroupID) {
+void buildDcGroupPre(uint3 gid: SV_GroupID) {
     const uint g = gid.x;
     if (g >= params.numDcGroups) {
         return;
     }
-    const uint4 rect = dcGroups[g];
-
-    // "pre": extra_precision, the DC stream's header: the kWPFixedDC tree and
-    // its clustered ANS histograms (the group's DC set). Nothing with a DC frame.
     SerialWriter pre;
     pre.base = (2 + 2 * g) * kBlobStrideWords;
     pre.pos = 0;
@@ -654,9 +657,18 @@ void buildDcGroupBlobs(uint3 gid: SV_GroupID) {
         writeHistogramSet(blobs, pre, params.dcLeaves, clusterInfo[dcSetOf(g)], 7, dcSetOf(g));
     }
     blobBits[2 + 2 * g] = pre.pos;
+}
 
-    // "mid": count - 1 (one AcMetadata entry per varblock), the AcMetadata
-    // stream's header: the kACMeta tree and its histograms (set 2 + 2g).
+/// "mid" of DC group g: count - 1 (one AcMetadata entry per varblock), the
+/// AcMetadata stream's header: the kACMeta tree and its histograms (set 2 + 2g).
+[shader("compute")]
+[numthreads(1, 1, 1)]
+void buildDcGroupMid(uint3 gid: SV_GroupID) {
+    const uint g = gid.x;
+    if (g >= params.numDcGroups) {
+        return;
+    }
+    const uint4 rect = dcGroups[g];
     SerialWriter mid;
     mid.base = (3 + 2 * g) * kBlobStrideWords;
     mid.pos = 0;
@@ -701,6 +713,7 @@ uint treeNodeTokens(StructuredBuffer<uint> tree, uint n, out uint t[5]) {
     return 5;
 }
 
+[noinline]
 void writeTreeFromNodes(RWStructuredBuffer<uint> buf, inout SerialWriter w, StructuredBuffer<uint> tree, uint numNodes) {
     for (uint i = 0; i < kMaxAlphabet; ++i) gHist[i] = 0;
     uint treeLen = 1;

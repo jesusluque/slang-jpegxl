@@ -68,7 +68,7 @@ void blendCanvas(uint3 tid: SV_DispatchThreadID) {
                 const float rna = na > 0.0f ? 1.0f / na : 0.0f;
                 o = (fgv[3 + e] * fa + bgv[3 + e] * ba * (1.0f - fa)) * rna;
             }
-        } else o = hasAlpha ? bgv[3 + e] + fgv[3 + e] * fa : bgv[3 + e] + fgv[3 + e];   // alpha-weighted add
+        } else o = !hasAlpha ? bgv[3 + e] + fgv[3 + e] : (e == a ? bgv[3 + e] : bgv[3 + e] + fgv[3 + e] * fa);   // alpha-weighted add (alpha.cc keeps the alpha channel itself)
         outv[3 + e] = o;
     }
     const uint mode = params.modes.x;

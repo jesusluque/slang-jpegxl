@@ -144,7 +144,7 @@ private:
     gpu::ComputeKernel                  rleScan_, rleHistograms_, uintConfigHist_, uintConfigChoose_;
     gpu::ComputeKernel                  jpegDecodeScan_, jpegToCoeffs_, jpegBlockCtx_, quantTableBlob_, changeBounds_, cropBytes_;
     gpu::ComputeKernel                  extractAlpha_, channelEntropy_, remapTokens_, modGroupSections_, modularGlobalBlob_;
-    gpu::ComputeKernel                  dcGroupBlobs_, globalBlobs_, layout_, blobEmit_;
+    gpu::ComputeKernel                  dcGroupPre_, dcGroupMid_, globalBlobs_, layout_, blobEmit_;
     gpu::PrefixSum                      prefixSum_;
     gpu::Buffer                         dequantAll_;   // every quant table kind, 3 channels each (kTableBase layout)
     gpu::Buffer                         orders_;       // the natural coefficient order of every bucket

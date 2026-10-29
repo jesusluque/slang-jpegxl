@@ -257,6 +257,10 @@ void decodeModularGlobals(uint3 tid: SV_DispatchThreadID) {
     if ((params.frameFlags & kFramePatches) != 0) {
         readPatchDictionary(d, params.xsize, params.ysize, params.refW, params.refH, params.numEc, window);
     }
+    if (d.error == kErrNone && (params.frameFlags & kFrameSplines) != 0) {
+        readSplines(d, params.xsize * params.ysize, window);
+        gsSetF(kGsCflBaseB, 1.0f);   // the default colour correlation the splines are dequantised with (y_to_x 0, y_to_b 1)
+    }
     if (d.error == kErrNone && (params.frameFlags & kFrameNoise) != 0) readNoise(d);
     if (d.error == kErrNone) decodeModularGlobal(d, modularGeom(params.colorChannels), window);
     arena[kGsDcGlobalBits] = d.br.pos - sections[0].x;
