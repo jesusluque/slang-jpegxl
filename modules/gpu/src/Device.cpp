@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <format>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -47,7 +48,12 @@ public:
             log::error("rhi: {}", message);
             lastError = message;
             break;
-        case rhi::DebugMessageType::Warning: log::warn("rhi: {}", message); break;
+        case rhi::DebugMessageType::Warning:
+            // The Metal compiler's "unused variable" notes come from results Slang stores and
+            // the kernels ignore (atomics' previous value, counts); they are noise at warn level.
+            if (std::string_view(message).find("-Wunused-variable") != std::string_view::npos) log::debug("rhi: {}", message);
+            else log::warn("rhi: {}", message);
+            break;
         default: log::debug("rhi: {}", message); break;
         }
     }
