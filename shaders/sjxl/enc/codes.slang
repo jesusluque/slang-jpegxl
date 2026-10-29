@@ -33,7 +33,8 @@ static const uint kSetContexts = 64;       // contexts of the DC group sets (tre
 /// Histogram sets: 0 the AC contexts, 1 + 2g the DC group g's DC stream, 2 + 2g its AcMetadata.
 uint setCtxBase(uint set) { return set == 0 ? 0 : params.numAcContexts + (set - 1) * kSetContexts; }
 uint setRegionBase(uint set) { return set * kAcClusters; }
-uint mapRegion() { return (1 + 2 * params.numDcGroups) * kAcClusters; }   // the context-map stream's own code
+uint mapRegion() { return (1 + 2 * params.numDcGroups + params.numEcSets) * kAcClusters; }   // the context-map stream's own code
+uint ecSet() { return 1 + 2 * params.numDcGroups; }
 static const int kPredictorZero = 0;
 static const int kPredictorGradient = 5;
 static const int kEpfSharpness = 4;   // what libjxl writes at every speed up to wombat
@@ -56,7 +57,10 @@ struct CodeParams {
     uint metaTreeNodes;
     uint metaLeaves;
     uint numAcContexts;   // the AC set's contexts (sets after it start at this index, kSetContexts each)
-    uint pad0, pad1, pad2;
+    uint numEcSets;       // 1 when a VarDCT frame carries an alpha channel (set 1 + 2 numDcGroups)
+    uint ecInGlobal;      // 1: the alpha channel fits a group and its stream goes into DcGlobal
+    uint ecLogAlpha;      // the alpha stream's ANS alphabet (6 at 8 bits, 7 at 16)
+    uint pad0;
 };
 
 StructuredBuffer<uint4>    dcGroups;   // bx0, by0, w, h in blocks
@@ -612,39 +616,6 @@ void buildDcGroupBlobs(uint3 gid: SV_GroupID) {
     blobBits[3 + 2 * g] = mid.pos;
 }
 
-[shader("compute")]
-[numthreads(1, 1, 1)]
-void buildGlobalBlobs(uint3 gid: SV_GroupID) {
-    if (gid.x != 0) {
-        return;
-    }
-    // DcGlobal: DC dequant default, quantizer, default block context map,
-    // default DC chroma-from-luma, no global modular tree.
-    SerialWriter dc;
-    dc.base = 0;
-    dc.pos = 0;
-    serialWrite(blobs, dc, 1, 1);
-    serialWriteU32(blobs, dc, distrBitsOffset(11, 1), distrBitsOffset(11, 2049), distrBitsOffset(12, 4097),
-                   distrBitsOffset(16, 8193), quantizer[0]);
-    serialWriteU32(blobs, dc, distrVal(16), distrBitsOffset(5, 1), distrBitsOffset(8, 1), distrBitsOffset(16, 1),
-                   quantizer[1]);
-    serialWrite(blobs, dc, 1, 1);
-    serialWrite(blobs, dc, 1, 1);
-    serialWrite(blobs, dc, 1, 0);
-    blobBits[0] = dc.pos;
-
-    // AcGlobal: dequant matrices default, one histogram set, natural orders,
-    // then the clustered AC histogram set.
-    SerialWriter ac;
-    ac.base = kBlobStrideWords;
-    ac.pos = 0;
-    serialWrite(blobs, ac, 1, 1);
-    serialWrite(blobs, ac, ceilLog2Nonzero(params.numGroups), 0);
-    serialWrite(blobs, ac, 2, 2);   // used_orders: Val(0) is the third distribution
-    writeHistogramSet(blobs, ac, kNumAcContexts, clusterInfo[0], kAcLogAlpha, 0);
-    blobBits[1] = ac.pos;
-}
-
 // --- Modular (lossless) frames -------------------------------------------------------
 
 /// The modular alphabet: 8-bit residual tokens stay below 64, 16-bit ones below 128.
@@ -691,7 +662,9 @@ void writeTreeFromNodes(RWStructuredBuffer<uint> buf, inout SerialWriter w, Stru
 /// The whole image's three channels as one ANS stream inside the blob (the
 /// global modular stream of an image no larger than a group): two passes, the
 /// size then the placement from the end.
-void writeModularImageStream(RWStructuredBuffer<uint> buf, inout SerialWriter w) {
+void writeModularImageStream(RWStructuredBuffer<uint> buf, inout SerialWriter w, uint set) {
+    const uint ctxBase = setCtxBase(set);
+    const uint regionBase = setRegionBase(set);
     uint total = 32;
     for (uint pass = 1; pass <= 2; ++pass) {
         uint state = kAnsSignature << 16;
@@ -703,7 +676,7 @@ void writeModularImageStream(RWStructuredBuffer<uint> buf, inout SerialWriter w)
                     const uint ctx = t >> 18, value = t & 0x3FFFFu;
                     uint tok, nbits, raw;
                     hybridEncode(value, tok, nbits, raw);
-                    const uint cluster = ctxMap[ctx];
+                    const uint cluster = regionBase + ctxMap[ctxBase + ctx];
                     const uint e = ansInfo[cluster * kAnsInfoStride + tok];
                     if (pass == 2) {
                         pos -= nbits;
@@ -723,6 +696,57 @@ void writeModularImageStream(RWStructuredBuffer<uint> buf, inout SerialWriter w)
         if (pass == 2) serialWriteAt(buf, w.base, w.pos, 32, state);
     }
     w.pos += total;
+}
+
+/// The global modular part of a VarDCT frame with an alpha channel: the global
+/// tree (treeNodes) with its clustered ANS histograms, the GroupHeader (global
+/// tree, default WP header, no transforms), and the channel itself when the
+/// image fits a group (else the AC groups carry it).
+void writeExtraChannelGlobal(RWStructuredBuffer<uint> buf, inout SerialWriter w) {
+    serialWrite(buf, w, 1, 1);   // has_tree
+    writeTreeFromNodes(buf, w, treeNodes, params.numTreeNodes);
+    writeHistogramSet(buf, w, params.numLeaves, clusterInfo[ecSet()], params.ecLogAlpha, ecSet());
+    serialWrite(buf, w, 1, 1);   // use_global_tree
+    serialWrite(buf, w, 1, 1);   // weighted header all_default
+    serialWrite(buf, w, 2, 0);   // num_transforms = 0
+    if (params.ecInGlobal != 0) writeModularImageStream(buf, w, ecSet());
+}
+
+[shader("compute")]
+[numthreads(1, 1, 1)]
+void buildGlobalBlobs(uint3 gid: SV_GroupID) {
+    if (gid.x != 0) {
+        return;
+    }
+    // DcGlobal: DC dequant default, quantizer, default block context map,
+    // default DC chroma-from-luma, no global modular tree.
+    SerialWriter dc;
+    dc.base = 0;
+    dc.pos = 0;
+    serialWrite(blobs, dc, 1, 1);
+    serialWriteU32(blobs, dc, distrBitsOffset(11, 1), distrBitsOffset(11, 2049), distrBitsOffset(12, 4097),
+                   distrBitsOffset(16, 8193), quantizer[0]);
+    serialWriteU32(blobs, dc, distrVal(16), distrBitsOffset(5, 1), distrBitsOffset(8, 1), distrBitsOffset(16, 1),
+                   quantizer[1]);
+    serialWrite(blobs, dc, 1, 1);   // default block context map
+    serialWrite(blobs, dc, 1, 1);   // default DC chroma-from-luma
+    if (params.numEcSets != 0) {
+        writeExtraChannelGlobal(blobs, dc);
+    } else {
+        serialWrite(blobs, dc, 1, 0);   // no global modular tree (and no modular image)
+    }
+    blobBits[0] = dc.pos;
+
+    // AcGlobal: dequant matrices default, one histogram set, natural orders,
+    // then the clustered AC histogram set.
+    SerialWriter ac;
+    ac.base = kBlobStrideWords;
+    ac.pos = 0;
+    serialWrite(blobs, ac, 1, 1);
+    serialWrite(blobs, ac, ceilLog2Nonzero(params.numGroups), 0);
+    serialWrite(blobs, ac, 2, 2);   // used_orders: Val(0) is the third distribution
+    writeHistogramSet(blobs, ac, kNumAcContexts, clusterInfo[0], kAcLogAlpha, 0);
+    blobBits[1] = ac.pos;
 }
 
 /// DcGlobal of a lossless Modular frame: the DC dequant defaults, the global
@@ -749,7 +773,7 @@ void buildModularGlobalBlob(uint3 gid: SV_GroupID) {
     serialWrite(blobs, dc, 3, 0);        // ... = 0
     serialWrite(blobs, dc, 2, 0);        // rct_type: Val(6), YCoCg
     if (params.width <= params.groupDim && params.height <= params.groupDim) {
-        writeModularImageStream(blobs, dc);
+        writeModularImageStream(blobs, dc, 0);
     }
     blobBits[0] = dc.pos;
 }

@@ -19,7 +19,8 @@ libjxl's entropy model, libjxl's adaptive quant field, chroma-from-luma,
 Gaborish + EPF, the weighted predictor and fixed trees for the DC, and ANS
 with clustered contexts throughout: at the file size `cjxl -e 5` produces it
 scores slightly above it on 4K photos (+0.1 to +0.6 SSIMULACRA2) and within
-a point or two on 200-pixel images. `--lossless` writes a Modular frame
+a point or two on 200-pixel images; alpha (coded losslessly as an extra
+channel) and 16-bit input are accepted. `--lossless` writes a Modular frame
 (YCoCg, weighted predictor, fixed tree, ANS; RGB or RGBA, 8 or 16 bits)
 within about 2 % of `cjxl -d 0 -e 5` on the test images. M3 continues with DC coding, the strategy
 and quant-field heuristics, and better lossless trees.

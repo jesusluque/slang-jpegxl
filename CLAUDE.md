@@ -107,7 +107,7 @@ Modules are static libraries `sjxl_<name>` aliased `sjxl::<name>`
 | codestream | CPU-side syntax only: `BitWriter`, U32/U64/F16 field coders, SizeHeader, ImageMetadata, FrameHeader, LoopFilter, TOC (`Headers.h`); `Tables.h`: quantizer params from a distance, DCT8 dequant weights, natural order, computed from libjxl formulas |
 | image | file I/O only: PNG/PPM/JPEG via stb (`readRgb8` 8-bit RGB, `readImage8` keeps alpha, `readImage` keeps alpha and 16-bit depth; `Rgb8` has `channels` 3/4 and `bitDepth` 8/16; `writePng` writes 16-bit PNGs itself; `readFile`, `writeFile`) |
 | metrics | `metrics::compare`: PSNR, largest difference and where, measured by `shaders/sjxl/metrics/compare.slang`; what tests and `sjxl compare` use |
-| encoder | `enc::Encoder::encode(Rgb8, Options{lossless, distance, adaptiveQuant, chromaFromLuma, loopFilter, acClusters})`: lossless → `encodeLossless` (modular: rctYCoCg → modHist → cluster → buildModularGlobalBlob (tree, histograms, RCT header, the stream when the image fits a group) → modGroupSections (ANS per group)); lossy → the VarDCT pipeline (`shaders/sjxl/enc/`): xyb → aq (quant field) → gaborish (inverse) → cfl (dct, per-tile least squares) → quantize (AdjustQuantBlockAC, dead zones) → strategy + large (transform selection per 32×32 superblock, then the 64-pixel families per 64×64 region) → transform (adjustQuantField, dctRows/dctCols for any varblock, dcFromLlf, acTokenize) → cfl → quantize (per varblock) → dc_tokens (dcTokenize: WP + kWPFixedDC per DC group; metaTokenize per item with kACMeta) → cluster per set → codes (trees, ANS histograms and context maps per set) → ac_sections + dcGroupSections (ANS per group, count then emit) → layout → emit |
+| encoder | `enc::Encoder::encode(Rgb8, Options{lossless, distance, adaptiveQuant, chromaFromLuma, loopFilter, acClusters, acStrategy, acsLambda, acsSpecials})`: RGB/RGBA, 8/16-bit; lossless → `encodeLossless` (modular: rctYCoCg → modHist → cluster → buildModularGlobalBlob (tree, histograms, RCT header, the stream when the image fits a group) → modGroupSections (ANS per group)); lossy → the VarDCT pipeline (`shaders/sjxl/enc/`): xyb → aq (quant field) → gaborish (inverse) → cfl (dct, per-tile least squares) → quantize (AdjustQuantBlockAC, dead zones) → strategy + large (transform selection per 32×32 superblock, then the 64-pixel families per 64×64 region) → transform (adjustQuantField, dctRows/dctCols for any varblock, dcFromLlf, acTokenize) → cfl → quantize (per varblock) → dc_tokens (dcTokenize: WP + kWPFixedDC per DC group; metaTokenize per item with kACMeta) → cluster per set → codes (trees, ANS histograms and context maps per set) → ac_sections + dcGroupSections (ANS per group, count then emit) → layout → emit |
 | decoder | `dec::Decoder::decode(bytes)`: `codestream::parse` on the CPU, then `shaders/sjxl/dec/`: sections (one thread per section: globals, DC groups, AC groups; libraries entropy/modular/frame/modframe .slangh over one `arena` buffer) → VarDCT: tables → dc_finalize → transforms; Modular: finalise (inverse transforms) → modular_out (channels to planes) → filters → output |
 | decoder (M2) | `dec::Decoder`: the GPU decode pipeline |
 
@@ -149,8 +149,12 @@ dumps a file's quant field and strategy map, `SJXL_ENC_MAPS=f` (plus
 `SJXL_ENC_NO_ADJUST=1`) encodes with them. PNG gAMA/cHRM/sRGB chunks are
 honoured as libjxl does (`image::Rgb8::gamma`; ICC profiles are not).
 
-Lossless (`--lossless`, RGB or RGBA at 8 or 16 bits; the lossy path takes
-8-bit RGB): a Modular frame, YCoCg RCT over the colour channels (alpha is the
+Both paths take RGB or RGBA at 8 or 16 bits (`image::readImage`). In a lossy
+frame the alpha channel is the extra channel: a one-channel modular image
+tokenised like the lossless one, its global part at the end of DcGlobal
+(`codes.slang writeExtraChannelGlobal`) and its groups after the AC stream in
+every AC group section (`ac_sections.slang`), in its own histogram set after
+the DC groups' sets. Lossless (`--lossless`): a Modular frame, YCoCg RCT over the colour channels (alpha is the
 fourth modular channel and an extra channel in the headers), per channel the
 weighted predictor with libjxl's fixed WP-property tree or Gradient with the
 gradient tree, whichever `channelEntropy` estimates cheaper (`modTokenize`

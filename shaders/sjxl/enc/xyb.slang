@@ -12,10 +12,11 @@ struct XybParams {
     uint  paddedHeight;
     uint  transfer;      // 0 sRGB, 2 power (gamma)
     float gammaInv;      // linear = v ^ gammaInv for transfer 2
-    uint  pad0, pad1;
+    uint  numChannels;   // 3, or 4 with alpha (skipped here)
+    uint  bitDepth;      // 8 or 16
 };
 
-StructuredBuffer<uint>     rgb8;    // width*height*3 bytes, packed little-endian
+StructuredBuffer<uint>     rgb8;    // width*height*numChannels samples of bitDepth/8 bytes, packed little-endian
 RWStructuredBuffer<float>  xyb;     // 3 planes of paddedWidth*paddedHeight
 ConstantBuffer<XybParams>  params;
 
@@ -29,6 +30,12 @@ float toLinear(float v) {
 
 uint byteAt(uint index) {
     return (rgb8[index >> 2] >> ((index & 3) * 8)) & 0xFFu;
+}
+
+/// Sample `index` as 0..1 (16-bit samples are little-endian pairs).
+float sampleAt(uint index) {
+    if (params.bitDepth == 8) return float(byteAt(index)) * (1.0f / 255.0f);
+    return float(byteAt(2 * index) | (byteAt(2 * index + 1) << 8)) * (1.0f / 65535.0f);
 }
 
 // cms/opsin_params.h
@@ -47,10 +54,10 @@ void rgbToXyb(uint3 tid: SV_DispatchThreadID) {
     }
     const uint sx = min(x, params.width - 1);
     const uint sy = min(y, params.height - 1);
-    const uint p = (sy * params.width + sx) * 3;
-    const float r = toLinear(float(byteAt(p + 0)) * (1.0f / 255.0f));
-    const float g = toLinear(float(byteAt(p + 1)) * (1.0f / 255.0f));
-    const float b = toLinear(float(byteAt(p + 2)) * (1.0f / 255.0f));
+    const uint p = (sy * params.width + sx) * params.numChannels;
+    const float r = toLinear(sampleAt(p + 0));
+    const float g = toLinear(sampleAt(p + 1));
+    const float b = toLinear(sampleAt(p + 2));
 
     float m0 = max(kM00 * r + kM01 * g + kM02 * b + kBias, 0.0f);
     float m1 = max(kM10 * r + kM11 * g + kM12 * b + kBias, 0.0f);

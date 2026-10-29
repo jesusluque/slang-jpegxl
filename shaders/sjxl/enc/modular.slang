@@ -26,7 +26,7 @@ struct ModParams {
     uint bitDepth;    // 8 or 16
     uint wpWordsPerGroup;
     uint pass;        // modTokenize: which predictor pass (tokens and histograms land at its offset)
-    uint pad2;
+    uint ctxBase;     // remapTokens: the first context of this stream's set in ctxHist
 };
 
 StructuredBuffer<uint>     rgb8;          // width * height * numChannels samples of bitDepth / 8 bytes, little-endian
@@ -80,6 +80,16 @@ void rctYCoCg(uint3 tid: SV_DispatchThreadID) {
     planes[1 * plane + i] = co;
     planes[2 * plane + i] = cg;
     if (nc > 3) planes[3 * plane + i] = sampleAt(i * nc + 3);
+}
+
+/// One thread per pixel: channel 3 (alpha) of the input as plane 0, for a
+/// VarDCT frame's extra channel.
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void extractAlpha(uint3 tid: SV_DispatchThreadID) {
+    if (tid.x >= params.width || tid.y >= params.height) return;
+    const uint i = tid.y * params.width + tid.x;
+    planes[i] = sampleAt(i * params.numChannels + 3);
 }
 
 /// One thread per group: its channels in raster order through the weighted
@@ -166,7 +176,7 @@ void remapTokens(uint3 tid: SV_DispatchThreadID) {
     uint tok, nbits, raw;
     hybridEncode(value, tok, nbits, raw);
     uint before;
-    InterlockedAdd(ctxHist[ctx * kHistBins + min(tok, kHistBins - 1)], 1u, before);
+    InterlockedAdd(ctxHist[(params.ctxBase + ctx) * kHistBins + min(tok, kHistBins - 1)], 1u, before);
 }
 
 struct AnsWriter {

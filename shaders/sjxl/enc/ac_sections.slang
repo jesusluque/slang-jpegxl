@@ -22,8 +22,13 @@ struct AcSectionParams {
     uint numGroups;
     uint numDcGroups;
     uint mode;          // 1 count, 2 emit
+    uint ecInGroups;    // 1: an alpha channel's modular group follows the AC stream in every section
+    uint ecCtxBase;     // the alpha set's first context in ctxMap
+    uint ecRegionBase;  // its first code region
+    uint width;         // image size in pixels (the alpha channel is not block-padded)
+    uint height;
+    uint groupDim;
     uint pad0;
-    uint pad1;
 };
 
 StructuredBuffer<uint4>    groups;         // AC groups: bx0, by0, w, h (blocks)
@@ -36,7 +41,9 @@ StructuredBuffer<uint>     ctxMap;         // AC context -> cluster
 StructuredBuffer<uint>     ansInfo;        // cluster c: freq | start << 16 per symbol at c * 256
 StructuredBuffer<uint>     ansReverse;     // cluster c: slots at c * 4096
 StructuredBuffer<uint>     sectionStart;   // mode 2: bit offset of each section
-RWStructuredBuffer<uint>   acSectionBits;  // mode 1 output: bits per group
+StructuredBuffer<uint>     ecTokens;       // the alpha channel's tokens per pixel (ctx << 18 | value)
+RWStructuredBuffer<uint>   acSectionBits;  // mode 1 output: bits per group (AC stream + the alpha group)
+RWStructuredBuffer<uint>   acOnlyBits;     // mode 1 output: the AC stream's bits alone
 RWStructuredBuffer<uint>   body;           // mode 2 output
 ConstantBuffer<AcSectionParams> params;
 
@@ -49,10 +56,10 @@ struct AnsWriter {
     uint bits;    // mode 1: bits so far
 };
 
-void put(inout AnsWriter aw, uint ctx, uint value) {
+void putIn(inout AnsWriter aw, uint ctxBase, uint regionBase, uint ctx, uint value) {
     uint tok, nbits, raw;
     hybridEncode(value, tok, nbits, raw);
-    const uint cluster = ctxMap[ctx];
+    const uint cluster = regionBase + ctxMap[ctxBase + ctx];
     const uint e = ansInfo[cluster * kAnsInfoStride + tok];
     const uint freq = e & 0xFFFFu;
     const uint start = e >> 16;
@@ -69,6 +76,8 @@ void put(inout AnsWriter aw, uint ctx, uint value) {
     aw.bits += nbits + ansN;
 }
 
+void put(inout AnsWriter aw, uint ctx, uint value) { putIn(aw, 0, 0, ctx, value); }
+
 [shader("compute")]
 [numthreads(1, 1, 1)]
 void acSections(uint3 tid: SV_DispatchThreadID) {
@@ -82,7 +91,7 @@ void acSections(uint3 tid: SV_DispatchThreadID) {
     aw.mode = params.mode;
     aw.state = kAnsSignature << 16;
     aw.bits = 32;
-    aw.pos = aw.mode == 2 ? sectionStart[section] + acSectionBits[g] : 0;
+    aw.pos = aw.mode == 2 ? sectionStart[section] + acOnlyBits[g] : 0;
     for (int by = int(rect.w) - 1; by >= 0; --by) {
         for (int bx = int(rect.z) - 1; bx >= 0; --bx) {
             const uint block = (rect.y + uint(by)) * params.blocksX + rect.x + uint(bx);
@@ -100,8 +109,35 @@ void acSections(uint3 tid: SV_DispatchThreadID) {
         }
     }
     if (aw.mode == 1) {
-        acSectionBits[g] = aw.bits;
+        acOnlyBits[g] = aw.bits;
     } else {
         emitAtomic(body, sectionStart[section], 32, aw.state);
+    }
+    if (params.ecInGroups == 0) {
+        if (aw.mode == 1) acSectionBits[g] = aw.bits;
+        return;
+    }
+    // The alpha channel's modular group: GroupHeader (global tree, default WP
+    // header, no transforms: 4 bits), then its ANS stream over the group's pixels.
+    const uint x0 = rect.x * 8, y0 = rect.y * 8;
+    const uint w = min(params.groupDim, params.width - x0);
+    const uint h = min(params.groupDim, params.height - y0);
+    AnsWriter ew;
+    ew.mode = params.mode;
+    ew.state = kAnsSignature << 16;
+    ew.bits = 4 + 32;
+    const uint ecStart = sectionStart[section] + acOnlyBits[g];
+    ew.pos = ew.mode == 2 ? sectionStart[section] + acSectionBits[g] : 0;
+    for (int y = int(h) - 1; y >= 0; --y) {
+        for (int x = int(w) - 1; x >= 0; --x) {
+            const uint t = ecTokens[(y0 + uint(y)) * params.width + x0 + uint(x)];
+            putIn(ew, params.ecCtxBase, params.ecRegionBase, t >> 18, t & 0x3FFFFu);
+        }
+    }
+    if (ew.mode == 1) {
+        acSectionBits[g] = aw.bits + ew.bits;
+    } else {
+        emitAtomic(body, ecStart, 4, 0x3u);
+        emitAtomic(body, ecStart + 4, 32, ew.state);
     }
 }

@@ -167,6 +167,36 @@ TEST_CASE("lossless encodes of alpha and 16-bit images decode bit-exact", "[enco
     CHECK(metrics->maxAbsDiff == 0);
 }
 
+TEST_CASE("lossy encodes of alpha and 16-bit images decode with their channels", "[encoder][alpha][depth16][conformance]") {
+    const std::filesystem::path djxl = test::findTool("djxl");
+    if (djxl.empty()) {
+        SKIP("djxl (Homebrew jpeg-xl) is not installed");
+    }
+    const auto [alpha, deep] = GENERATE(table<bool, bool>({{true, false}, {false, true}, {true, true}}));
+    CAPTURE(alpha, deep);
+    const image::Rgb8 source = variantImage(alpha, deep);
+    enc::Options options;
+    options.distance = 1.0f;
+    auto encoded = encoder()->encode(source, options);
+    REQUIRE(encoded);
+    const std::filesystem::path jxl = test::scratchDir() / std::format("lossy_variant_{}_{}.jxl", alpha, deep);
+    const std::filesystem::path png = test::scratchDir() / std::format("lossy_variant_{}_{}.decoded.png", alpha, deep);
+    REQUIRE(image::writeFile(jxl, *encoded));
+    std::filesystem::remove(png);
+    REQUIRE(test::run(std::format("\"{}\" \"{}\" \"{}\" >/dev/null 2>&1", djxl.string(), jxl.string(), png.string())));
+    auto decoded = image::readImage(png);
+    REQUIRE(decoded);
+    REQUIRE(decoded->channels == source.channels);
+    REQUIRE(decoded->bitDepth == source.bitDepth);
+    auto metrics = test::compare(source, *decoded);
+    REQUIRE(metrics);
+    WARN(std::format("lossy alpha {} 16-bit {}: {} bytes, PSNR {:.2f} dB, max diff {} on channel {}", alpha, deep, encoded->size(),
+                     metrics->psnr, metrics->maxAbsDiff, metrics->maxAtChannel));
+    CHECK(metrics->psnr >= 30.0);
+    // The alpha channel is coded losslessly: the largest difference must be in a colour channel.
+    if (alpha) CHECK(metrics->maxAtChannel < 3);
+}
+
 TEST_CASE("encoding is deterministic", "[encoder]") {
     auto source = image::readRgb8(test::testData("sveti_crop_257x129.png"));
     REQUIRE(source);

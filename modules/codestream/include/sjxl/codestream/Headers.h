@@ -22,7 +22,7 @@ constexpr uint32_t kColorTileDimBlocks = 8;   ///< chroma-from-luma tile: 64 px
 /// transform_data (all_default). Byte-aligned on exit.
 /// `gamma` 0: the all_default sRGB encoding; else a gamma transfer (e.g. 0.45455)
 /// over sRGB primaries and D65.
-void writeCodestreamHeaders(BitWriter& w, uint32_t xsize, uint32_t ysize, float gamma = 0.0f);
+void writeCodestreamHeaders(BitWriter& w, uint32_t xsize, uint32_t ysize, float gamma = 0.0f, uint32_t bitDepth = 8, bool alpha = false);
 /// Signature, SizeHeader and the ImageMetadata of an 8- or 16-bit sRGB image
 /// that is not XYB encoded (a lossless Modular frame), with an unassociated
 /// alpha channel of the same depth when `alpha`. Byte-aligned on exit.
@@ -40,7 +40,7 @@ struct FrameParams {
 };
 
 /// A single-pass, full-frame, last VarDCT frame in XYB. Not byte-aligned on exit.
-void writeFrameHeader(BitWriter& w, const FrameParams& params);
+void writeFrameHeader(BitWriter& w, const FrameParams& params, uint32_t numExtraChannels = 0);
 
 /// The TOC (no permutation) for `sectionBytes`, one entry per section, or one
 /// entry when the frame has a single group and pass. Byte-aligned on entry and exit.

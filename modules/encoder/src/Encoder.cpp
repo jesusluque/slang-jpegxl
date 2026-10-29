@@ -111,6 +111,7 @@ Result<std::unique_ptr<Encoder>> Encoder::create(std::shared_ptr<gpu::ShaderLibr
     SJXL_ASSIGN(enc->acSections_, gpu::ComputeKernel::create(lib, "sjxl/enc/ac_sections", "acSections"));
     SJXL_ASSIGN(enc->rctYCoCg_, gpu::ComputeKernel::create(lib, "sjxl/enc/modular", "rctYCoCg"));
     SJXL_ASSIGN(enc->modTokenize_, gpu::ComputeKernel::create(lib, "sjxl/enc/modular", "modTokenize"));
+    SJXL_ASSIGN(enc->extractAlpha_, gpu::ComputeKernel::create(lib, "sjxl/enc/modular", "extractAlpha"));
     SJXL_ASSIGN(enc->channelEntropy_, gpu::ComputeKernel::create(lib, "sjxl/enc/modular", "channelEntropy"));
     SJXL_ASSIGN(enc->remapTokens_, gpu::ComputeKernel::create(lib, "sjxl/enc/modular", "remapTokens"));
     SJXL_ASSIGN(enc->modGroupSections_, gpu::ComputeKernel::create(lib, "sjxl/enc/modular", "modGroupSections"));
@@ -169,9 +170,6 @@ Result<std::vector<uint8_t>> Encoder::encode(const image::Rgb8& image, const Opt
     if (options.lossless) {
         return encodeLossless(image, options);
     }
-    if (image.channels != 3 || image.bitDepth != 8) {
-        return Error(ErrorCode::Unsupported, "lossy encoding of alpha or 16-bit input (use --lossless)");
-    }
     if (!(options.distance > 0.0f) || options.distance > 25.0f) {
         return Error::make(ErrorCode::InvalidArgument, "distance {} is not in (0, 25]", options.distance);
     }
@@ -229,10 +227,16 @@ Result<std::vector<uint8_t>> Encoder::encode(const image::Rgb8& image, const Opt
     SJXL_ASSIGN(auto groups, gpu::Buffer::fromSpan<Uint4>(dev, acRects, "enc.groups"));
     SJXL_ASSIGN(auto dcGroups, gpu::Buffer::fromSpan<Uint4>(dev, dcRects, "enc.dcGroups"));
 
-    // Histogram sets: 0 the AC contexts, 1 + 2g the DC stream of DC group g, 2 + 2g its AcMetadata.
-    const uint32_t numSets = 1 + 2 * numDcGroups;
-    const uint32_t numContextsAll = kNumAcContexts + 2 * numDcGroups * kSetContexts;
+    // Histogram sets: 0 the AC contexts, 1 + 2g the DC stream of DC group g, 2 + 2g its
+    // AcMetadata, then the alpha channel's modular stream when there is one.
+    const bool hasAlpha = image.channels == 4;
+    const bool ecFits = image.width <= dim.groupDim && image.height <= dim.groupDim;
+    const uint32_t numEcSets = hasAlpha ? 1 : 0;
+    const uint32_t ecSet = 1 + 2 * numDcGroups;
+    const uint32_t numSets = 1 + 2 * numDcGroups + numEcSets;
+    const uint32_t numContextsAll = kNumAcContexts + (2 * numDcGroups + numEcSets) * kSetContexts;
     const uint32_t numCodeRegions = numSets * kAcClusters;
+    const uint64_t pixels = uint64_t{image.width} * image.height;
     const uint32_t numBlobRegions = 2 + 2 * numDcGroups;
     SJXL_ASSIGN(auto hist, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{numCodeRegions} * kCodeStride, "enc.hist"));
     SJXL_ASSIGN(auto codes, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{numCodeRegions} * kCodeStride, "enc.codes"));
@@ -257,6 +261,19 @@ Result<std::vector<uint8_t>> Encoder::encode(const image::Rgb8& image, const Opt
     const uint32_t wpWordsPerGroup = 5 * 2 * (codestream::kDcGroupDimBlocks + 2);
     SJXL_ASSIGN(auto wpScratch, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{numDcGroups} * wpWordsPerGroup, "enc.wpScratch"));
     SJXL_ASSIGN(auto dcTokens, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{3} * nblocks, "enc.dcTokens"));
+    // The alpha channel as a modular stream (the lossless machinery over one plane).
+    const uint64_t alphaPixels = hasAlpha ? pixels : 4;
+    SJXL_ASSIGN(auto alphaPlane, gpu::Buffer::ofType<int32_t>(dev, alphaPixels, "enc.alphaPlane"));
+    SJXL_ASSIGN(auto alphaTokens, gpu::Buffer::ofType<uint32_t>(dev, alphaPixels, "enc.alphaTokens"));
+    SJXL_ASSIGN(auto alphaPassTokens, gpu::Buffer::ofType<uint32_t>(dev, 2 * alphaPixels, "enc.alphaPassTokens"));
+    SJXL_ASSIGN(auto alphaPassHist, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{2} * kSetContexts * kHistBins, "enc.alphaPassHist"));
+    SJXL_ASSIGN(auto alphaPassBits, gpu::Buffer::ofType<float>(dev, 2, "enc.alphaPassBits"));
+    const uint32_t alphaWpWords = 5 * 2 * (dim.groupDim + 2);
+    SJXL_ASSIGN(auto alphaWpScratch, gpu::Buffer::ofType<uint32_t>(dev, hasAlpha ? uint64_t{numGroups} * alphaWpWords : 4, "enc.alphaWp"));
+    SJXL_ASSIGN(auto acOnlyBits, gpu::Buffer::ofType<uint32_t>(dev, numGroups, "enc.acOnlyBits"));
+    uint32_t alphaLeaves = 0, alphaNodes = 0;
+    gpu::Buffer alphaTree;
+    SJXL_ASSIGN(alphaTree, gpu::Buffer::ofType<uint32_t>(dev, 8, "enc.alphaTree"));
     SJXL_ASSIGN(auto acSectionBits, gpu::Buffer::ofType<uint32_t>(dev, numGroups, "enc.acSectionBits"));
 
     const uint32_t metaItems = numDcGroups * kMetaItemsPerGroup;
@@ -281,6 +298,8 @@ Result<std::vector<uint8_t>> Encoder::encode(const image::Rgb8& image, const Opt
         c["params"]["paddedHeight"].setData(dim.ysizePadded);
         c["params"]["transfer"].setData(uint32_t{image.gamma > 0.0f ? 2u : 0u});
         c["params"]["gammaInv"].setData(image.gamma > 0.0f ? 1.0f / image.gamma : 1.0f);
+        c["params"]["numChannels"].setData(image.channels);
+        c["params"]["bitDepth"].setData(image.bitDepth);
     });
 
     // The quant field (from the planes before the inverse Gaborish), then the
@@ -506,6 +525,74 @@ Result<std::vector<uint8_t>> Encoder::encode(const image::Rgb8& image, const Opt
     };
     dcTokenize_.dispatch(batch, {numDcGroups, 1, 1}, [&](rhi::ShaderCursor c) { bindDc(c, 0, dummy_); });
     metaTokenize_.dispatch(batch, {metaItems, 1, 1}, [&](rhi::ShaderCursor c) { bindDc(c, 0, dummy_); });
+    if (hasAlpha) {
+        // The alpha channel: both predictor passes, the choice (bookkeeping on two
+        // numbers), the frame's global tree and the remapped tokens in the alpha set.
+        uint32_t wpLeaves = 0, gradLeaves = 0;
+        const std::vector<uint32_t> wpTree = fixedTree(kModPropWp, kPredWeighted, pixels, wpLeaves);
+        const std::vector<uint32_t> gradTree = fixedTree(kModPropGradient, kPredGradient, pixels, gradLeaves);
+        SJXL_ASSIGN(auto wpTreeBuf, gpu::Buffer::fromSpan<uint32_t>(dev, wpTree, "enc.alphaWpTree"));
+        SJXL_ASSIGN(auto gradTreeBuf, gpu::Buffer::fromSpan<uint32_t>(dev, gradTree, "enc.alphaGradTree"));
+        SJXL_ASSIGN(auto choice, gpu::Buffer::ofType<uint32_t>(dev, 1, "enc.alphaChoice"));
+        SJXL_ASSIGN(auto leafMapBuf, gpu::Buffer::ofType<uint32_t>(dev, kSetContexts, "enc.alphaLeafMap"));
+        const auto bindAlpha = [&](rhi::ShaderCursor c, const gpu::Buffer& tree, uint32_t pass, const gpu::Buffer& choiceBuf,
+                                   const gpu::Buffer& leafMapB) {
+            c["rgb8"].setBinding(rgb.rhi());
+            c["planes"].setBinding(alphaPlane.rhi());
+            c["planesIn"].setBinding(alphaPlane.rhi());
+            c["treeNodes"].setBinding(tree.rhi());
+            c["wpScratch"].setBinding(alphaWpScratch.rhi());
+            c["passTokens"].setBinding(alphaPassTokens.rhi());
+            c["passHist"].setBinding(alphaPassHist.rhi());
+            c["passBits"].setBinding(alphaPassBits.rhi());
+            c["choice"].setBinding(choiceBuf.rhi());
+            c["leafMap"].setBinding(leafMapB.rhi());
+            c["modTokens"].setBinding(alphaTokens.rhi());
+            c["ctxHist"].setBinding(ctxHist.rhi());
+            c["ctxMap"].setBinding(ctxMap.rhi());
+            c["ansInfo"].setBinding(ansInfo.rhi());
+            c["ansReverse"].setBinding(ansReverse.rhi());
+            c["groupStart"].setBinding(dummy_.rhi());
+            c["groupBits"].setBinding(dummy_.rhi());
+            c["body"].setBinding(dummy_.rhi());
+            c["params"]["width"].setData(image.width);
+            c["params"]["height"].setData(image.height);
+            c["params"]["groupDim"].setData(dim.groupDim);
+            c["params"]["groupsX"].setData(dim.xsizeGroups);
+            c["params"]["numGroups"].setData(numGroups);
+            c["params"]["numLeaves"].setData(alphaLeaves);
+            c["params"]["mode"].setData(0u);
+            c["params"]["numChannels"].setData(image.channels);
+            c["params"]["bitDepth"].setData(image.bitDepth);
+            c["params"]["wpWordsPerGroup"].setData(alphaWpWords);
+            c["params"]["pass"].setData(pass);
+            c["params"]["ctxBase"].setData(kNumAcContexts + (ecSet - 1) * kSetContexts);
+        };
+        extractAlpha_.dispatch(batch, {image.width, image.height, 1}, [&](rhi::ShaderCursor c) { bindAlpha(c, wpTreeBuf, 0, choice, leafMapBuf); });
+        // modTokenize reads one channel: the alpha plane is plane 0 of a one-channel image.
+        const auto bindAlphaOne = [&](rhi::ShaderCursor c, const gpu::Buffer& tree, uint32_t pass, const gpu::Buffer& choiceBuf,
+                                      const gpu::Buffer& leafMapB) {
+            bindAlpha(c, tree, pass, choiceBuf, leafMapB);
+            c["params"]["numChannels"].setData(1u);
+        };
+        modTokenize_.dispatch(batch, {numGroups, 1, 1}, [&](rhi::ShaderCursor c) { bindAlphaOne(c, wpTreeBuf, 0, choice, leafMapBuf); });
+        modTokenize_.dispatch(batch, {numGroups, 1, 1}, [&](rhi::ShaderCursor c) { bindAlphaOne(c, gradTreeBuf, 1, choice, leafMapBuf); });
+        channelEntropy_.dispatch(batch, {2, 1, 1}, [&](rhi::ShaderCursor c) { bindAlphaOne(c, wpTreeBuf, 0, choice, leafMapBuf); });
+        SJXL_TRY(batch.submit(true));
+        SJXL_ASSIGN(const std::vector<float> bitsHost, alphaPassBits.readAll<float>(dev));
+        const uint32_t chosen = bitsHost[0] <= bitsHost[1] ? 0u : 1u;
+        const std::vector<uint32_t> treeWords = chosen == 0 ? wpTree : gradTree;
+        alphaLeaves = chosen == 0 ? wpLeaves : gradLeaves;
+        alphaNodes = static_cast<uint32_t>(treeWords.size() / kModTreeWords);
+        std::vector<uint32_t> leafMapHost(kSetContexts);
+        for (uint32_t j = 0; j < kSetContexts; ++j) leafMapHost[j] = j;
+        const std::vector<uint32_t> choiceHost{chosen};
+        SJXL_ASSIGN(alphaTree, gpu::Buffer::fromSpan<uint32_t>(dev, treeWords, "enc.alphaTree"));
+        SJXL_ASSIGN(auto choiceB, gpu::Buffer::fromSpan<uint32_t>(dev, choiceHost, "enc.alphaChoice"));
+        SJXL_ASSIGN(auto leafMapB, gpu::Buffer::fromSpan<uint32_t>(dev, leafMapHost, "enc.alphaLeafMap"));
+        remapTokens_.dispatch(batch, {static_cast<uint32_t>(pixels), 1, 1}, [&](rhi::ShaderCursor c) { bindAlphaOne(c, alphaTree, 0, choiceB, leafMapB); });
+        stats_.alphaPredictor = chosen;
+    }
     const auto bindSections = [&](rhi::ShaderCursor c, uint32_t mode, const gpu::Buffer& body) {
         c["groups"].setBinding(groups.rhi());
         c["acs"].setBinding(acs.rhi());
@@ -517,7 +604,9 @@ Result<std::vector<uint8_t>> Encoder::encode(const image::Rgb8& image, const Opt
         c["ansInfo"].setBinding(ansInfo.rhi());
         c["ansReverse"].setBinding(ansReverse.rhi());
         c["sectionStart"].setBinding(sectionStart.rhi());
+        c["ecTokens"].setBinding(alphaTokens.rhi());
         c["acSectionBits"].setBinding(acSectionBits.rhi());
+        c["acOnlyBits"].setBinding(acOnlyBits.rhi());
         c["body"].setBinding(body.rhi());
         c["params"]["nblocks"].setData(nblocks);
         c["params"]["blocksX"].setData(dim.xsizeBlocks);
@@ -525,6 +614,12 @@ Result<std::vector<uint8_t>> Encoder::encode(const image::Rgb8& image, const Opt
         c["params"]["numGroups"].setData(numGroups);
         c["params"]["numDcGroups"].setData(numDcGroups);
         c["params"]["mode"].setData(mode);
+        c["params"]["ecInGroups"].setData(uint32_t{hasAlpha && !ecFits ? 1u : 0u});
+        c["params"]["ecCtxBase"].setData(kNumAcContexts + (ecSet - 1) * kSetContexts);
+        c["params"]["ecRegionBase"].setData(ecSet * kAcClusters);
+        c["params"]["width"].setData(image.width);
+        c["params"]["height"].setData(image.height);
+        c["params"]["groupDim"].setData(dim.groupDim);
     };
     // The ANS sections (one thread per AC group, one per DC group) measured in mode 1 and emitted in mode 2.
     const auto sectionPasses = [&](uint32_t mode, const gpu::Buffer& body) {
@@ -565,8 +660,8 @@ Result<std::vector<uint8_t>> Encoder::encode(const image::Rgb8& image, const Opt
         c["ansInfo"].setBinding(ansInfo.rhi());
         c["ansReverse"].setBinding(ansReverse.rhi());
         c["planes"].setBinding(dummyInt_.rhi());
-        c["treeNodes"].setBinding(dummy_.rhi());
-        c["modTokens"].setBinding(dummy_.rhi());
+        c["treeNodes"].setBinding(alphaTree.rhi());
+        c["modTokens"].setBinding(alphaTokens.rhi());
         c["dcTree"].setBinding(dcTree.rhi());
         c["metaTree"].setBinding(metaTree.rhi());
         c["codes"].setBinding(codes.rhi());
@@ -581,6 +676,16 @@ Result<std::vector<uint8_t>> Encoder::encode(const image::Rgb8& image, const Opt
         c["params"]["metaTreeNodes"].setData(static_cast<uint32_t>(metaTreeWords.size() / kModTreeWords));
         c["params"]["metaLeaves"].setData(metaLeaves);
         c["params"]["numAcContexts"].setData(kNumAcContexts);
+        c["params"]["numEcSets"].setData(numEcSets);
+        c["params"]["ecInGlobal"].setData(uint32_t{hasAlpha && ecFits ? 1u : 0u});
+        c["params"]["ecLogAlpha"].setData(uint32_t{image.bitDepth > 8 ? 7u : 6u});
+        c["params"]["width"].setData(image.width);
+        c["params"]["height"].setData(image.height);
+        c["params"]["groupDim"].setData(dim.groupDim);
+        c["params"]["numTreeNodes"].setData(alphaNodes);
+        c["params"]["numLeaves"].setData(alphaLeaves);
+        c["params"]["numChannels"].setData(1u);
+        c["params"]["bitDepth"].setData(image.bitDepth);
     };
     dcGroupBlobs_.dispatchGroups(batch, {numDcGroups, 1, 1}, bindCodes);
     globalBlobs_.dispatchGroups(batch, {1, 1, 1}, bindCodes);
@@ -670,8 +775,8 @@ Result<std::vector<uint8_t>> Encoder::encode(const image::Rgb8& image, const Opt
 
     // Headers and TOC on the CPU, then the body.
     codestream::BitWriter head;
-    codestream::writeCodestreamHeaders(head, image.width, image.height, image.gamma);
-    codestream::writeFrameHeader(head, frame);
+    codestream::writeCodestreamHeaders(head, image.width, image.height, image.gamma, image.bitDepth, hasAlpha);
+    codestream::writeFrameHeader(head, frame, hasAlpha ? 1u : 0u);
     if (dim.singleSection()) {
         sizes.assign(1, bodyBytes);
     }
@@ -952,6 +1057,7 @@ Result<std::vector<uint8_t>> Encoder::encodeLossless(const image::Rgb8& image, c
         c["params"]["bitDepth"].setData(image.bitDepth);
         c["params"]["wpWordsPerGroup"].setData(wpWordsPerGroup);
         c["params"]["pass"].setData(pass);
+        c["params"]["ctxBase"].setData(0u);
     };
     // Both predictor passes and their per-channel entropies; the choice is bookkeeping on the host.
     SJXL_ASSIGN(choice, gpu::Buffer::ofType<uint32_t>(dev, channels, "enc.choice"));
@@ -1038,6 +1144,9 @@ Result<std::vector<uint8_t>> Encoder::encodeLossless(const image::Rgb8& image, c
         c["params"]["metaTreeNodes"].setData(0u);
         c["params"]["metaLeaves"].setData(0u);
         c["params"]["numAcContexts"].setData(numLeaves);
+        c["params"]["numEcSets"].setData(0u);
+        c["params"]["ecInGlobal"].setData(0u);
+        c["params"]["ecLogAlpha"].setData(6u);
     };
     modularGlobalBlob_.dispatchGroups(batch, {1, 1, 1}, bindCodes);
     if (!fitsGroup) {

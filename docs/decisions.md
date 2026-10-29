@@ -59,9 +59,11 @@ per subsystem or milestone, appended to as the work goes. Dates are absolute.
   contexts; lossless Modular encoding of RGB and RGBA at 8 and 16 bits;
   transform selection DCT8..64x64 with libjxl's entropy model and the 8x8
   specials; PNG colour chunks; DC and AcMetadata with the weighted predictor,
-  libjxl's fixed trees and ANS.) Next: three-channel strategy costs, the
-  weighted predictor and transforms for lossless, alpha and 16-bit in the
-  lossy path, encoder speed (the serial ANS and WP passes).
+  libjxl's fixed trees and ANS; lossless with the weighted predictor and
+  the per-channel predictor choice; alpha and 16-bit in the lossy path.)
+  Next: three-channel strategy costs, transforms (palette, Squeeze) and a
+  learned tree for lossless, animation and progressive encoding, encoder
+  speed (the serial ANS and WP passes).
 - **M4 decoder completeness**: splines, grey JPEG transcodes, loop filters
   on YCbCr frames, extra channel blending in patches, writing the ICC
   profile into the output file, float samples. (16-bit output, animation
@@ -346,6 +348,28 @@ cjxl at the same distance. The cost model is the obvious lever left (it
 prefers the rectangular shapes and rarely picks 16×16 or 32×32 on the small
 images; cjxl's maps use them in smooth areas), together with checking our
 quant field and strategy maps against cjxl's on the same image.
+
+## Lossy frames with alpha and 16-bit input (2026-10-29)
+
+The VarDCT path takes the same inputs as the lossless one. 16-bit samples
+go through `sampleAt` in the XYB kernel (normalised by 65535) and the
+ImageMetadata carries the bit depth, so `djxl` writes a 16-bit PNG. An alpha
+channel becomes the frame's extra channel, coded as libjxl codes extra
+channels of a VarDCT frame: a modular image of one channel whose global part
+sits at the end of DcGlobal (has_tree, the tree with its clustered ANS
+histograms, the GroupHeader with the global tree and no transforms, and the
+channel itself when the image fits a group) and whose groups follow the AC
+stream inside every AC group section (a 4-bit GroupHeader, then the ANS
+stream over the group's pixels). The channel is tokenised with the lossless
+machinery (`extractAlpha`, then `modTokenize` twice for the weighted and
+gradient predictors, `channelEntropy`, the host's choice, `remapTokens` into
+the alpha histogram set, which is numbered after the DC groups' sets) and is
+exact. `acSections` keeps the AC stream's own bit count (`acOnlyBits`) to
+place the second stream; the DcGlobal tail and the section writer are the only
+format changes, plus the ImageMetadata extra channel, `ec_upsampling` and the
+per-channel BlendingInfo in the frame header, shared with the lossless
+writer. djxl and our decoder agree within 1–2 LSB on the RGBA, 16-bit and
+RGBA 16-bit variants (colour PSNR ≈ 35 dB at d = 1, alpha exact).
 
 ## DC and AcMetadata streams: weighted predictor, fixed trees, ANS (2026-10-29)
 

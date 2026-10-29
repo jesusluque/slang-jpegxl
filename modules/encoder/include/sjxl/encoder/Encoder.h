@@ -53,6 +53,7 @@ struct Stats {
     uint32_t              quantDc = 0;
     bool                  gaborish = false;
     uint32_t              epfIters = 0;
+    uint32_t              alphaPredictor = 0;   ///< lossy with alpha: 0 weighted, 1 gradient
 };
 
 class Encoder {
@@ -72,7 +73,7 @@ private:
     gpu::ComputeKernel                  gaborishInverse_, cflTile_, quantize_;
     gpu::ComputeKernel                  tables_, buildOrders_, selectStrategies_, largeQf_, largeRows_, largeCols_, mergeLarge_, adjustQuantField_, dctRows_, dctCols_, dcFromLlf_, specialTransform_, acTokenize_;
     gpu::ComputeKernel                  dcTokenize_, metaTokenize_, dcGroupSections_, clusterContexts_, accumulateClusters_, acSections_;
-    gpu::ComputeKernel                  rctYCoCg_, modTokenize_, channelEntropy_, remapTokens_, modGroupSections_, modularGlobalBlob_;
+    gpu::ComputeKernel                  rctYCoCg_, modTokenize_, extractAlpha_, channelEntropy_, remapTokens_, modGroupSections_, modularGlobalBlob_;
     gpu::ComputeKernel                  dcGroupBlobs_, globalBlobs_, layout_, blobEmit_;
     gpu::PrefixSum                      prefixSum_;
     gpu::Buffer                         dequantAll_;   // every quant table kind, 3 channels each (kTableBase layout)
