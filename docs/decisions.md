@@ -51,9 +51,11 @@ per subsystem or milestone, appended to as the work goes. Dates are absolute.
   sRGB PNGs within max abs diff ≤ 1 of `djxl`. All 8–32 px transforms,
   IDENTITY/DCT2x2/DCT4x4/DCT4x8/AFV, ANS + prefix + LZ77, modular MA trees
   with all predictors, RCT/Palette/Squeeze, Gaborish + EPF, custom orders.
-- **M3 encoder quality**: inverse Gaborish + default LoopFilter, EPF sharpness,
-  CfL per tile, adaptive quant field, DCT16/32 strategy search, context
-  clustering (≤ 32, fixed-point costs as cujpegxl), ANS for AC.
+- **M3 encoder quality**: (done 2026-10-29: inverse Gaborish + LoopFilter as
+  libjxl chooses it, EPF sharpness 4, CfL per tile, adaptive quant field,
+  AdjustQuantBlockAC.) Next: ANS for AC with context clustering (≤ 32 clusters,
+  fixed-point costs as cujpegxl), DCT16/32 strategy search, Modular lossless
+  encoding, alpha and 16-bit input.
 - **M4 decoder completeness**: splines, grey JPEG transcodes, loop filters
   on YCbCr frames, extra channel blending in patches, writing the ICC
   profile into the output file, float samples. (16-bit output, animation
@@ -109,6 +111,88 @@ Natural order: `dct8NaturalOrder()` follows `CoeffOrderAndLut` literally; the
 first diagonal is memory index 1 then 8 (libjxl swaps x and y on odd
 diagonals). Coefficient memory layout is `coef[fx * 8 + fy]` with fx the
 horizontal frequency, as cujpegxl checked against libjxl.
+
+## M3 encoder: adaptive quantisation, chroma-from-luma, loop filter (2026-10-29)
+
+The first M3 slice ports libjxl's hare-tier (`-e 5`) perceptual heuristics,
+each as a kernel, so the encoder's choices at a given distance are close to
+cjxl's:
+
+- **Quant field** (`enc/aq.slang`): `aqDiff` per 4×4 cell computes libjxl's
+  masking measure of Y (the gamma-corrected 4-neighbour Laplacian, squared,
+  limited to 0.2, `MaskingSqrt`, summed ×0.25: the `pre_erosion` image);
+  `aqMap` per block runs `FuzzyErosion` (the four smallest of each cell's 3×3
+  neighbourhood with the distance-dependent weights, four cells per block)
+  then `PerBlockModulations` (`ComputeMask`, `GammaModulation`,
+  `HfModulation`, min with `BlueModulation`, `exp` with the dampening ramp
+  for distances 2..14), and `aqRawField` turns the float field into 1..256
+  under the global scale. The field uses the planes *before* the inverse
+  Gaborish, as libjxl does, and distance × 0.62 when the Gaborish is off.
+- **Quantizer**: libjxl's speeds up to squirrel do *not* derive the global
+  scale from the field's median; they call
+  `ComputeGlobalScaleAndQuant(quant_dc, 0.39 / distance, 0)` and only the
+  butteraugli iterations of kitten and slower use the median. So the
+  quantizer is a function of the distance, computed on the host
+  (`quantParamsFor`) and uploaded; a first version that took the median on
+  the device through a log histogram gave a 5-level field (raw qf 2..6) and
+  worse quality. With the uniform field (`--no-aq`) the scale and the field
+  are 0.79 / distance, libjxl's fast tiers.
+- **Inverse Gaborish** (`enc/gaborish.slang`): the 5×5 `WeightsSymmetric5`
+  kernel from `kGaborish[5]` with mul 1, mirrored borders, applied after the
+  field is computed. LoopFilter as `LoopFilterFromParams`: Gaborish when
+  distance > 0.5, EPF iterations by thresholds 0.7 / 1.5 / 4.0; the
+  AcMetadata sharpness channel is 4 everywhere through the MA leaf's offset
+  (so it still costs no bits). `x_qm_scale` is 3 up to distance 2.5 then
+  4, 5, 6 (`b_qm_scale` 2); the encoder multiplies X's quant by
+  1.25^(x_qm_scale − 2) as the decoder divides its steps.
+- **Chroma-from-luma** (`enc/cfl.slang`): `dct` keeps the float DCT8
+  coefficients of every block for the two consumers; `cflTile` per 64 px tile
+  regresses X and B on Y over the tile's blocks with the coefficients scaled
+  by `Scale() · 128 · qf / dequant` (libjxl's "strange multiplier"), the
+  fast closed-form `FindBestMultiplier` with the 2.6 towards-zero bias,
+  clamped to −128..127 in 1/84 units. On the test images ytox is always 0
+  (also in cjxl's files) and ytob ranges about −28..13.
+- **Quantise** (`enc/quantize.slang`): `QuantizeRoundtripYBlockAC` at the
+  hare tier: `AdjustQuantBlockAC` for Y, X, B from the field's value (finer
+  for flat blocks and for blocks whose high frequencies would all round to
+  zero, coarser in busy blocks, Y dead zones tuned from the rounding errors),
+  the largest quant wins and is written back to the field; Y quantised and
+  reconstructed with the bias; X and B as residuals against it with the
+  tile's factors (ytox/84, 1 + ytob/84). The chroma DC uses the DC factors
+  (0, 1) that the decoder's `DequantDC` adds, not the tile factors as
+  libjxl's encoder does.
+
+Measured with `djxl` as decoder and SSIMULACRA2 against the source, at the
+file size cjxl `-e 5` produces for the distance (our distance found by
+bisection), Debug build:
+
+| image | d | cjxl bytes / SSIM2 | ours, same d | ours at cjxl's size | Δ at size |
+|---|---|---|---|---|---|
+| berlin_200 | 1 | 5762 / 59.77 | 6051 / 59.84 | 5748 / 59.53 | −0.24 |
+| berlin_200 | 3 | 2654 / 48.84 | 2966 / 48.56 | 2653 / 45.16 | −3.68 |
+| sveti_crop_257x129 | 1 | 9780 / 88.55 | 10233 / 86.20 | 9772 / 85.77 | −2.78 |
+| sveti_crop_257x129 | 3 | 5079 / 76.95 | 5092 / 74.96 | 5085 / 74.87 | −2.09 |
+| sveti_stefan_320 | 1 | 16527 / 86.79 | 18164 / 84.40 | 16522 / 83.28 | −3.51 |
+| sveti_stefan_320 | 3 | 7641 / 72.75 | 8406 / 69.96 | 7625 / 66.71 | −6.04 |
+
+Before this slice (M1 profile) the gap at matched size was about −3.8 on
+sveti_stefan_320 at d = 1 and the quality at the same distance was 3–4 points
+below cjxl's; now the quality at the same distance matches cjxl within
+0.3–2.8 points and the files are 0–12 % larger. Ablation at matched size
+(mean Δ over the six rows, before AdjustQuantBlockAC): all stages −3.05,
+without the field −3.4, without CfL −4.0, without the loop filter −2.7 (cjxl
+itself scores +0.3 higher with `--epf=0 --gaborish=0` under SSIMULACRA2, so
+the filters are kept for parity and for block boundaries, which the metric
+underweights). AdjustQuantBlockAC moved the mean by nothing but brought the
+same-distance quality level with cjxl. The remaining gap is coding
+efficiency, not quantisation: one prefix-coded AC cluster against cjxl's
+ANS with clustered contexts and custom orders, and DCT8 only where cjxl's
+strategy map uses 16×16 to 32×16 transforms in the smooth areas. Those are
+the next slices. Debug: `SJXL_DEBUG=1 sjxl encode` prints the quantizer, the
+field range and the first tiles' cmap; `SJXL_DEBUG=1 SJXL_DEBUG_QF=1 sjxl
+decode` dumps any file's quant field per block (used to check the field's
+shape against cjxl's: same pattern, cjxl's one step higher where its
+AdjustQuantBlockAC raised it).
 
 ## M2 decoder, VarDCT (2026-10-29)
 

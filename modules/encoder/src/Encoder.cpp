@@ -1,7 +1,10 @@
 // Copyright (c) 2026 jesus luque.
 #include "sjxl/encoder/Encoder.h"
 
+#include <algorithm>
 #include <array>
+#include <bit>
+#include <cmath>
 #include <cstring>
 
 #include "sjxl/codestream/Headers.h"
@@ -40,6 +43,26 @@ std::vector<Uint4> groupRects(const FrameDim& dim, uint32_t groupBlocks, uint32_
     return rects;
 }
 
+/// LoopFilterFromParams (enc_frame.cc): Gaborish above distance 0.5, EPF
+/// iterations by distance thresholds 0.7, 1.5 and 4. x_qm_scale 3 up to
+/// distance 2.5 then 4, 5, 6 (the pixel-statistics adjustment is squirrel+).
+codestream::FrameParams frameParamsFor(const Options& options) {
+    codestream::FrameParams frame;
+    frame.gaborish = options.loopFilter && options.distance > 0.5f;
+    frame.epfIters = 0;
+    if (options.loopFilter) {
+        for (float threshold : {0.7f, 1.5f, 4.0f}) {
+            if (options.distance >= threshold) ++frame.epfIters;
+        }
+    }
+    frame.xQmScale = 3;
+    for (float step : {2.5f, 5.5f, 9.5f}) {
+        if (options.distance > step) ++frame.xQmScale;
+    }
+    frame.bQmScale = 2;
+    return frame;
+}
+
 }   // namespace
 
 Result<std::unique_ptr<Encoder>> Encoder::create(std::shared_ptr<gpu::ShaderLibrary> library) {
@@ -48,7 +71,13 @@ Result<std::unique_ptr<Encoder>> Encoder::create(std::shared_ptr<gpu::ShaderLibr
     enc->device_ = &enc->library_->device();
     gpu::ShaderLibrary& lib = *enc->library_;
     SJXL_ASSIGN(enc->rgbToXyb_, gpu::ComputeKernel::create(lib, "sjxl/enc/xyb", "rgbToXyb"));
-    SJXL_ASSIGN(enc->dctQuant_, gpu::ComputeKernel::create(lib, "sjxl/enc/dct_quant", "dctQuant"));
+    SJXL_ASSIGN(enc->aqDiff_, gpu::ComputeKernel::create(lib, "sjxl/enc/aq", "aqDiff"));
+    SJXL_ASSIGN(enc->aqMap_, gpu::ComputeKernel::create(lib, "sjxl/enc/aq", "aqMap"));
+    SJXL_ASSIGN(enc->aqRawField_, gpu::ComputeKernel::create(lib, "sjxl/enc/aq", "aqRawField"));
+    SJXL_ASSIGN(enc->gaborishInverse_, gpu::ComputeKernel::create(lib, "sjxl/enc/gaborish", "gaborishInverse"));
+    SJXL_ASSIGN(enc->dct_, gpu::ComputeKernel::create(lib, "sjxl/enc/cfl", "dct"));
+    SJXL_ASSIGN(enc->cflTile_, gpu::ComputeKernel::create(lib, "sjxl/enc/cfl", "cflTile"));
+    SJXL_ASSIGN(enc->quantize_, gpu::ComputeKernel::create(lib, "sjxl/enc/quantize", "quantize"));
     SJXL_ASSIGN(enc->acItems_, gpu::ComputeKernel::create(lib, "sjxl/enc/items", "acItems"));
     SJXL_ASSIGN(enc->dcItems_, gpu::ComputeKernel::create(lib, "sjxl/enc/items", "dcItems"));
     SJXL_ASSIGN(enc->metaItems_, gpu::ComputeKernel::create(lib, "sjxl/enc/items", "metaItems"));
@@ -75,8 +104,22 @@ Result<std::vector<uint8_t>> Encoder::encode(const image::Rgb8& image, const Opt
     }
     gpu::Device& dev = *device_;
     const FrameDim dim = codestream::frameDim(image.width, image.height);
-    const codestream::QuantParams qp = codestream::quantParamsForDistance(options.distance);
+    const codestream::FrameParams frame = frameParamsFor(options);
+    // The quant field's distance: libjxl lowers it when the Gaborish is off.
+    const float fieldDistance = options.distance * (frame.gaborish ? 1.0f : 0.62f);
+    // The field's unit: libjxl's adaptive scale, or the flat 0.79 / d of its
+    // fast tiers. The quantizer's global scale follows 0.39 / d with the
+    // adaptive field (enc_heuristics.cc, speeds up to squirrel), 0.79 / d flat.
+    const float fieldScale = options.adaptiveQuant ? codestream::initialQuantAc(fieldDistance) : 0.79f / options.distance;
+    const codestream::QuantParams qp = codestream::quantParamsFor(options.adaptiveQuant ? 0.39f / options.distance : fieldScale,
+                                                                  codestream::initialQuantDc(options.distance));
+    const std::array<uint32_t, 4> quantizerWords{qp.globalScale, qp.quantDc, std::bit_cast<uint32_t>(qp.invGlobalScale),
+                                                 std::bit_cast<uint32_t>(qp.globalScaleFloat)};
     const uint32_t nblocks = dim.numBlocks();
+    const uint32_t tilesX = (dim.xsizeBlocks + 7) / 8;
+    const uint32_t tilesY = (dim.ysizeBlocks + 7) / 8;
+    const uint32_t cellsX = dim.xsizePadded / 4;
+    const uint32_t cellsY = dim.ysizePadded / 4;
     const uint32_t numGroups = dim.numGroups();
     const uint32_t numDcGroups = dim.numDcGroups();
     const uint32_t numSections = dim.numSections();
@@ -88,6 +131,14 @@ Result<std::vector<uint8_t>> Encoder::encode(const image::Rgb8& image, const Opt
 
     const uint64_t planePixels = uint64_t{dim.xsizePadded} * dim.ysizePadded;
     SJXL_ASSIGN(auto xyb, gpu::Buffer::ofType<float>(dev, 3 * planePixels, "enc.xyb"));
+    SJXL_ASSIGN(auto xybSharp, gpu::Buffer::ofType<float>(dev, frame.gaborish ? 3 * planePixels : 4, "enc.xybSharp"));
+    SJXL_ASSIGN(auto preErosion, gpu::Buffer::ofType<float>(dev, uint64_t{cellsX} * cellsY, "enc.preErosion"));
+    SJXL_ASSIGN(auto qfField, gpu::Buffer::ofType<float>(dev, nblocks, "enc.qf"));
+    SJXL_ASSIGN(auto quantizer, gpu::Buffer::fromSpan<uint32_t>(dev, quantizerWords, "enc.quantizer"));
+    SJXL_ASSIGN(auto rawQf, gpu::Buffer::ofType<uint32_t>(dev, nblocks, "enc.rawQf"));
+    SJXL_ASSIGN(auto coeffs, gpu::Buffer::ofType<float>(dev, uint64_t{3} * nblocks * 64, "enc.coeffs"));
+    SJXL_ASSIGN(auto cmapX, gpu::Buffer::ofType<int32_t>(dev, uint64_t{tilesX} * tilesY, "enc.cmapX"));
+    SJXL_ASSIGN(auto cmapB, gpu::Buffer::ofType<int32_t>(dev, uint64_t{tilesX} * tilesY, "enc.cmapB"));
     SJXL_ASSIGN(auto acQuant, gpu::Buffer::ofType<int32_t>(dev, uint64_t{3} * nblocks * 64, "enc.acQuant"));
     SJXL_ASSIGN(auto dcQuant, gpu::Buffer::ofType<int32_t>(dev, uint64_t{3} * nblocks, "enc.dcQuant"));
     SJXL_ASSIGN(auto nonZeros, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{3} * nblocks, "enc.nonZeros"));
@@ -131,18 +182,75 @@ Result<std::vector<uint8_t>> Encoder::encode(const image::Rgb8& image, const Opt
         c["params"]["paddedWidth"].setData(dim.xsizePadded);
         c["params"]["paddedHeight"].setData(dim.ysizePadded);
     });
-    dctQuant_.dispatch(batch, {nblocks, 1, 1}, [&](rhi::ShaderCursor c) {
+
+    // The quant field (from the planes before the inverse Gaborish), then the
+    // integer field under the quantizer's global scale.
+    const auto bindAq = [&](rhi::ShaderCursor c) {
         c["xyb"].setBinding(xyb.rhi());
-        c["dequant"].setBinding(dequant_.rhi());
-        c["acQuant"].setBinding(acQuant.rhi());
-        c["dcQuant"].setBinding(dcQuant.rhi());
-        c["nonZeros"].setBinding(nonZeros.rhi());
+        c["preErosion"].setBinding(preErosion.rhi());
+        c["qf"].setBinding(qfField.rhi());
+        c["quantizer"].setBinding(quantizer.rhi());
+        c["rawQf"].setBinding(rawQf.rhi());
         c["params"]["paddedWidth"].setData(dim.xsizePadded);
         c["params"]["paddedHeight"].setData(dim.ysizePadded);
         c["params"]["blocksX"].setData(dim.xsizeBlocks);
         c["params"]["blocksY"].setData(dim.ysizeBlocks);
-        c["params"]["quantMul"].setData(static_cast<float>(qp.quantField) * qp.globalScaleFloat);
-        c["params"]["dcMul"].setData(qp.globalScaleFloat * static_cast<float>(qp.quantDc));
+        c["params"]["cellsX"].setData(cellsX);
+        c["params"]["cellsY"].setData(cellsY);
+        c["params"]["uniform"].setData(uint32_t{options.adaptiveQuant ? 0u : 1u});
+        c["params"]["distance"].setData(fieldDistance);
+        c["params"]["scale"].setData(fieldScale);
+    };
+    if (options.adaptiveQuant) {
+        aqDiff_.dispatch(batch, {cellsX * cellsY, 1, 1}, bindAq);
+    }
+    aqMap_.dispatch(batch, {nblocks, 1, 1}, bindAq);
+    aqRawField_.dispatch(batch, {nblocks, 1, 1}, bindAq);
+
+    // Pre-sharpening for the decoder's Gaborish, then the DCT of every block.
+    const gpu::Buffer& planes = frame.gaborish ? xybSharp : xyb;
+    if (frame.gaborish) {
+        gaborishInverse_.dispatch(batch, {dim.xsizePadded, dim.ysizePadded, 1}, [&](rhi::ShaderCursor c) {
+            c["src"].setBinding(xyb.rhi());
+            c["dst"].setBinding(xybSharp.rhi());
+            c["params"]["paddedWidth"].setData(dim.xsizePadded);
+            c["params"]["paddedHeight"].setData(dim.ysizePadded);
+        });
+    }
+    const auto bindCfl = [&](rhi::ShaderCursor c) {
+        c["xyb"].setBinding(planes.rhi());
+        c["coeffs"].setBinding(coeffs.rhi());
+        c["dequant"].setBinding(dequant_.rhi());
+        c["rawQf"].setBinding(rawQf.rhi());
+        c["quantizer"].setBinding(quantizer.rhi());
+        c["cmapX"].setBinding(cmapX.rhi());
+        c["cmapB"].setBinding(cmapB.rhi());
+        c["params"]["paddedWidth"].setData(dim.xsizePadded);
+        c["params"]["paddedHeight"].setData(dim.ysizePadded);
+        c["params"]["blocksX"].setData(dim.xsizeBlocks);
+        c["params"]["blocksY"].setData(dim.ysizeBlocks);
+        c["params"]["tilesX"].setData(tilesX);
+        c["params"]["tilesY"].setData(tilesY);
+    };
+    dct_.dispatch(batch, {nblocks, 1, 1}, bindCfl);
+    if (options.chromaFromLuma) {
+        cflTile_.dispatch(batch, {tilesX * tilesY, 1, 1}, bindCfl);
+    }
+    quantize_.dispatch(batch, {nblocks, 1, 1}, [&](rhi::ShaderCursor c) {
+        c["coeffs"].setBinding(coeffs.rhi());
+        c["dequant"].setBinding(dequant_.rhi());
+        c["rawQf"].setBinding(rawQf.rhi());
+        c["quantizer"].setBinding(quantizer.rhi());
+        c["cmapX"].setBinding(cmapX.rhi());
+        c["cmapB"].setBinding(cmapB.rhi());
+        c["acQuant"].setBinding(acQuant.rhi());
+        c["dcQuant"].setBinding(dcQuant.rhi());
+        c["nonZeros"].setBinding(nonZeros.rhi());
+        c["params"]["blocksX"].setData(dim.xsizeBlocks);
+        c["params"]["blocksY"].setData(dim.ysizeBlocks);
+        c["params"]["tilesX"].setData(tilesX);
+        c["params"]["xQmMultiplier"].setData(static_cast<float>(std::pow(1.25, static_cast<int>(frame.xQmScale) - 2)));
+        c["params"]["bQmMultiplier"].setData(static_cast<float>(std::pow(1.25, static_cast<int>(frame.bQmScale) - 2)));
     });
 
     const auto bindItems = [&](rhi::ShaderCursor c, uint32_t mode, const gpu::Buffer& bits, const gpu::Buffer& prefix,
@@ -153,6 +261,9 @@ Result<std::vector<uint8_t>> Encoder::encode(const image::Rgb8& image, const Opt
         c["dcQuant"].setBinding(dcQuant.rhi());
         c["nonZeros"].setBinding(nonZeros.rhi());
         c["order"].setBinding(order_.rhi());
+        c["rawQf"].setBinding(rawQf.rhi());
+        c["cmapX"].setBinding(cmapX.rhi());
+        c["cmapB"].setBinding(cmapB.rhi());
         c["codes"].setBinding(codes.rhi());
         c["hist"].setBinding(hist.rhi());
         c["itemBits"].setBinding(bits.rhi());
@@ -166,7 +277,7 @@ Result<std::vector<uint8_t>> Encoder::encode(const image::Rgb8& image, const Opt
         c["params"]["numGroups"].setData(numGroups);
         c["params"]["numDcGroups"].setData(numDcGroups);
         c["params"]["mode"].setData(mode);
-        c["params"]["quantField"].setData(qp.quantField);
+        c["params"]["tilesX"].setData(tilesX);
     };
     const auto itemPasses = [&](uint32_t mode, const gpu::Buffer& body) {
         acItems_.dispatch(batch, {acItems, 1, 1}, [&](rhi::ShaderCursor c) { bindItems(c, mode, acBits, acPrefix, body); });
@@ -180,13 +291,12 @@ Result<std::vector<uint8_t>> Encoder::encode(const image::Rgb8& image, const Opt
     const auto bindCodes = [&](rhi::ShaderCursor c) {
         c["dcGroups"].setBinding(dcGroups.rhi());
         c["hist"].setBinding(hist.rhi());
+        c["quantizer"].setBinding(quantizer.rhi());
         c["codes"].setBinding(codes.rhi());
         c["blobs"].setBinding(blobs.rhi());
         c["blobBits"].setBinding(blobBits.rhi());
         c["params"]["numDcGroups"].setData(numDcGroups);
         c["params"]["numGroups"].setData(numGroups);
-        c["params"]["globalScale"].setData(qp.globalScale);
-        c["params"]["quantDc"].setData(qp.quantDc);
         c["params"]["blocksX"].setData(dim.xsizeBlocks);
         c["params"]["blocksY"].setData(dim.ysizeBlocks);
     };
@@ -217,24 +327,20 @@ Result<std::vector<uint8_t>> Encoder::encode(const image::Rgb8& image, const Opt
     };
     layout_.dispatch(batch, {1, 1, 1}, [&](rhi::ShaderCursor c) { bindLayout(c, dummy_); });
     SJXL_TRY(batch.submit(true));
+    stats_.globalScale = qp.globalScale;
+    stats_.quantDc = qp.quantDc;
+    stats_.gaborish = frame.gaborish;
+    stats_.epfIters = frame.epfIters;
     if (!platform::env("SJXL_DEBUG").empty()) {
-        SJXL_ASSIGN(const auto xybHost, xyb.readAll<float>(dev));
-        SJXL_ASSIGN(const auto dcHost, dcQuant.readAll<int32_t>(dev));
-        SJXL_ASSIGN(const auto acHost, acQuant.readAll<int32_t>(dev));
-        log::info("enc debug: xyb(0,0) = {} {} {}; dcQuant block0 = {} {} {}; qp gs={} qdc={} qf={}", xybHost[0], xybHost[planePixels],
-                  xybHost[2 * planePixels], dcHost[0], dcHost[nblocks], dcHost[2 * nblocks], qp.globalScale, qp.quantDc, qp.quantField);
-        const uint32_t dbgBlock = static_cast<uint32_t>(std::atoi(platform::env("SJXL_DEBUG_BLOCK").c_str()));
-        for (uint32_t ch = 0; ch < 3; ++ch) {
-            std::string ac;
-            for (int k = 0; k < 64; ++k) ac += std::format("{} ", acHost[(ch * nblocks + dbgBlock) * 64 + k]);
-            log::info("enc debug: acQuant c{} block{} = {}", ch, dbgBlock, ac);
-        }
-        log::info("enc debug: dcQuant block{} = {} {} {}", dbgBlock, dcHost[dbgBlock], dcHost[nblocks + dbgBlock], dcHost[2 * nblocks + dbgBlock]);
-        std::string row;
-        for (int k = 0; k < 10; ++k) row += std::format("({:.3f},{:.3f},{:.3f}) ", xybHost[k], xybHost[planePixels + k], xybHost[2 * planePixels + k]);
-        log::info("enc debug: xyb row0[0..10) = {}", row);
-        SJXL_ASSIGN(const auto rgbHost, rgb.readAll<uint32_t>(dev));
-        log::info("enc debug: rgb words = {:08x} {:08x} {:08x}; dims {}x{} padded {}x{}", rgbHost[0], rgbHost[1], rgbHost[2], image.width, image.height, dim.xsizePadded, dim.ysizePadded);
+        SJXL_ASSIGN(const auto rawQfHost, rawQf.readAll<uint32_t>(dev));
+        SJXL_ASSIGN(const auto cmapXHost, cmapX.readAll<int32_t>(dev));
+        SJXL_ASSIGN(const auto cmapBHost, cmapB.readAll<int32_t>(dev));
+        uint32_t qfMin = 256, qfMax = 0;
+        for (uint32_t v : rawQfHost) { qfMin = std::min(qfMin, v); qfMax = std::max(qfMax, v); }
+        std::string cm;
+        for (size_t i = 0; i < std::min<size_t>(cmapXHost.size(), 12); ++i) cm += std::format("({},{}) ", cmapXHost[i], cmapBHost[i]);
+        log::info("enc debug: global_scale {} quant_dc {} raw qf [{}, {}] gab {} epf {} xqm {} cmap(x,b) {}", qp.globalScale,
+                  qp.quantDc, qfMin, qfMax, frame.gaborish, frame.epfIters, frame.xQmScale, cm);
     }
 
     SJXL_ASSIGN(const std::vector<uint32_t> totalsHost, totals.readAll<uint32_t>(dev));
@@ -254,9 +360,6 @@ Result<std::vector<uint8_t>> Encoder::encode(const image::Rgb8& image, const Opt
     // Headers and TOC on the CPU, then the body.
     codestream::BitWriter head;
     codestream::writeCodestreamHeaders(head, image.width, image.height);
-    codestream::FrameParams frame;
-    frame.gaborish = false;
-    frame.epfIters = 0;
     codestream::writeFrameHeader(head, frame);
     if (dim.singleSection()) {
         sizes.assign(1, bodyBytes);

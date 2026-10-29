@@ -1,0 +1,82 @@
+// Copyright (c) 2026 jesus luque.
+//
+// The forward 8x8 DCT in libjxl's conventions: the orthonormal 2D DCT-II
+// scaled by 1/8 (so coefficient 0 is the block mean), stored coef[fx * 8 + fy]
+// with fx the horizontal frequency -- libjxl's transposed raster order
+// (cujpegxl dct_impl.cuh, checked against libjxl). The 1D transform is
+// libjxl's recursive butterfly: even outputs are the half-size DCT of
+// v[i] + v[N-1-i], odd outputs the half-size DCT of (v[i] - v[N-1-i]) /
+// (2 cos(pi (i + 0.5) / N)) with neighbours added.
+#pragma once
+
+static const float kDctSqrt2 = 1.41421356237309504880f;
+// 1 / (2 cos(pi (i + 0.5) / N)) for N = 4 (2 values) and N = 8 (4 values).
+static const float kOdd4[2] = {0.54119610014619701f, 1.3065629648763764f};
+static const float kOdd8[4] = {0.50979557910415918f, 0.60134488693504529f, 0.89997622313641557f, 2.5629154477415055f};
+
+// In place: v <- 2 * A2 v (DCT-2 of two values, unnormalised).
+void dct2(inout float v0, inout float v1) {
+    const float a = v0 + v1;
+    const float b = v0 - v1;
+    v0 = a;
+    v1 = b;
+}
+
+// In place: v <- 4 * A4 v.
+void dct4(inout float v[4]) {
+    float even[2] = {v[0] + v[3], v[1] + v[2]};
+    dct2(even[0], even[1]);
+    float odd[2] = {(v[0] - v[3]) * kOdd4[0], (v[1] - v[2]) * kOdd4[1]};
+    dct2(odd[0], odd[1]);
+    odd[0] = odd[0] * kDctSqrt2 + odd[1];
+    v[0] = even[0];
+    v[1] = odd[0];
+    v[2] = even[1];
+    v[3] = odd[1];
+}
+
+// In place: v <- 8 * A8 v.
+void dct8(inout float v[8]) {
+    float even[4];
+    float odd[4];
+    for (int i = 0; i < 4; ++i) {
+        even[i] = v[i] + v[7 - i];
+        odd[i] = (v[i] - v[7 - i]) * kOdd8[i];
+    }
+    dct4(even);
+    dct4(odd);
+    odd[0] = odd[0] * kDctSqrt2 + odd[1];
+    odd[1] += odd[2];
+    odd[2] += odd[3];
+    for (int i = 0; i < 4; ++i) {
+        v[2 * i] = even[i];
+        v[2 * i + 1] = odd[i];
+    }
+}
+
+/// coef[fx * 8 + fy] of the 8x8 block whose top-left sample is `src[base]`,
+/// rows `stride` apart.
+void forwardDct8x8(StructuredBuffer<float> src, uint base, uint stride, out float coef[64]) {
+    float rows[64];   // rows[fx * 8 + r]
+    for (uint r = 0; r < 8; ++r) {
+        float v[8];
+        const uint rowBase = base + r * stride;
+        for (uint x = 0; x < 8; ++x) {
+            v[x] = src[rowBase + x];
+        }
+        dct8(v);
+        for (uint fx = 0; fx < 8; ++fx) {
+            rows[fx * 8 + r] = v[fx];
+        }
+    }
+    for (uint fx = 0; fx < 8; ++fx) {
+        float v[8];
+        for (uint r = 0; r < 8; ++r) {
+            v[r] = rows[fx * 8 + r];
+        }
+        dct8(v);
+        for (uint fy = 0; fy < 8; ++fy) {
+            coef[fx * 8 + fy] = v[fy] * (1.0f / 64.0f);
+        }
+    }
+}

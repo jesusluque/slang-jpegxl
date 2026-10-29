@@ -8,7 +8,8 @@ namespace sjxl::codestream {
 namespace {
 
 // libjxl quantizer.h / enc_adaptive_quantization.cc constants.
-constexpr float kAcQuant = 0.725f;
+constexpr float kAcQuant = 0.725f;          // cujpegxl's calibration of the uniform field
+constexpr float kAcQuantAdaptive = 0.765f;  // libjxl kAcQuant, the adaptive field's unit
 constexpr float kDcQuant = 1.095924047623553f;
 constexpr float kDcQuantPow = 0.83f;
 constexpr float kDcMul = 0.3f;
@@ -23,11 +24,12 @@ float mult(float v) { return v > 0.0f ? 1.0f + v : 1.0f / (1.0f - v); }
 }   // namespace
 
 QuantParams quantParamsForDistance(float distance) {
-    const float quantAc = kAcQuant / distance;
     const float btDc = std::max(0.5f * distance,
                                 std::min(distance, kDcMul * std::pow((1.0f / kDcMul) * distance, kDcQuantPow)));
-    const float quantDcFloat = std::min(kDcQuant / btDc, 50.0f);
+    return quantParamsFor(kAcQuant / distance, std::min(kDcQuant / btDc, 50.0f));
+}
 
+QuantParams quantParamsFor(float quantAc, float quantDcFloat) {
     // ComputeGlobalScaleAndQuant with a uniform field: median == quantAc, mad == 0.
     float scale = static_cast<float>(kGlobalScaleDenom) * quantAc / kQuantFieldTarget;
     scale = std::clamp(scale, 1.0f, static_cast<float>(1 << 15));
@@ -51,6 +53,14 @@ QuantParams quantParamsForDistance(float distance) {
     p.invGlobalScale = invGlobalScale;
     return p;
 }
+
+float initialQuantDc(float distance) {
+    const float btDc = std::max(0.5f * distance,
+                                std::min(distance, kDcMul * std::pow((1.0f / kDcMul) * distance, kDcQuantPow)));
+    return std::min(kDcQuant / btDc, 50.0f);
+}
+
+float initialQuantAc(float distance) { return kAcQuantAdaptive / distance; }
 
 std::array<float, 3 * 64> dct8DequantWeights() {
     // DequantMatricesLibraryDef::DCT(): six distance bands per channel.

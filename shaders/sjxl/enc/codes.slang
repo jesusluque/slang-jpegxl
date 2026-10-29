@@ -27,20 +27,18 @@ static const uint kBlobStrideWords = 2048;
 static const uint kNumAcContexts = 15 * (37 + 458);   // default BlockCtxMap
 static const int kPredictorZero = 0;
 static const int kPredictorGradient = 5;
+static const int kEpfSharpness = 4;   // what libjxl writes at every speed up to wombat
 
 struct CodeParams {
     uint numDcGroups;
     uint numGroups;
-    uint globalScale;
-    uint quantDc;
     uint blocksX;
     uint blocksY;
-    uint pad0;
-    uint pad1;
 };
 
 StructuredBuffer<uint4>    dcGroups;   // bx0, by0, w, h in blocks
 StructuredBuffer<uint>     hist;
+StructuredBuffer<uint>     quantizer;  // [0] global_scale, [1] quant_dc
 RWStructuredBuffer<uint>   codes;      // depth << 16 | bits
 RWStructuredBuffer<uint>   blobs;
 RWStructuredBuffer<uint>   blobBits;
@@ -408,10 +406,11 @@ uint loadHistogram(uint histBase) {
 // --- modular headers (GroupHeader + MA tree) ------------------------------------
 
 /// A leaf: property 0, `predictor`, offset 0, multiplier 1 (log 0, bits 0).
-void appendLeaf(inout uint tokens[12], inout uint count, int predictor) {
+/// A leaf: predictor, offset, multiplier 1 (mul_log 0, mul_bits 0).
+void appendLeaf(inout uint tokens[12], inout uint count, int predictor, int offset) {
     tokens[count++] = 0;
     tokens[count++] = uint(predictor);
-    tokens[count++] = 0;
+    tokens[count++] = packSigned(offset);
     tokens[count++] = 0;
     tokens[count++] = 0;
 }
@@ -450,7 +449,7 @@ void buildDcGroupBlobs(uint3 gid: SV_GroupID) {
     serialWrite(blobs, pre, 2, 0);
     uint tokens[12];
     uint count = 0;
-    appendLeaf(tokens, count, kPredictorGradient);
+    appendLeaf(tokens, count, kPredictorGradient, 0);
     writeModularTree(blobs, pre, tokens, count);
     const uint dcLen = loadHistogram((1 + 2 * g) * kCodeStride);
     writePrefixHistograms(blobs, pre, dcLen, 1, (1 + 2 * g) * kCodeStride);
@@ -458,7 +457,8 @@ void buildDcGroupBlobs(uint3 gid: SV_GroupID) {
 
     // "mid": count - 1, AcMetadata modular header. The tree's root splits on
     // the channel (property 0 > 2): the EPF channel takes the first leaf
-    // (context 0, an alphabet of one symbol), the others the second.
+    // (context 0, an alphabet of one symbol: every block is sharpness 4
+    // through the leaf's offset), the others the second.
     SerialWriter mid;
     mid.base = (3 + 2 * g) * kBlobStrideWords;
     mid.pos = 0;
@@ -467,8 +467,8 @@ void buildDcGroupBlobs(uint3 gid: SV_GroupID) {
     count = 0;
     tokens[count++] = 1;                 // property 0 + 1
     tokens[count++] = packSigned(2);     // split value: channel > 2
-    appendLeaf(tokens, count, kPredictorZero);
-    appendLeaf(tokens, count, kPredictorZero);
+    appendLeaf(tokens, count, kPredictorZero, kEpfSharpness);
+    appendLeaf(tokens, count, kPredictorZero, 0);
     writeModularTree(blobs, mid, tokens, count);
     const uint metaLen = loadHistogram((2 + 2 * g) * kCodeStride);
     serialWrite(blobs, mid, 1, 0);       // lz77.enabled
@@ -502,9 +502,9 @@ void buildGlobalBlobs(uint3 gid: SV_GroupID) {
     dc.pos = 0;
     serialWrite(blobs, dc, 1, 1);
     serialWriteU32(blobs, dc, distrBitsOffset(11, 1), distrBitsOffset(11, 2049), distrBitsOffset(12, 4097),
-                   distrBitsOffset(16, 8193), params.globalScale);
+                   distrBitsOffset(16, 8193), quantizer[0]);
     serialWriteU32(blobs, dc, distrVal(16), distrBitsOffset(5, 1), distrBitsOffset(8, 1), distrBitsOffset(16, 1),
-                   params.quantDc);
+                   quantizer[1]);
     serialWrite(blobs, dc, 1, 1);
     serialWrite(blobs, dc, 1, 1);
     serialWrite(blobs, dc, 1, 0);

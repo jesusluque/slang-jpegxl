@@ -21,6 +21,13 @@ struct QuantParams {
     float    invGlobalScale = 0;   ///< 2^16 / globalScale
 };
 [[nodiscard]] QuantParams quantParamsForDistance(float distance);
+/// Quantizer::ComputeGlobalScaleAndQuant(quantDc, quantAc, 0) and the raw field value of `quantAc`.
+[[nodiscard]] QuantParams quantParamsFor(float quantAc, float quantDc);
+
+/// libjxl InitialQuantDC: the DC quantiser (before the global scale) for a distance.
+[[nodiscard]] float initialQuantDc(float distance);
+/// libjxl kAcQuant / distance: the unit of the adaptive quant field.
+[[nodiscard]] float initialQuantAc(float distance);
 
 /// libjxl kInvDCQuant, channels X, Y, B.
 constexpr std::array<float, 3> kInvDcQuant = {4096.0f, 512.0f, 256.0f};

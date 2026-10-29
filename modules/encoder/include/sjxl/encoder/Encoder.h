@@ -22,6 +22,13 @@ namespace sjxl::enc {
 struct Options {
     /// Butteraugli distance: smaller is higher quality (1.0 ~ libjxl quality 90).
     float distance = 1.0f;
+    /// Per-block quant field from libjxl's masking model; off: one value per frame.
+    bool adaptiveQuant = true;
+    /// Chroma-from-luma per 64 px tile; off: X and B against Y with the default factors.
+    bool chromaFromLuma = true;
+    /// Gaborish + EPF as libjxl chooses them for the distance, with the inverse
+    /// Gaborish applied before the DCT; off: LoopFilter disabled.
+    bool loopFilter = true;
 };
 
 /// What the last encode measured, for tests and the CLI.
@@ -29,6 +36,10 @@ struct Stats {
     uint32_t              headBytes = 0;
     uint32_t              bodyBytes = 0;
     std::vector<uint32_t> sectionBytes;
+    uint32_t              globalScale = 0;   ///< the quantizer the device chose
+    uint32_t              quantDc = 0;
+    bool                  gaborish = false;
+    uint32_t              epfIters = 0;
 };
 
 class Encoder {
@@ -43,7 +54,9 @@ private:
 
     std::shared_ptr<gpu::ShaderLibrary> library_;
     gpu::Device*                        device_ = nullptr;
-    gpu::ComputeKernel                  rgbToXyb_, dctQuant_, acItems_, dcItems_, metaItems_;
+    gpu::ComputeKernel                  rgbToXyb_, aqDiff_, aqMap_, aqRawField_;
+    gpu::ComputeKernel                  gaborishInverse_, dct_, cflTile_, quantize_;
+    gpu::ComputeKernel                  acItems_, dcItems_, metaItems_;
     gpu::ComputeKernel                  dcGroupBlobs_, globalBlobs_, layout_, blobEmit_;
     gpu::PrefixSum                      prefixSum_;
     gpu::Buffer                         dequant_;   // 3 * 64 floats

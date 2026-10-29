@@ -17,7 +17,7 @@ ctest --test-dir build/macos-arm64-debug -R prefix          # tests matching a n
 build/macos-arm64-debug/bin/sjxl_gpu_tests "prefix sum*"    # one Catch2 case by name (or a [tag])
 cmake --build build/macos-arm64-debug --target sjxl_gpu_tests   # one binary
 build/macos-arm64-debug/bin/sjxl info [in.jxl]              # device info, or a file's headers and frame list
-build/macos-arm64-debug/bin/sjxl encode in.png out.jxl --distance 1.0   # M1
+build/macos-arm64-debug/bin/sjxl encode in.png out.jxl --distance 1.0 [--no-aq] [--no-cfl] [--no-filters]
 build/macos-arm64-debug/bin/sjxl decode in.jxl out.png                  # every stage on the GPU; animations write out_000.png, ...
 build/macos-arm64-debug/bin/sjxl compare a.png b.png                    # PSNR + largest diff, on the GPU
 build/macos-arm64-debug/bin/sjxl pixel a.png x y ; sjxl convert in.png out.png   # one pixel; re-save as RGB8
@@ -99,7 +99,7 @@ Modules are static libraries `sjxl_<name>` aliased `sjxl::<name>`
 | codestream | CPU-side syntax only: `BitWriter`, U32/U64/F16 field coders, SizeHeader, ImageMetadata, FrameHeader, LoopFilter, TOC (`Headers.h`); `Tables.h`: quantizer params from a distance, DCT8 dequant weights, natural order, computed from libjxl formulas |
 | image | file I/O only: PNG/PPM/JPEG via stb (`readRgb8` 8-bit RGB, `readImage8` keeps alpha, `readImage` keeps alpha and 16-bit depth; `Rgb8` has `channels` 3/4 and `bitDepth` 8/16; `writePng` writes 16-bit PNGs itself; `readFile`, `writeFile`) |
 | metrics | `metrics::compare`: PSNR, largest difference and where, measured by `shaders/sjxl/metrics/compare.slang`; what tests and `sjxl compare` use |
-| encoder | `enc::Encoder::encode(Rgb8, Options{distance})`: the GPU encode pipeline (`shaders/sjxl/enc/`): xyb → dct_quant → items (mode 0 histogram, 1 count, 2 emit) → codes (Huffman + headers per DC group, globals) → prefix sums → layout → emit |
+| encoder | `enc::Encoder::encode(Rgb8, Options{distance, adaptiveQuant, chromaFromLuma, loopFilter})`: the GPU encode pipeline (`shaders/sjxl/enc/`): xyb → aq (quant field) → gaborish (inverse) → cfl (dct, per-tile least squares) → quantize (AdjustQuantBlockAC, dead zones) → items (mode 0 histogram, 1 count, 2 emit) → codes (Huffman + headers per DC group, globals) → prefix sums → layout → emit |
 | decoder | `dec::Decoder::decode(bytes)`: `codestream::parse` on the CPU, then `shaders/sjxl/dec/`: sections (one thread per section: globals, DC groups, AC groups; libraries entropy/modular/frame/modframe .slangh over one `arena` buffer) → VarDCT: tables → dc_finalize → transforms; Modular: finalise (inverse transforms) → modular_out (channels to planes) → filters → output |
 | decoder (M2) | `dec::Decoder`: the GPU decode pipeline |
 
@@ -107,13 +107,20 @@ Granularity glossary: block 8×8 px; varblock = one transform (8×8 to 256×256)
 tile 64×64 px (chroma-from-luma); AC group 256×256 px (one entropy-coded
 section per pass); DC group 2048×2048 px (one section: DC + AcMetadata).
 
-Encoder stages (M1 profile; each a kernel, one `CommandBatch` per stage):
-sRGB8→XYB per pixel → DCT8 + quantise per block → DC gradient residual and
-AcMetadata tokens → histograms (atomics) → 15-bit length-limited prefix codes
-+ Brotli-style code-length serialisation per histogram → token bit lengths →
-prefix sums (section bit offsets, section byte sizes) → bit emission by
-`InterlockedOr` into a zeroed body buffer → readback of sizes and body; CPU
-writes headers + TOC and appends the body.
+Encoder stages (each a kernel, one `CommandBatch` per stage): sRGB8→XYB per
+pixel → adaptive quant field (libjxl's masking model per 4×4 cell and block,
+`aq.slang`; the quantizer's global scale is 0.39/distance as libjxl's hare
+tier) → inverse Gaborish → DCT8 per block (float coefficients) →
+chroma-from-luma per 64 px tile (least squares on the scaled coefficients) →
+quantise per block (AdjustQuantBlockAC per channel, Y dead zones, CfL
+residuals, x_qm_scale) → DC gradient residual and AcMetadata tokens (YtoX,
+YtoB, strategy, qf, sharpness 4) → histograms (atomics) → 15-bit
+length-limited prefix codes + Brotli-style code-length serialisation per
+histogram → token bit lengths → prefix sums (section bit offsets, section
+byte sizes) → bit emission by `InterlockedOr` into a zeroed body buffer →
+readback of sizes and body; CPU writes headers (LoopFilter: Gaborish above
+d 0.5, EPF iterations by distance) + TOC and appends the body.
+`sjxl encode --no-aq --no-cfl --no-filters` switch the stages off for A/B runs.
 
 Decoder stages: CPU parses signature/headers/TOC into a section table →
 one-thread kernels decode DcGlobal and AcGlobal (quantizer, block context

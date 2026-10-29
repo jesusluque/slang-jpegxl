@@ -64,7 +64,7 @@ TEST_CASE("djxl decodes what the encoder writes", "[encoder][conformance]") {
     REQUIRE(metrics);
     WARN(std::format("{} d={}: PSNR {:.2f} dB, max diff {} at ({},{}) c{}, {} bytes", name, distance, metrics->psnr,
                      metrics->maxAbsDiff, metrics->maxAtX, metrics->maxAtY, metrics->maxAtChannel, encoded->size()));
-    // M1 profile: DCT8 only, uniform quant field, no loop filter. Floors are
+    // DCT8 only, adaptive quant field, CfL, Gaborish + EPF. Floors are
     // recorded in docs/decisions.md.
     CHECK(metrics->psnr >= (distance <= 1.0f ? 30.0 : 24.0));
 }

@@ -11,7 +11,7 @@
 // bx) * 3 + ci (ci: Y, X, B); DC items g * 196608 + ci * 65536 + by * 256 + bx;
 // AcMetadata items g * 133120 + [0,1024) YtoX tiles, [1024,2048) YtoB tiles,
 // then 65536 strategies and 65536 quant-field values (the EPF channel costs
-// no bits: its alphabet has one symbol). Items outside their group's rect
+// no bits: its alphabet has one symbol, sharpness 4 through the leaf offset). Items outside their group's rect
 // are 0 bits.
 module enc_items;
 
@@ -32,7 +32,7 @@ struct ItemParams {
     uint numGroups;
     uint numDcGroups;
     uint mode;          // 0 histogram, 1 count, 2 emit
-    uint quantField;    // uniform qf, stored as qf - 1
+    uint tilesX;        // chroma-from-luma tiles across the frame
     uint pad0;
 };
 
@@ -42,6 +42,9 @@ StructuredBuffer<int>      acQuant;       // [c][block][k]
 StructuredBuffer<int>      dcQuant;       // [c][block]
 StructuredBuffer<uint>     nonZeros;      // [c][block]
 StructuredBuffer<uint>     order;         // natural order, 64 entries
+StructuredBuffer<uint>     rawQf;         // [block]: the quant field, 1..256
+StructuredBuffer<int>      cmapX;         // [tile]: YtoX
+StructuredBuffer<int>      cmapB;         // [tile]: YtoB
 StructuredBuffer<uint>     codes;         // depth << 16 | bits; region r at r * 256
 RWStructuredBuffer<uint>   hist;          // same regions as codes
 RWStructuredBuffer<uint>   itemBits;      // mode 1 output
@@ -175,17 +178,21 @@ void metaItems(uint3 tid: SV_DispatchThreadID) {
     const uint tilesX = (rect.z + 7) / 8;
     const uint tilesY = (rect.w + 7) / 8;
     if (l < 2 * kMetaTiles) {
-        // YtoX then YtoB, one value per 64 px tile: no chroma-from-luma yet, 0.
+        // YtoX then YtoB, one value per 64 px tile, from the chroma-from-luma pass.
         const uint t = l % kMetaTiles;
-        if (t % 32 < tilesX && t / 32 < tilesY) {
-            token(cur, packSigned(0));
+        const uint tx = t % 32, ty = t / 32;
+        if (tx < tilesX && ty < tilesY) {
+            const uint tile = (rect.y / 8 + ty) * params.tilesX + rect.x / 8 + tx;
+            token(cur, packSigned(l < kMetaTiles ? cmapX[tile] : cmapB[tile]));
         }
     } else {
         const uint b = (l - 2 * kMetaTiles) % kMetaBlocks;
         const bool qfRow = (l - 2 * kMetaTiles) >= kMetaBlocks;
-        if (b % 256 < rect.z && b / 256 < rect.w) {
+        const uint bx = b % 256, by = b / 256;
+        if (bx < rect.z && by < rect.w) {
             // Strategy row: DCT8 everywhere; QF row: qf - 1.
-            token(cur, packSigned(qfRow ? int(params.quantField) - 1 : 0));
+            const uint block = (rect.y + by) * params.blocksX + rect.x + bx;
+            token(cur, packSigned(qfRow ? int(rawQf[block]) - 1 : 0));
         }
     }
     if (params.mode == 1) {

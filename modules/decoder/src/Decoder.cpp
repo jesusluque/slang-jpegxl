@@ -869,6 +869,14 @@ Result<Decoder::FrameOutput> Decoder::run(const codestream::Parsed& parsed, cons
                 log::info("dec debug: acs row {:3} {}", by, row);
             }
         }
+        if (!platform::env("SJXL_DEBUG_QF").empty()) {
+            // quant field: one number per 8x8 block
+            for (uint32_t by = 0; by < dim.ysizeBlocks; ++by) {
+                std::string row;
+                for (uint32_t bx = 0; bx < dim.xsizeBlocks; ++bx) row += std::format("{:3}", qfHost[by * dim.xsizeBlocks + bx]);
+                log::info("dec debug: qf row {:3} {}", by, row);
+            }
+        }
         for (uint32_t ch = 0; ch < 3; ++ch) {
             std::string dq;
             for (int k = 0; k < 16; ++k) dq += std::format("{:.5f} ", dqHost[(ch * nblocks + dbgBlock) * 64 + k]);
