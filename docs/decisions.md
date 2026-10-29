@@ -1666,3 +1666,20 @@ small data, pure latency), the AC token readback (24 ms for the 25 MB
 per-slot token buffer; a compacted token list would cut it), the two
 strategy passes (50 ms) and the CPU chains themselves (18 + 19 ms, of which a
 part is waiting for the GPU work before each readback). cjxl -e 5: 90 ms.
+
+## Linux targets: what is checked from the Mac (2026-10-29)
+
+The `linux-x86_64-{debug,release}` presets build slang-rhi with CUDA and
+Vulkan (`cmake/Dependencies.cmake`), the device tries CUDA then Vulkan
+(`SJXL_BACKEND` reorders), `Buffer::create` clears new buffers on those
+backends (Metal hands out zeroed memory, they do not), the shader cache goes
+to `$XDG_CACHE_HOME` or `~/.cache`, and `platform::executableDir` reads
+`/proc/self/exe`. Without a Linux GPU here, `tools/check_targets.sh` compiles
+every compute entry of every shader for Metal, CUDA and SPIR-V with slangc:
+118 entries, no failures on any target (a first run reported 118 SPIR-V
+failures that were slangc refusing to write binary output to /dev/null).
+Still to be verified on hardware: slang-rhi's CUDA and Vulkan device
+creation with the pinned commit and patches, 64-bit atomics are not used
+(`InterlockedOr` on 32-bit words only), `[noinline]` and threadgroup sizes
+under the SPIR-V backend, and the timing of the single-thread kernels on a
+discrete GPU, where the CPU readbacks of this milestone cross PCIe.

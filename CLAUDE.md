@@ -28,6 +28,7 @@ SJXL_DEBUG=1 SJXL_DEBUG_BLOCK=57 build/macos-arm64-debug/bin/sjxl decode ...    
 SJXL_DEBUG=1 SJXL_DEBUG_ACS=1 SJXL_DEBUG_TABLES=/tmp/t.bin ... decode ...      # strategy map per block; dequant tables to a file
 cjxl in.png x.jxl -e 7 -d 1 --epf=0 --gaborish=0   # isolates the transform path from the filters
 ~/tools/slang/bin/slangc shaders/sjxl/<dir>/<file>.slang -I shaders -target metal -entry <entry> -stage compute -o /dev/null
+tools/check_targets.sh [metal cuda spirv]        # every kernel entry for every backend target (SPIR-V needs a real output file)
 cjxl in.png ref.jxl -d 1 -e 5 ; djxl out.jxl check.png      # Homebrew oracle (/opt/homebrew/bin)
 ```
 
