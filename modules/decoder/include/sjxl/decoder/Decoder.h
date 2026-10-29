@@ -37,22 +37,31 @@ class Decoder {
 public:
     [[nodiscard]] static Result<std::unique_ptr<Decoder>> create(std::shared_ptr<gpu::ShaderLibrary> library);
 
-    /// Headers only, no device work.
+    /// Headers only, no device work. Stops at a permuted TOC (Parsed::incomplete).
     [[nodiscard]] static Result<codestream::Parsed> info(std::span<const uint8_t> file) { return codestream::parse(file); }
+    /// Headers of every frame, finishing permuted TOCs with the device.
+    [[nodiscard]] Result<codestream::Parsed> parseAll(std::span<const uint8_t> file);
 
     [[nodiscard]] Result<image::Rgb8> decode(std::span<const uint8_t> file);
     [[nodiscard]] const Stats& stats() const noexcept { return stats_; }
 
 private:
     Decoder() = default;
-    /// One frame; a reference-only frame stores its planes in `refs` and returns an empty image.
+    /// One frame; a reference-only frame stores its planes in `refs`, a DC frame in
+    /// `dcFrames[level]`, and both return an empty image.
     [[nodiscard]] Result<image::Rgb8> run(const codestream::Parsed& parsed, const codestream::ParsedFrame& frame, bool withLz77Windows,
-                                          std::array<RefFrame, 4>& refs);
+                                          std::array<RefFrame, 4>& refs, std::array<RefFrame, 5>& dcFrames);
+    /// The permutation of a permuted TOC, decoded by a kernel: the order and the bit after it.
+    struct TocPermutation {
+        std::vector<uint32_t> order;
+        size_t endBit = 0;
+    };
+    [[nodiscard]] Result<TocPermutation> decodeTocPermutation(const codestream::Parsed& parsed, const codestream::ParsedFrame& frame);
 
     std::shared_ptr<gpu::ShaderLibrary> library_;
     gpu::Device*                        device_ = nullptr;
     gpu::ComputeKernel globals_, dcGroups_, acGroups_, tables_, smoothDc_, computeSigma_, dequantCoeffs_, llfFromDc_, idctRows_, idctCols_, transformSpecial_,
-        gaborish_, epf_, output_, modularGlobals_, modularDcGroups_, modularAcGroups_, modularFinalize_, modularToPlanes_, bucketPatches_, applyPatches_;
+        gaborish_, epf_, output_, modularGlobals_, modularDcGroups_, modularAcGroups_, modularFinalize_, modularToPlanes_, bucketPatches_, applyPatches_, tocPermutation_, dcFromFrame_;
     Stats stats_;
 };
 

@@ -24,16 +24,18 @@ struct DcGroupGeom {
     uint numDcGroups;
     uint group;
     uint groupBlocks;    // AC group size in blocks (groupDim / 8)
+    uint useDcFrame;     // kUseDcFrame: the DC comes from a DC frame, nothing of it is coded here
 };
 
 void decodeDcGroup(inout Dec d, DcGroupGeom g, uint windowOff) {
     const GlobalTree global = globalTree();
-    // VarDCT DC: extra precision, three channels in Y, X, B order.
-    const uint extraPrecision = brRead(d.br, 2);
-    const float mul = 1.0f / float(1u << extraPrecision);
     const uint chansOff = alloc(d, kMaxChannels * kChanWords);
     if (d.error != kErrNone) return;
     uint numChannels = 3;
+    if (g.useDcFrame == 0) {
+    // VarDCT DC: extra precision, three channels in Y, X, B order.
+    const uint extraPrecision = brRead(d.br, 2);
+    const float mul = 1.0f / float(1u << extraPrecision);
     for (uint i = 0; i < 3; ++i) storeChannel(chansOff, i, newChannel(d, g.w, g.h, 0, 0));
     if (d.error != kErrNone) return;
     decodeModularStream(d, chansOff, numChannels, 1 + g.group, global, windowOff, 8);
@@ -74,6 +76,7 @@ void decodeDcGroup(inout Dec d, DcGroupGeom g, uint windowOff) {
             quantDcBucket[block] = bucket;
         }
     }
+    }   // VarDCT DC
     // ModularDC group: no channels without extra channels, nothing to read.
 
     // AcMetadata.

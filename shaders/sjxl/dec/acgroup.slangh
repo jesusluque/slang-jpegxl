@@ -44,7 +44,8 @@ struct AcGroupGeom {
     uint group;
 };
 
-void decodeAcGroup(inout Dec d, AcGroupGeom g, uint windowOff) {
+/// One pass of one AC group: coefficients are added, shifted by the pass's shift.
+void decodeAcGroup(inout Dec d, AcGroupGeom g, uint pass, uint shift, uint windowOff) {
     const uint numHistograms = arena[kGsNumHistograms];
     const uint numCtxs = arena[kGsBctxNumCtxs];
     const uint acContexts = numCtxs * (kNonZeroBuckets + kZeroDensityContextCount);
@@ -55,9 +56,10 @@ void decodeAcGroup(inout Dec d, AcGroupGeom g, uint windowOff) {
         if (histo >= numHistograms) { fail(d, kErrCorrupt); return; }
         ctxOffset = histo * acContexts;
     }
-    SymReader r = makeSymReader(d, arena[kGsAcCodeSet], windowOff, 0);
+    SymReader r = makeSymReader(d, arena[passTable(pass) + 1], windowOff, 0);
     if (d.error != kErrNone) return;
-    const uint ordersOff = arena[kGsOrdersOff];
+    const uint ordersOff = arena[passTable(pass) + 0];
+    const int scale = int(1u << shift);
     // Group-local non-zero counts per channel, this row and the one above.
     const uint nzOff = alloc(d, 3 * 2 * 32);
     if (d.error != kErrNone) return;
@@ -114,7 +116,7 @@ void decodeAcGroup(inout Dec d, AcGroupGeom g, uint windowOff) {
                     const uint idx = arena[orderOff + k];
                     const uint q = idx >> 6;
                     const uint target = (g.y0 + by + q / cx) * g.blocksX + g.x0 + bx + q % cx;
-                    coeffs[(c * g.nblocks + target) * 64 + (idx & 63)] += coeff;
+                    coeffs[(c * g.nblocks + target) * 64 + (idx & 63)] += coeff * scale;
                     prev = u != 0 ? 1 : 0;
                     nzeros -= prev;
                 }

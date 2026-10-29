@@ -54,10 +54,10 @@ per subsystem or milestone, appended to as the work goes. Dates are absolute.
 - **M3 encoder quality**: inverse Gaborish + default LoopFilter, EPF sharpness,
   CfL per tile, adaptive quant field, DCT16/32 strategy search, context
   clustering (≤ 32, fixed-point costs as cujpegxl), ANS for AC.
-- **M4 decoder completeness**: upsampling, splines/noise, progressive
-  passes, alpha and extra channels, >8-bit output, ICC, animation, JPEG
-  recompression. (64–256 px transforms, Modular frames with
-  RCT/palette/Squeeze, lossy modular, patches: done.)
+- **M4 decoder completeness**: upsampling, splines/noise, alpha and extra
+  channels, >8-bit output, ICC, animation, JPEG recompression. (64–256 px
+  transforms, Modular frames with RCT/palette/Squeeze, lossy modular,
+  patches, progressive passes, DC frames, permuted TOCs: done.)
 - **M5 platforms and speed**: Linux CUDA/Vulkan, async readback, batching,
   per-stage timings here.
 
@@ -298,3 +298,39 @@ bit-exact for lossless.
 
 Not done: extra channels and alpha blending in patches, splines, noise,
 animation/blending of several displayed frames, DC frames, upsampling.
+
+## Progressive: passes, DC frames, permuted TOCs (2026-10-29)
+
+`cjxl -p` writes, for VarDCT, a Modular *DC frame* (frame type 1, the image at
+1/8, itself in 3 passes with a permuted TOC) followed by the displayed frame
+with kUseDcFrame and 3 passes; for Modular images, one frame in 2 passes with
+a permuted TOC. Three pieces:
+
+- **Passes** (`frame.slangh decodeAcGlobal`, `acgroup.slangh`,
+  `sections.slang`): AcGlobal carries per pass the coefficient orders and
+  the AC histograms, kept in a pass table in the arena; the AC group of pass
+  p is TOC entry 2 + nDC + p·nAC + g. The AC group thread decodes its passes
+  in order, adding `coefficient << shift` to the same slots (libjxl
+  interleaves the passes per block, which only matters for its per-pass
+  non-zero rows; ours are per call). Modular groups decode per pass the
+  channels in the pass's shift bracket (`GetDownsamplingBracket`, computed
+  on the host). The order table of every pass is 394k words, added to the
+  globals region per pass.
+- **Permuted TOC** (`toc.slang`): the permutation is entropy coded and sits
+  *before* the section sizes, so the CPU cannot even find the sizes without
+  it. `parse()` stops at such a frame (`Parsed::incomplete`), a one-thread
+  kernel decodes the permutation and reports the bit after it, the host
+  reads both back (bookkeeping) and `finishToc()` reads the sizes, builds the
+  logical section table (`permuted_offsets[j] = offsets[permutation[j]]`) and
+  parses the frames that follow. `Decoder::parseAll` does the loop; `sjxl
+  info` uses it.
+- **DC frames**: a DC frame of level L is a Modular XYB frame of size
+  ⌈size / 8^L⌉, decoded like any frame and kept as planes in `dcFrames[L]`.
+  The frame below it (kUseDcFrame) reads no VarDCT DC in its DC groups (not
+  even extra_precision), skips AdaptiveDCSmoothing (FinalizeDC), and takes
+  its DC image from the planes (`dc_finalize.slang dcFromFrame`); its DC
+  context bucket is 0 (libjxl zero-fills quant_dc).
+
+Measured: `-p` at efforts 5 and 7 (distance 1), `-p -d 0 -e 7` and
+`-p -m 1 -d 1 -e 7` on the four test images and a 768 px gradient: within 1
+LSB, lossless bit-exact (`[progressive]` test).

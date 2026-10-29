@@ -228,3 +228,36 @@ TEST_CASE("the decoder applies cjxl's patches like djxl", "[decoder][conformance
     WARN(std::format("patches {}: {} frames, vs djxl PSNR {:.2f} dB, max diff {}", options, parsed->frames.size(), metrics->psnr, metrics->maxAbsDiff));
     CHECK(metrics->maxAbsDiff <= (tag == "lossless" ? 0 : 1));
 }
+
+TEST_CASE("the decoder matches djxl on cjxl's progressive output", "[decoder][conformance][cjxl][progressive]") {
+    const std::filesystem::path djxl = test::findTool("djxl");
+    const std::filesystem::path cjxl = test::findTool("cjxl");
+    if (djxl.empty() || cjxl.empty()) SKIP("cjxl/djxl are not installed");
+    const std::string name = GENERATE(std::string("sveti_64.png"), std::string("berlin_200.png"), std::string("sveti_crop_257x129.png"),
+                                      std::string("sveti_stefan_320.png"));
+    // -p: passes with a DC frame (VarDCT), a permuted TOC (modular).
+    const std::string options = GENERATE(std::string("-p -d 1 -e 5"), std::string("-p -d 1 -e 7"), std::string("-p -d 0 -e 7"),
+                                         std::string("-p -m 1 -d 1 -e 7"));
+    CAPTURE(name, options);
+    std::string tag = options;
+    for (char& ch : tag) if (ch == ' ' || ch == '-') ch = '_';
+    const std::filesystem::path jxl = test::scratchDir() / std::format("dec_prog_{}{}.jxl", name, tag);
+    const std::filesystem::path png = test::scratchDir() / std::format("dec_prog_{}{}.djxl.png", name, tag);
+    REQUIRE(test::run(std::format("\"{}\" \"{}\" \"{}\" {} >/dev/null 2>&1", cjxl.string(), test::testData(name).string(), jxl.string(), options)));
+    REQUIRE(test::run(std::format("\"{}\" \"{}\" \"{}\" >/dev/null 2>&1", djxl.string(), jxl.string(), png.string())));
+    auto bytes = image::readFile(jxl);
+    REQUIRE(bytes);
+    auto reference = image::readRgb8(png);
+    REQUIRE(reference);
+    auto ours = decoder().decode(*bytes);
+    if (!ours && ours.error().code() == ErrorCode::Unsupported) {
+        WARN(std::format("{} {}: unsupported: {}", name, options, ours.error().message()));
+        SUCCEED();
+        return;
+    }
+    REQUIRE(ours);
+    auto metrics = test::compare(*reference, *ours);
+    REQUIRE(metrics);
+    WARN(std::format("{} {}: vs djxl PSNR {:.2f} dB, max diff {}", name, options, metrics->psnr, metrics->maxAbsDiff));
+    CHECK(metrics->maxAbsDiff <= (options.find("-d 0") != std::string::npos ? 0 : 1));
+}

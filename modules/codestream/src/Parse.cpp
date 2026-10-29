@@ -302,11 +302,16 @@ Result<void> readFrameHeader(BitReader& br, const ImageMetadata& m, FrameHeader&
     }
     if (f.frameType != 2) {
         f.numPasses = br.readU32(U32Enc{{Val(1), Val(2), Val(3), BitsOffset(3, 4)}});
+        if (f.numPasses > 11) return corrupt("too many passes");
         if (f.numPasses != 1) {
-            const uint32_t numDownsample = br.readU32(U32Enc{{Val(0), Val(1), Val(2), BitsOffset(1, 3)}});
-            for (uint32_t i = 0; i + 1 < f.numPasses; ++i) (void)br.read(2);
-            for (uint32_t i = 0; i < numDownsample; ++i) (void)br.readU32(U32Enc{{Val(1), Val(2), Val(4), Val(8)}});
-            for (uint32_t i = 0; i < numDownsample; ++i) (void)br.readU32(U32Enc{{Val(0), Val(1), Val(2), Bits(3)}});
+            f.numDownsample = br.readU32(U32Enc{{Val(0), Val(1), Val(2), BitsOffset(1, 3)}});
+            if (f.numDownsample > 4 || f.numDownsample > f.numPasses) return corrupt("passes downsample count");
+            for (uint32_t i = 0; i + 1 < f.numPasses; ++i) f.passShift[i] = br.read(2);
+            for (uint32_t i = 0; i < f.numDownsample; ++i) f.downsample[i] = br.readU32(U32Enc{{Val(1), Val(2), Val(4), Val(8)}});
+            for (uint32_t i = 0; i < f.numDownsample; ++i) {
+                f.lastPass[i] = br.readU32(U32Enc{{Val(0), Val(1), Val(2), Bits(3)}});
+                if (f.lastPass[i] >= f.numPasses) return corrupt("passes last_pass");
+            }
         }
     }
     if (f.frameType == 1) {
@@ -425,6 +430,142 @@ Result<float> BitReader::readF16() {
     return value;
 }
 
+namespace {
+
+/// Section table of a frame from its sizes (codestream order) and permutation (logical ->
+/// codestream index; identity when empty), starting at `firstByte`. Returns the end byte.
+Result<size_t> buildSections(ParsedFrame& frame, const std::vector<uint32_t>& sizes, std::span<const uint32_t> permutation, size_t firstByte,
+                             size_t codestreamSize) {
+    const uint32_t n = static_cast<uint32_t>(sizes.size());
+    std::vector<size_t> offsets(n);
+    size_t offset = firstByte;
+    for (uint32_t i = 0; i < n; ++i) {
+        offsets[i] = offset;
+        offset += sizes[i];
+    }
+    if (offset > codestreamSize) return Error(ErrorCode::Corrupt, "sections past the end of the codestream");
+    frame.sections.resize(n);
+    for (uint32_t j = 0; j < n; ++j) {
+        const uint32_t i = permutation.empty() ? j : permutation[j];
+        if (i >= n) return Error(ErrorCode::Corrupt, "TOC permutation index");
+        frame.sections[j].byteOffset = offsets[i];
+        frame.sections[j].byteSize = sizes[i];
+    }
+    return offset;
+}
+
+/// The TOC sizes (byte aligned) at `bit`, then the sections. Returns the end byte.
+Result<size_t> readTocSizes(Parsed& p, ParsedFrame& frame, size_t bit, std::span<const uint32_t> permutation) {
+    BitReader fr(p.codestream, bit);
+    fr.jumpToByteBoundary();
+    std::vector<uint32_t> sizes(frame.numSections);
+    for (uint32_t& sz : sizes) sz = fr.readU32(kTocDist);
+    fr.jumpToByteBoundary();
+    if (!fr.withinBounds()) return Error(ErrorCode::Corrupt, "truncated TOC");
+    frame.tocEndBit = fr.bitPosition();
+    return buildSections(frame, sizes, permutation, frame.tocEndBit / 8, p.codestream.size());
+}
+
+/// Frames from `startByte` on: DC frames and reference-only Modular frames (patch
+/// dictionaries) may precede the displayed frame; each starts byte-aligned after the
+/// previous one's sections. Stops early (p.incomplete) at a permuted TOC.
+Result<void> parseFramesFrom(Parsed& p, size_t startByte) {
+    const ImageMetadata& m = p.metadata;
+    const auto unsupported = [](std::string what) { return Error(ErrorCode::Unsupported, std::move(what)); };
+    const auto corrupt = [](std::string what) { return Error(ErrorCode::Corrupt, std::move(what)); };
+    std::array<bool, 4> referenceSaved{};
+    std::array<bool, 5> dcFrameSaved{};
+    for (const ParsedFrame& earlier : p.frames) {
+        if (earlier.header.frameType == 2) referenceSaved[earlier.header.saveAsReference] = true;
+        if (earlier.header.frameType == 1) dcFrameSaved[earlier.header.dcLevel] = true;
+    }
+    size_t frameStartByte = startByte;
+    for (;;) {
+        if (p.frames.size() >= 16) return unsupported("more than 16 frames");
+        if (frameStartByte >= p.codestream.size()) return corrupt("codestream ends before the last frame");
+        BitReader fr(p.codestream, frameStartByte * 8);
+        ParsedFrame frame;
+        frame.frameHeaderBit = fr.bitPosition();
+        SJXL_TRY(readFrameHeader(fr, m, frame.header));
+        if (!fr.withinBounds()) return corrupt("truncated frame header");
+        const FrameHeader& f = frame.header;
+        const bool referenceOnly = f.frameType == 2;
+        const bool dcFrame = f.frameType == 1;
+        if (f.isModular) {
+            if (f.colorTransform == 2) return unsupported("Modular frames in YCbCr");
+            if (m.colorSpace != 0 && m.colorSpace != 1) return unsupported("Modular frames in a colour space other than RGB or grey");
+            if (m.floatingPointSample) return unsupported("floating point samples");
+        } else {
+            if (!m.xybEncoded || f.colorTransform != 0) return unsupported("VarDCT frames not encoded in XYB");
+            if (referenceOnly) return unsupported("VarDCT reference-only frames");
+            if (dcFrame) return unsupported("VarDCT DC frames");
+        }
+        if (f.frameType == 3) return unsupported("skip-progressive frames");
+        if (f.flags & FrameHeader::kNoise) return unsupported("noise synthesis");
+        if (f.flags & FrameHeader::kSplines) return unsupported("splines");
+        if (f.upsampling != 1) return unsupported("upsampling");
+        if (f.customSizeOrOrigin && !referenceOnly) return unsupported("frames with a custom size or origin");
+        if (referenceOnly) {
+            if (!f.saveBeforeColorTransform) return unsupported("reference frames saved after the colour transform");
+            if (f.saveAsReference >= 4) return corrupt("reference slot");
+            referenceSaved[f.saveAsReference] = true;
+        } else if (dcFrame) {
+            if (f.dcLevel < 1 || f.dcLevel > 4) return corrupt("DC frame level");
+            dcFrameSaved[f.dcLevel] = true;
+        } else if (!f.isLast) {
+            return unsupported("multiple displayed frames (animation or blending)");
+        }
+        if ((f.flags & FrameHeader::kPatches) && !referenceSaved[0] && !referenceSaved[1] && !referenceSaved[2] && !referenceSaved[3]) {
+            return corrupt("patches without a reference frame");
+        }
+        if ((f.flags & FrameHeader::kUseDcFrame) && !dcFrameSaved[f.dcLevel + 1]) return corrupt("kUseDcFrame without the DC frame");
+        uint32_t fx = f.customSizeOrOrigin ? f.frameXsize : m.xsize;
+        uint32_t fy = f.customSizeOrOrigin ? f.frameYsize : m.ysize;
+        if (dcFrame) {
+            fx = (fx + (1u << (3 * f.dcLevel)) - 1) >> (3 * f.dcLevel);
+            fy = (fy + (1u << (3 * f.dcLevel)) - 1) >> (3 * f.dcLevel);
+        }
+        frame.dim = frameDim(fx, fy, f.groupSizeShift);
+        // toc.h NumTocEntries: one entry for one group and one pass; else DcGlobal,
+        // DC groups, AcGlobal, then the AC groups of every pass.
+        frame.singleSection = frame.dim.numGroups() == 1 && f.numPasses == 1;
+        frame.numSections = frame.singleSection ? 1 : 2 + frame.dim.numDcGroups() + frame.dim.numGroups() * f.numPasses;
+        // TOC
+        if (fr.readBool()) {
+            // Entropy coded permutation: a kernel decodes it, finishToc() resumes here.
+            frame.tocPermuted = true;
+            frame.tocPermutationBit = fr.bitPosition();
+            p.frames.push_back(std::move(frame));
+            p.frame = p.frames.back();
+            p.incomplete = true;
+            return ok();
+        }
+        SJXL_ASSIGN(const size_t end, readTocSizes(p, frame, fr.bitPosition(), {}));
+        const bool displayed = !referenceOnly && !dcFrame;
+        p.frames.push_back(std::move(frame));
+        if (displayed) break;
+        frameStartByte = end;
+    }
+    p.frame = p.frames.back();
+    p.incomplete = false;
+    return ok();
+}
+
+}   // namespace
+
+Result<void> finishToc(Parsed& p, std::span<const uint32_t> permutation, size_t endBit) {
+    if (!p.incomplete || p.frames.empty()) return Error(ErrorCode::InternalError, "finishToc without a pending TOC");
+    ParsedFrame& frame = p.frames.back();
+    if (permutation.size() != frame.numSections) return Error(ErrorCode::Corrupt, "TOC permutation size");
+    SJXL_ASSIGN(const size_t end, readTocSizes(p, frame, endBit, permutation));
+    frame.tocPermuted = false;   // sections are final now
+    const bool displayed = frame.header.frameType != 1 && frame.header.frameType != 2;
+    p.incomplete = false;
+    p.frame = frame;
+    if (displayed) return ok();
+    return parseFramesFrom(p, end);
+}
+
 Result<Parsed> parse(std::span<const uint8_t> file) {
     Parsed p;
     SJXL_ASSIGN(p.codestream, unwrapContainer(file));
@@ -448,74 +589,7 @@ Result<Parsed> parse(std::span<const uint8_t> file) {
         return unsupported("transfer functions other than sRGB, linear, gamma and DCI (PQ/HLG/709)");
     }
 
-    // Frames: reference-only Modular frames (patch dictionaries) may precede the
-    // displayed frame; each starts byte-aligned after the previous one's sections.
-    std::array<bool, 4> referenceSaved{};
-    size_t frameStartByte = (br.bitPosition() + 7) / 8;
-    for (uint32_t frameIndex = 0;; ++frameIndex) {
-        if (frameIndex >= 16) return unsupported("more than 16 frames");
-        if (frameStartByte >= p.codestream.size()) return corrupt("codestream ends before the last frame");
-        BitReader fr(p.codestream, frameStartByte * 8);
-        ParsedFrame frame;
-        frame.frameHeaderBit = fr.bitPosition();
-        SJXL_TRY(readFrameHeader(fr, m, frame.header));
-        if (!fr.withinBounds()) return corrupt("truncated frame header");
-        const FrameHeader& f = frame.header;
-        const bool referenceOnly = f.frameType == 2;
-        if (f.isModular) {
-            if (f.frameType != 0 && !referenceOnly) return unsupported(std::format("Modular frames of type {}", f.frameType));
-            if (f.colorTransform == 2) return unsupported("Modular frames in YCbCr");
-            if (m.colorSpace != 0 && m.colorSpace != 1) return unsupported("Modular frames in a colour space other than RGB or grey");
-            if (m.floatingPointSample) return unsupported("floating point samples");
-        } else {
-            if (!m.xybEncoded || f.colorTransform != 0) return unsupported("VarDCT frames not encoded in XYB");
-            if (referenceOnly) return unsupported("VarDCT reference-only frames");
-        }
-        if (f.frameType == 1 || f.frameType == 3) return unsupported("DC or skip-progressive frames");
-        if (f.flags & FrameHeader::kNoise) return unsupported("noise synthesis");
-        if (f.flags & FrameHeader::kSplines) return unsupported("splines");
-        if (f.flags & FrameHeader::kUseDcFrame) return unsupported("DC frames");
-        if (f.upsampling != 1) return unsupported("upsampling");
-        if (f.numPasses != 1) return unsupported("progressive passes");
-        if (f.customSizeOrOrigin && !referenceOnly) return unsupported("frames with a custom size or origin");
-        if (referenceOnly) {
-            if (!f.saveBeforeColorTransform) return unsupported("reference frames saved after the colour transform");
-            if (f.saveAsReference >= 4) return corrupt("reference slot");
-            referenceSaved[f.saveAsReference] = true;
-        } else if (!f.isLast) {
-            return unsupported("multiple displayed frames (animation or blending)");
-        }
-        if ((f.flags & FrameHeader::kPatches) && !referenceSaved[0] && !referenceSaved[1] && !referenceSaved[2] && !referenceSaved[3]) {
-            return corrupt("patches without a reference frame");
-        }
-        const uint32_t fx = f.customSizeOrOrigin ? f.frameXsize : m.xsize;
-        const uint32_t fy = f.customSizeOrOrigin ? f.frameYsize : m.ysize;
-        frame.dim = frameDim(fx, fy, f.groupSizeShift);
-        const uint32_t numEntries = frame.dim.singleSection() ? 1 : frame.dim.numSections();
-        frame.singleSection = frame.dim.singleSection();
-        // TOC
-        if (fr.readBool()) {
-            return unsupported("TOC permutation (entropy coded; decoded on the device in a later milestone)");
-        }
-        fr.jumpToByteBoundary();
-        std::vector<uint32_t> sizes(numEntries);
-        for (uint32_t& sz : sizes) sz = fr.readU32(kTocDist);
-        fr.jumpToByteBoundary();
-        if (!fr.withinBounds()) return corrupt("truncated TOC");
-        frame.tocEndBit = fr.bitPosition();
-        size_t offset = frame.tocEndBit / 8;
-        frame.sections.resize(numEntries);
-        for (uint32_t i = 0; i < numEntries; ++i) {
-            frame.sections[i].byteOffset = offset;
-            frame.sections[i].byteSize = sizes[i];
-            offset += sizes[i];
-        }
-        if (offset > p.codestream.size()) return corrupt("sections past the end of the codestream");
-        p.frames.push_back(std::move(frame));
-        if (!referenceOnly) break;
-        frameStartByte = offset;
-    }
-    p.frame = p.frames.back();
+    SJXL_TRY(parseFramesFrom(p, (br.bitPosition() + 7) / 8));
     return p;
 }
 

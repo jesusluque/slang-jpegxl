@@ -40,6 +40,9 @@ static const uint kGsTreeNumNodes = 33;
 static const uint kGsTreeNumLeaves = 34;
 static const uint kGsTreeCodeSet = 35;
 static const uint kGsTreeUsesWp = 36;
+static const uint kGsNumPasses = 37;
+static const uint kGsPassTableOff = 38;    // numPasses x kPassWords: ordersOff, codeSet, usedOrders, 0
+static const uint kPassWords = 4;
 static const uint kGsNumHistograms = 40;
 static const uint kGsAcCodeSet = 41;
 static const uint kGsUsedOrders = 42;
@@ -545,17 +548,16 @@ void readCoeffOrder(inout Dec d, inout SymReader r, uint llf, uint size, uint na
 }
 
 /// DecodeCoeffOrders for one pass: used_orders and the orders of every bucket.
-void readCoeffOrders(inout Dec d, uint windowOff) {
+uint readCoeffOrders(inout Dec d, uint windowOff, out uint usedOrdersOut) {
     const uint usedOrders = brU32(d.br, distrVal(0x5F), distrVal(0x13), distrVal(0), distrBitsOffset(13, 0));
-    arena[kGsUsedOrders] = usedOrders;
+    usedOrdersOut = usedOrders;
     const uint ordersOff = alloc(d, kCoeffOrderLimit * 64);
-    arena[kGsOrdersOff] = ordersOff;
-    if (d.error != kErrNone) return;
+    if (d.error != kErrNone) return ordersOff;
     uint codeSet = 0;
     SymReader r;
     if (usedOrders != 0) {
         codeSet = decodeHistograms(d, 8, false, windowOff);
-        if (d.error != kErrNone) return;
+        if (d.error != kErrNone) return ordersOff;
         r = makeSymReader(d, codeSet, windowOff, 0);
     }
     uint computed = 0;
@@ -578,25 +580,63 @@ void readCoeffOrders(inout Dec d, uint windowOff) {
         } else {
             // The natural order is needed while the three permutations are applied.
             const uint keep = alloc(d, size);
-            if (d.error != kErrNone) return;
+            if (d.error != kErrNone) return ordersOff;
             for (uint k = 0; k < size; ++k) arena[keep + k] = arena[natural + k];
             for (uint c = 0; c < 3; ++c) {
                 readCoeffOrder(d, r, llf, size, keep, ordersOff + coeffOrderOffset(ord, c));
-                if (d.error != kErrNone) return;
+                if (d.error != kErrNone) return ordersOff;
             }
         }
     }
     if (usedOrders != 0 && !checkFinalState(r)) fail(d, kErrCorrupt);
+    return ordersOff;
 }
 
-/// The whole AcGlobal section for a single-pass frame.
-void decodeAcGlobal(inout Dec d, uint numGroups, uint windowOff) {
+/// DecodePermutation(skip 0) for the TOC: its own histograms over 8 contexts, the
+/// Lehmer code, the permutation into dest[0..size). Returns the bit position after it.
+uint readTocPermutation(inout Dec d, uint size, uint dest) {
+    const uint codeSet = decodeHistograms(d, 8, false, 0xFFFFFFFFu);
+    if (d.error != kErrNone) return d.br.pos;
+    SymReader r = makeSymReader(d, codeSet, 0xFFFFFFFFu, 0);
+    if (d.error != kErrNone) return d.br.pos;
+    const uint natural = alloc(d, size);
+    if (d.error != kErrNone) return d.br.pos;
+    for (uint i = 0; i < size; ++i) arena[natural + i] = i;
+    readCoeffOrder(d, r, 0, size, natural, dest);
+    if (d.error != kErrNone) return d.br.pos;
+    if (!checkFinalState(r)) fail(d, kErrCorrupt);
+    return d.br.pos;
+}
+
+/// The pass table entry of pass p.
+uint passTable(uint p) { return arena[kGsPassTableOff] + p * kPassWords; }
+
+/// The whole AcGlobal section: dequant matrices, the histogram count, then per
+/// pass the coefficient orders and the AC histograms (ProcessACGlobal).
+void decodeAcGlobal(inout Dec d, uint numGroups, uint numPasses, uint windowOff) {
     readDequantMatrices(d);
     if (d.error != kErrNone) return;
     const uint numHistograms = 1 + brRead(d.br, ceilLog2Nonzero(numGroups));
     arena[kGsNumHistograms] = numHistograms;
-    readCoeffOrders(d, windowOff);
+    arena[kGsNumPasses] = numPasses;
+    const uint table = alloc(d, numPasses * kPassWords);
+    arena[kGsPassTableOff] = table;
     if (d.error != kErrNone) return;
     const uint numContexts = numHistograms * arena[kGsBctxNumCtxs] * (kNonZeroBuckets + kZeroDensityContextCount);
-    arena[kGsAcCodeSet] = decodeHistograms(d, numContexts, false, windowOff);
+    for (uint p = 0; p < numPasses; ++p) {
+        uint usedOrders;
+        const uint ordersOff = readCoeffOrders(d, windowOff, usedOrders);
+        if (d.error != kErrNone) return;
+        const uint codeSet = decodeHistograms(d, numContexts, false, windowOff);
+        if (d.error != kErrNone) return;
+        arena[table + p * kPassWords + 0] = ordersOff;
+        arena[table + p * kPassWords + 1] = codeSet;
+        arena[table + p * kPassWords + 2] = usedOrders;
+        arena[table + p * kPassWords + 3] = 0;
+        if (p == 0) {   // pass 0 also in the single-pass slots (debug readers)
+            arena[kGsOrdersOff] = ordersOff;
+            arena[kGsAcCodeSet] = codeSet;
+            arena[kGsUsedOrders] = usedOrders;
+        }
+    }
 }

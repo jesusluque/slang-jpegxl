@@ -106,6 +106,9 @@ struct FrameHeader {
     uint32_t groupSizeShift = 1;
     uint32_t xQmScale = 3, bQmScale = 2;
     uint32_t numPasses = 1;
+    std::array<uint32_t, 11> passShift{};          // passes.shift (0 for the last pass)
+    uint32_t numDownsample = 0;
+    std::array<uint32_t, 4> downsample{}, lastPass{};
     uint32_t dcLevel = 0;
     bool     customSizeOrOrigin = false;
     int32_t  x0 = 0, y0 = 0;
@@ -130,8 +133,11 @@ struct ParsedFrame {
     FrameDim              dim;
     size_t                frameHeaderBit = 0;   // where the frame header starts
     size_t                tocEndBit = 0;        // first section starts here (byte aligned)
-    std::vector<Section>  sections;             // in codestream order, after permutation
+    std::vector<Section>  sections;             // logical order (DcGlobal, DC groups, AcGlobal, AC groups per pass)
     bool                  singleSection = false;
+    uint32_t              numSections = 0;
+    bool                  tocPermuted = false;    // the TOC starts with an entropy-coded permutation
+    size_t                tocPermutationBit = 0;  // its first bit; finishToc() continues from after it
 };
 
 struct Parsed {
@@ -139,7 +145,13 @@ struct Parsed {
     std::vector<uint8_t>     codestream;   // the raw codestream (boxes unwrapped)
     std::vector<ParsedFrame> frames;       // in codestream order; the last one is displayed
     ParsedFrame              frame;        // the displayed (last) frame, a copy of frames.back()
+    bool                     incomplete = false;   // frames.back() has a permuted TOC still to finish (finishToc)
 };
+
+/// After a kernel decoded the permutation of frames.back()'s TOC (`permutation[j]` is the
+/// codestream index of logical section j; `endBit` the bit after it): reads the sizes,
+/// builds the sections, and parses the frames that follow.
+[[nodiscard]] Result<void> finishToc(Parsed& p, std::span<const uint32_t> permutation, size_t endBit);
 
 /// Unwraps the container if present (jxlc / jxlp boxes), parses the headers
 /// and every frame's header and TOC (reference-only frames for patches, then

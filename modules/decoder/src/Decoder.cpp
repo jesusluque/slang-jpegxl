@@ -64,6 +64,8 @@ Result<std::unique_ptr<Decoder>> Decoder::create(std::shared_ptr<gpu::ShaderLibr
     SJXL_ASSIGN(dec->modularAcGroups_, gpu::ComputeKernel::create(lib, "sjxl/dec/sections", "decodeModularAcGroups"));
     SJXL_ASSIGN(dec->modularFinalize_, gpu::ComputeKernel::create(lib, "sjxl/dec/sections", "modularFinalizeFrame"));
     SJXL_ASSIGN(dec->modularToPlanes_, gpu::ComputeKernel::create(lib, "sjxl/dec/modular_out", "modularToPlanes"));
+    SJXL_ASSIGN(dec->tocPermutation_, gpu::ComputeKernel::create(lib, "sjxl/dec/toc", "decodeTocPermutation"));
+    SJXL_ASSIGN(dec->dcFromFrame_, gpu::ComputeKernel::create(lib, "sjxl/dec/dc_finalize", "dcFromFrame"));
     SJXL_ASSIGN(dec->bucketPatches_, gpu::ComputeKernel::create(lib, "sjxl/dec/patches", "bucketPatches"));
     SJXL_ASSIGN(dec->applyPatches_, gpu::ComputeKernel::create(lib, "sjxl/dec/patches", "applyPatches"));
     SJXL_ASSIGN(dec->gaborish_, gpu::ComputeKernel::create(lib, "sjxl/dec/filters", "gaborish"));
@@ -72,14 +74,24 @@ Result<std::unique_ptr<Decoder>> Decoder::create(std::shared_ptr<gpu::ShaderLibr
     return dec;
 }
 
+Result<codestream::Parsed> Decoder::parseAll(std::span<const uint8_t> file) {
+    SJXL_ASSIGN(codestream::Parsed parsed, codestream::parse(file));
+    while (parsed.incomplete) {
+        SJXL_ASSIGN(const TocPermutation perm, decodeTocPermutation(parsed, parsed.frames.back()));
+        SJXL_TRY(codestream::finishToc(parsed, perm.order, perm.endBit));
+    }
+    return parsed;
+}
+
 Result<image::Rgb8> Decoder::decode(std::span<const uint8_t> file) {
-    SJXL_ASSIGN(const codestream::Parsed parsed, codestream::parse(file));
+    SJXL_ASSIGN(const codestream::Parsed parsed, parseAll(file));
     std::array<RefFrame, 4> refs;
+    std::array<RefFrame, 5> dcFrames;
     image::Rgb8 image;
     for (const codestream::ParsedFrame& frame : parsed.frames) {
-        auto result = run(parsed, frame, false, refs);
+        auto result = run(parsed, frame, false, refs, dcFrames);
         if (!result && result.error().code() == ErrorCode::Unsupported && result.error().message() == "LZ77 window") {
-            result = run(parsed, frame, true, refs);
+            result = run(parsed, frame, true, refs, dcFrames);
         }
         if (!result) return result.error();
         image = std::move(*result);
@@ -87,11 +99,43 @@ Result<image::Rgb8> Decoder::decode(std::span<const uint8_t> file) {
     return image;
 }
 
+Result<Decoder::TocPermutation> Decoder::decodeTocPermutation(const codestream::Parsed& parsed, const codestream::ParsedFrame& frame) {
+    gpu::Device& dev = *device_;
+    std::vector<uint32_t> csWords((parsed.codestream.size() + 3) / 4 + 2, 0);
+    std::memcpy(csWords.data(), parsed.codestream.data(), parsed.codestream.size());
+    SJXL_ASSIGN(auto cs, gpu::Buffer::fromSpan<uint32_t>(dev, csWords, "dec.toc.cs"));
+    constexpr uint32_t kTocArenaWords = 1u << 20;
+    SJXL_ASSIGN(auto arena, gpu::Buffer::ofType<uint32_t>(dev, kTocArenaWords, "dec.toc.arena"));
+    SJXL_ASSIGN(auto out, gpu::Buffer::ofType<uint32_t>(dev, 2 + frame.numSections, "dec.toc.out"));
+    gpu::CommandBatch batch(dev);
+    tocPermutation_.dispatch(batch, {1, 1, 1}, [&](rhi::ShaderCursor c) {
+        c["cs"].setBinding(cs.rhi());
+        c["arena"].setBinding(arena.rhi());
+        c["tocOut"].setBinding(out.rhi());
+        c["params"]["tocBit"].setData(static_cast<uint32_t>(frame.tocPermutationBit));
+        c["params"]["tocEntries"].setData(frame.numSections);
+        c["params"]["arenaCap"].setData(kTocArenaWords);
+    });
+    SJXL_TRY(batch.submit(true));
+    SJXL_ASSIGN(const std::vector<uint32_t> words, out.readAll<uint32_t>(dev));
+    if (words[0] != kErrNone) return Error::make(ErrorCode::Corrupt, "{} in the TOC permutation", describe(words[0]));
+    TocPermutation perm;
+    perm.endBit = words[1];
+    perm.order.assign(words.begin() + 2, words.end());
+    return perm;
+}
+
 Result<image::Rgb8> Decoder::run(const codestream::Parsed& parsed, const codestream::ParsedFrame& frame, bool withLz77Windows,
-                                 std::array<RefFrame, 4>& refs) {
+                                 std::array<RefFrame, 4>& refs, std::array<RefFrame, 5>& dcFrames) {
     gpu::Device& dev = *device_;
     const codestream::ImageMetadata& m = parsed.metadata;
     const bool referenceOnly = frame.header.frameType == 2;
+    const bool dcFrame = frame.header.frameType == 1;
+    const bool useDcFrame = (frame.header.flags & codestream::FrameHeader::kUseDcFrame) != 0;
+    const RefFrame* dcSource = useDcFrame ? &dcFrames[frame.header.dcLevel + 1] : nullptr;
+    if (useDcFrame && (!dcSource->planes || dcSource->width != frame.dim.xsizeBlocks || dcSource->height != frame.dim.ysizeBlocks)) {
+        return Error(ErrorCode::Corrupt, "the DC frame does not match the frame's block grid");
+    }
     const codestream::FrameDim& dim = frame.dim;
     const codestream::LoopFilter& lf = frame.header.loopFilter;
     const uint32_t nblocks = dim.numBlocks();
@@ -118,6 +162,7 @@ Result<image::Rgb8> Decoder::run(const codestream::Parsed& parsed, const codestr
     // region, decodes groups into them through views, and expands palettes at the
     // finalise step in the AC groups' region.
     uint32_t globalsWords = kGlobalsWords, dcGroupWords = kDcGroupWords, acGroupWords = kAcGroupWords;
+    if (!modular && frame.header.numPasses > 1) globalsWords += (frame.header.numPasses - 1) * 6156u * 64u;   // one order table per pass
     if (modular) {
         const uint64_t pixels = uint64_t{dim.xsize} * dim.ysize;
         if (pixels * (colorChannels + 2) > (uint64_t{1} << 31)) return Error(ErrorCode::Unsupported, "modular frames above 512 Mpixel");
@@ -155,6 +200,7 @@ Result<image::Rgb8> Decoder::run(const codestream::Parsed& parsed, const codestr
     SJXL_ASSIGN(auto xybB, gpu::Buffer::ofType<float>(dev, 3 * planePixels, "dec.xybB"));
     const uint32_t outBytes = dim.xsize * dim.ysize * 3;
     SJXL_ASSIGN(auto rgb8, gpu::Buffer::ofType<uint32_t>(dev, (outBytes + 3) / 4, "dec.rgb8"));
+    SJXL_ASSIGN(auto dummy, gpu::Buffer::ofType<float>(dev, 4, "dec.dummy"));   // stands in for absent optional inputs
 
     gpu::CommandBatch batch(dev);
 
@@ -190,6 +236,39 @@ Result<image::Rgb8> Decoder::run(const codestream::Parsed& parsed, const codestr
         c["params"]["colorChannels"].setData(colorChannels);
         c["params"]["bitDepth"].setData(m.bitsPerSample);
         c["params"]["frameFlags"].setData(static_cast<uint32_t>(frame.header.flags));
+        c["params"]["numPasses"].setData(frame.header.numPasses);
+        {
+            // passes.shift and GetDownsamplingBracket per pass, 12 slots as three vectors.
+            std::array<uint32_t, 12> shift{};
+            std::array<int32_t, 12> minShift{}, maxShift{};
+            for (uint32_t p = 0; p < frame.header.numPasses; ++p) {
+                shift[p] = frame.header.passShift[p];
+                int32_t mx = 2, mn = 3;
+                for (uint32_t i = 0;; ++i) {
+                    for (uint32_t j = 0; j < frame.header.numDownsample; ++j) {
+                        if (i == frame.header.lastPass[j]) {
+                            const uint32_t ds = frame.header.downsample[j];
+                            mn = ds == 8 ? 3 : ds == 4 ? 2 : ds == 2 ? 1 : 0;
+                        }
+                    }
+                    if (i == frame.header.numPasses - 1) mn = 0;
+                    if (i == p) break;
+                    mx = mn - 1;
+                }
+                minShift[p] = mn;
+                maxShift[p] = mx;
+            }
+            const auto quad = [](const auto& a, size_t at) { return std::array{a[at], a[at + 1], a[at + 2], a[at + 3]}; };
+            c["params"]["passShiftA"].setData(quad(shift, 0));
+            c["params"]["passShiftB"].setData(quad(shift, 4));
+            c["params"]["passShiftC"].setData(quad(shift, 8));
+            c["params"]["passMinA"].setData(quad(minShift, 0));
+            c["params"]["passMinB"].setData(quad(minShift, 4));
+            c["params"]["passMinC"].setData(quad(minShift, 8));
+            c["params"]["passMaxA"].setData(quad(maxShift, 0));
+            c["params"]["passMaxB"].setData(quad(maxShift, 4));
+            c["params"]["passMaxC"].setData(quad(maxShift, 8));
+        }
         c["params"]["refW"].setData(std::array<uint32_t, 4>{refs[0].width, refs[1].width, refs[2].width, refs[3].width});
         c["params"]["refH"].setData(std::array<uint32_t, 4>{refs[0].height, refs[1].height, refs[2].height, refs[3].height});
     };
@@ -222,6 +301,8 @@ Result<image::Rgb8> Decoder::run(const codestream::Parsed& parsed, const codestr
                 c["params"]["epfIters"].setData(lf.epfIters);
                 c["params"]["useConstantSigma"].setData(uint32_t{1});
                 c["params"]["constantInvSigma"].setData(kInvSigmaNum / lf.epfSigmaForModular);
+                c["dcFrame"].setBinding(dummy.rhi());
+                c["params"]["dcFramePaddedWidth"].setData(0u);
             });
         }
     } else {
@@ -248,8 +329,11 @@ Result<image::Rgb8> Decoder::run(const codestream::Parsed& parsed, const codestr
         for (int i = 0; i < 8; ++i) c["params"]["sharpLut"][i].setData(lf.epfSharpLut[static_cast<size_t>(i)]);
         c["params"]["useConstantSigma"].setData(uint32_t{0});
         c["params"]["constantInvSigma"].setData(0.0f);
+        c["dcFrame"].setBinding(dcSource ? dcSource->planes->rhi() : dummy.rhi());
+        c["params"]["dcFramePaddedWidth"].setData(dcSource ? dcSource->paddedWidth : 0u);
     };
-    smoothDc_.dispatch(batch, {dim.xsizeBlocks, dim.ysizeBlocks, 1}, bindFinalize);
+    if (useDcFrame) dcFromFrame_.dispatch(batch, {nblocks, 1, 1}, bindFinalize);   // no smoothing with a DC frame (FinalizeDC)
+    else smoothDc_.dispatch(batch, {dim.xsizeBlocks, dim.ysizeBlocks, 1}, bindFinalize);
     computeSigma_.dispatch(batch, {nblocks, 1, 1}, bindFinalize);
     acGroups_.dispatch(batch, {numGroups, 1, 1}, bindSections);
     const auto bindTransforms = [&](rhi::ShaderCursor c) {
@@ -325,7 +409,6 @@ Result<image::Rgb8> Decoder::run(const codestream::Parsed& parsed, const codestr
     }
     if (frame.header.flags & codestream::FrameHeader::kPatches) {
         // After the loop filters, before the colour transform (render pipeline order).
-        SJXL_ASSIGN(auto dummy, gpu::Buffer::ofType<float>(dev, 4, "dec.dummy"));
         const auto bindPatches = [&](rhi::ShaderCursor c) {
             c["arena"].setBinding(arena.rhi());
             c["xyb"].setBinding(src->rhi());
@@ -347,7 +430,7 @@ Result<image::Rgb8> Decoder::run(const codestream::Parsed& parsed, const codestr
         bucketPatches_.dispatch(batch, {1, 1, 1}, bindPatches);
         applyPatches_.dispatch(batch, {dim.xsize * dim.ysize, 1, 1}, bindPatches);
     }
-    if (!referenceOnly) output_.dispatch(batch, {(outBytes + 3) / 4, 1, 1}, [&](rhi::ShaderCursor c) {
+    if (!referenceOnly && !dcFrame) output_.dispatch(batch, {(outBytes + 3) / 4, 1, 1}, [&](rhi::ShaderCursor c) {
         c["xyb"].setBinding(src->rhi());
         c["rgb8"].setBinding(rgb8.rhi());
         c["params"]["width"].setData(dim.xsize);
@@ -403,9 +486,10 @@ Result<image::Rgb8> Decoder::run(const codestream::Parsed& parsed, const codestr
     SJXL_ASSIGN(const std::vector<uint32_t> header, arena.readRange<uint32_t>(dev, 0, kGsHeaderSize));
     stats_.dcGlobalBits = header[45];
     stats_.usedAcs = header[47];
-    if (referenceOnly) {
-        // Saved before the colour transform: the XYB planes as they are after the filters.
-        RefFrame& ref = refs[frame.header.saveAsReference];
+    if (referenceOnly || dcFrame) {
+        // Saved before the colour transform: the XYB planes as they are after the filters
+        // (a reference frame for patches, or the DC image of the frame one level down).
+        RefFrame& ref = referenceOnly ? refs[frame.header.saveAsReference] : dcFrames[frame.header.dcLevel];
         ref.planes.emplace(std::move(*src));
         ref.paddedWidth = dim.xsizePadded;
         ref.paddedHeight = dim.ysizePadded;

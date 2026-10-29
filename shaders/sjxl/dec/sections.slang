@@ -48,9 +48,19 @@ struct SectionParams {
     uint colorChannels;   // modular: 1 (grey) or 3
     uint bitDepth;        // modular: bits per sample
     uint frameFlags;      // FrameHeader flags (bit 1: patches)
-    uint pad1, pad2;
+    uint numPasses;       // 1..11; AC group g of pass p is section 2 + nDC + p * nAC + g
+    uint pad2;
     uint4 refW;           // reference frame sizes per slot (0: none)
     uint4 refH;
+    uint4 passShiftA;     // passes.shift[0..3], [4..7], [8..11]
+    uint4 passShiftB;
+    uint4 passShiftC;
+    int4  passMinA;       // modular: GetDownsamplingBracket per pass
+    int4  passMinB;
+    int4  passMinC;
+    int4  passMaxA;
+    int4  passMaxB;
+    int4  passMaxC;
 };
 
 StructuredBuffer<uint2>   sections;   // bit start, bit end of each TOC entry, codestream order
@@ -73,6 +83,21 @@ Dec makeDec(uint section, uint base, uint cap) {
     return d;
 }
 
+uint vec4At(uint4 a, uint4 b, uint4 c, uint i) {
+    const uint4 v = i < 4 ? a : (i < 8 ? b : c);
+    const uint j = i & 3;
+    return j == 0 ? v.x : j == 1 ? v.y : j == 2 ? v.z : v.w;
+}
+int ivec4At(int4 a, int4 b, int4 c, uint i) {
+    const int4 v = i < 4 ? a : (i < 8 ? b : c);
+    const uint j = i & 3;
+    return j == 0 ? v.x : j == 1 ? v.y : j == 2 ? v.z : v.w;
+}
+uint passShift(uint p) { return vec4At(params.passShiftA, params.passShiftB, params.passShiftC, p); }
+int passMinShift(uint p) { return ivec4At(params.passMinA, params.passMinB, params.passMinC, p); }
+int passMaxShift(uint p) { return ivec4At(params.passMaxA, params.passMaxB, params.passMaxC, p); }
+uint acSection(uint pass, uint g) { return 2 + params.numDcGroups + pass * params.numGroups + g; }
+
 uint groupBlocks() { return params.groupDim / 8; }
 uint xsizeGroups() { return (params.blocksX + groupBlocks() - 1) / groupBlocks(); }
 uint xsizeDcGroups() { return (params.blocksX + params.groupDim - 1) / params.groupDim; }
@@ -90,6 +115,7 @@ DcGroupGeom dcGeom(uint g) {
     geom.numDcGroups = params.numDcGroups;
     geom.group = g;
     geom.groupBlocks = groupBlocks();
+    geom.useDcFrame = (params.frameFlags & 32u) != 0 ? 1u : 0u;
     return geom;
 }
 
@@ -131,12 +157,12 @@ void decodeGlobals(uint3 tid: SV_DispatchThreadID) {
             d.br.pos = sections[1 + params.numDcGroups].x;
             d.br.end = sections[1 + params.numDcGroups].y;
         }
-        decodeAcGlobal(d, params.numGroups, window);
+        decodeAcGlobal(d, params.numGroups, params.numPasses, window);
         arena[kGsAcGlobalBits] = d.br.pos;
     }
     if (d.error == kErrNone && params.singleSection != 0) {
         stage = 4;
-        decodeAcGroup(d, acGeom(0), window);
+        decodeAcGroup(d, acGeom(0), 0, passShift(0), window);
     }
     status[0] = d.error | (d.error != kErrNone ? (stage << 8) : 0);
     arena[kGsError] = d.error;
@@ -162,8 +188,12 @@ void decodeAcGroups(uint3 tid: SV_DispatchThreadID) {
     if (g >= params.numGroups || params.singleSection != 0) return;
     if (arena[kGsError] != kErrNone) { status[1 + params.numDcGroups + g] = arena[kGsError]; return; }
     const uint base = params.acArenaBase + g * params.acArenaWords;
-    Dec d = makeDec(2 + params.numDcGroups + g, base, base + params.acArenaWords);
-    decodeAcGroup(d, acGeom(g), windowFor(1 + params.numDcGroups + g));
+    Dec d = makeDec(acSection(0, g), base, base + params.acArenaWords);
+    for (uint pass = 0; pass < params.numPasses && d.error == kErrNone; ++pass) {
+        d.br.pos = sections[acSection(pass, g)].x;
+        d.br.end = sections[acSection(pass, g)].y;
+        decodeAcGroup(d, acGeom(g), pass, passShift(pass), windowFor(1 + params.numDcGroups + g));
+    }
     status[1 + params.numDcGroups + g] = d.error;
 }
 
@@ -191,9 +221,9 @@ void groupRect(uint g, bool dcGroup, out uint x0, out uint y0, out uint w, out u
     h = dim;
 }
 
-/// Stream ids (ModularStreamId): ModularDC(g) = 1 + nDC + g; ModularAC(g, pass 0) = 1 + 3 nDC + 17 + g.
+/// Stream ids (ModularStreamId): ModularDC(g) = 1 + nDC + g; ModularAC(g, pass) = 1 + 3 nDC + 17 + nAC * pass + g.
 uint modularDcStream(uint g) { return 1 + params.numDcGroups + g; }
-uint modularAcStream(uint g) { return 1 + 3 * params.numDcGroups + 17 + g; }
+uint modularAcStream(uint g, uint pass) { return 1 + 3 * params.numDcGroups + 17 + params.numGroups * pass + g; }
 
 [shader("compute")]
 [numthreads(1, 1, 1)]
@@ -217,7 +247,7 @@ void decodeModularGlobals(uint3 tid: SV_DispatchThreadID) {
         if (d.error == kErrNone) {
             stage = 4;
             groupRect(0, false, x0, y0, w, h);
-            decodeModularGroup(d, x0, y0, w, h, 0, 2, modularAcStream(0), window);
+            decodeModularGroup(d, x0, y0, w, h, passMinShift(0), passMaxShift(0), modularAcStream(0, 0), window);
         }
     }
     status[0] = d.error | (d.error != kErrNone ? (stage << 8) : 0);
@@ -246,10 +276,14 @@ void decodeModularAcGroups(uint3 tid: SV_DispatchThreadID) {
     if (g >= params.numGroups || params.singleSection != 0) return;
     if (arena[kGsError] != kErrNone) { status[1 + params.numDcGroups + g] = arena[kGsError]; return; }
     const uint base = params.acArenaBase + g * params.acArenaWords;
-    Dec d = makeDec(2 + params.numDcGroups + g, base, base + params.acArenaWords);
+    Dec d = makeDec(acSection(0, g), base, base + params.acArenaWords);
     uint x0, y0, w, h;
     groupRect(g, false, x0, y0, w, h);
-    decodeModularGroup(d, x0, y0, w, h, 0, 2, modularAcStream(g), windowFor(1 + params.numDcGroups + g));
+    for (uint pass = 0; pass < params.numPasses && d.error == kErrNone; ++pass) {
+        d.br.pos = sections[acSection(pass, g)].x;
+        d.br.end = sections[acSection(pass, g)].y;
+        decodeModularGroup(d, x0, y0, w, h, passMinShift(pass), passMaxShift(pass), modularAcStream(g, pass), windowFor(1 + params.numDcGroups + g));
+    }
     status[1 + params.numDcGroups + g] = d.error;
 }
 

@@ -135,3 +135,6 @@ in the finalise thread. Patches: reference-only Modular frames come first in
 the codestream and keep their planes; the displayed frame's globals thread
 decodes the dictionary, and `patches.slang` blends the rectangles per pixel
 after the filters (`docs/decisions.md`, "Patches and multiple frames").
+Progressive: passes add shifted coefficients per AC group thread; a permuted
+TOC is decoded by `toc.slang` and the parser resumes (`Decoder::parseAll`); a
+DC frame's planes become the next frame's DC (`dcFromFrame`).

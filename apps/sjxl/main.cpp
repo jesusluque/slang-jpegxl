@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <memory>
 #include <string>
 #include <string_view>
 
@@ -39,6 +40,15 @@ int info(int argc, char** argv) {
         if (!bytes) return fail(bytes.error());
         auto parsed = sjxl::dec::Decoder::info(*bytes);
         if (!parsed) return fail(parsed.error());
+        if (parsed->incomplete) {   // a permuted TOC: the device decodes the permutation
+            auto device = sjxl::gpu::Device::create();
+            if (!device) return fail(device.error());
+            auto library = std::make_shared<sjxl::gpu::ShaderLibrary>(*device);
+            auto decoder = sjxl::dec::Decoder::create(library);
+            if (!decoder) return fail(decoder.error());
+            parsed = (*decoder)->parseAll(*bytes);
+            if (!parsed) return fail(parsed.error());
+        }
         const auto& m = parsed->metadata;
         std::printf("image     %ux%u, %u-bit%s, %s, %s%s\n", m.xsize, m.ysize, m.bitsPerSample, m.floatingPointSample ? " float" : "",
                     m.colorSpace == 0 ? "RGB" : m.colorSpace == 1 ? "grey" : "other colour space", m.xybEncoded ? "XYB" : "not XYB",
@@ -48,11 +58,12 @@ int info(int argc, char** argv) {
             const auto& f = parsed->frames[i];
             const auto& h = f.header;
             const char* type = h.frameType == 0 ? "regular" : h.frameType == 1 ? "DC" : h.frameType == 2 ? "reference-only" : "skip-progressive";
-            std::printf("  frame %zu %s %s %ux%u, groups %u px (%u AC, %u DC), %zu sections%s%s%s%s, gab %d, epf %u%s\n", i, type,
+            std::printf("  frame %zu %s %s %ux%u, groups %u px (%u AC, %u DC), %zu sections, %u pass%s%s%s%s%s, gab %d, epf %u%s\n", i, type,
                         h.isModular ? "Modular" : "VarDCT", f.dim.xsize, f.dim.ysize, f.dim.groupDim, f.dim.numGroups(), f.dim.numDcGroups(),
-                        f.sections.size(), (h.flags & sjxl::codestream::FrameHeader::kPatches) ? ", patches" : "",
+                        f.sections.size(), h.numPasses, h.numPasses == 1 ? "" : "es", (h.flags & sjxl::codestream::FrameHeader::kPatches) ? ", patches" : "",
                         (h.flags & sjxl::codestream::FrameHeader::kSplines) ? ", splines" : "", (h.flags & sjxl::codestream::FrameHeader::kNoise) ? ", noise" : "",
-                        h.frameType == 2 ? (h.saveBeforeColorTransform ? ", saved before the colour transform" : ", saved after the colour transform") : "",
+                        h.frameType == 2 ? (h.saveBeforeColorTransform ? ", saved before the colour transform" : ", saved after the colour transform")
+                                         : h.frameType == 1 ? ", DC frame" : (h.flags & sjxl::codestream::FrameHeader::kUseDcFrame) ? ", DC from a DC frame" : "",
                         h.loopFilter.gab ? 1 : 0, h.loopFilter.epfIters, h.isLast ? ", last" : "");
         }
         return 0;

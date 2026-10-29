@@ -21,9 +21,24 @@ struct DcFinalizeParams {
     float sharpLut[8];
     float constantInvSigma;   // modular frames: kInvSigmaNum / epf_sigma_for_modular for every block
     uint  useConstantSigma;
-    float pad2;
+    uint  dcFramePaddedWidth; // kUseDcFrame: the DC frame's planes, one pixel per block
 };
 ConstantBuffer<DcFinalizeParams> params;
+
+StructuredBuffer<float> dcFrame;   // a DC frame's 3 planes (kUseDcFrame), dcFramePaddedWidth * height
+
+/// kUseDcFrame: the DC image is the DC frame's pixels (passes_state.cc: shared->dc = &dc_frames[level]),
+/// written to dcSmooth since no smoothing runs (FinalizeDC skips it).
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void dcFromFrame(uint3 tid: SV_DispatchThreadID) {
+    const uint nblocks = params.blocksX * params.blocksY;
+    if (tid.x >= nblocks) return;
+    const uint bx = tid.x % params.blocksX;
+    const uint by = tid.x / params.blocksX;
+    const uint plane = params.dcFramePaddedWidth * ((params.blocksY + 7) / 8 * 8);
+    for (uint c = 0; c < 3; ++c) dcSmooth[c * nblocks + tid.x] = dcFrame[c * plane + by * params.dcFramePaddedWidth + bx];
+}
 
 static const uint kGsGlobalScaleF = 4;
 static const uint kGsMulDc = 9;
