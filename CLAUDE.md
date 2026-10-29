@@ -131,7 +131,9 @@ tier) → inverse Gaborish → transform selection per 32×32 superblock
 DCT8x4/AFV, 8×16, 16×8, 16×16, 16×32, 32×16, 32×32; `large.slang`: 64×64,
 64×32, 32×64 per 64×64 region through the rowPass buffer; libjxl's
 EstimateEntropy model, sqrt|q| per non-zero and entropy_mul per transform,
-plus λ = 128 times the squared rounding error) → separable forward DCT of every varblock
+plus λ = 128 times the squared rounding error; the three channels are scored, X and B as
+chroma-from-luma residuals of a first CfL pass on DCT8 coefficients, with libjxl's
+quant_norm16 of the float field; `SJXL_ACS_YONLY=1` / `SJXL_ACS_ROUND=1` are the A/B knobs) → separable forward DCT of every varblock
 (`transform.slang`, libjxl's coefficient memory; `common/transform_basis.slangh`
 holds the bases and strategy tables) → DC from the lowest frequencies →
 chroma-from-luma per 64 px tile (least squares on the scaled coefficients) →

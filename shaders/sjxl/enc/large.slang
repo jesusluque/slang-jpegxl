@@ -32,19 +32,26 @@ struct LargeParams {
     float lambda;
     float distance;
     uint  largeMask;   // bit f: family f may be chosen
-    uint  pad0, pad1, pad2;
+    uint  channelPass; // largeCols: 0 the Y channel (its coefficients kept in largeY), 1 X and B as chroma-from-luma residuals
+    uint  tilesX;      // chroma-from-luma tiles across (64 px: a region is a tile)
+    uint  threeChannels;   // 1: X and B scored too
+    uint  deadZone;    // 1: quantise with the coder's dead zones (libjxl's estimate rounds)
 };
 
-StructuredBuffer<float>    xyb;          // 3 planes; only Y is read
+StructuredBuffer<float>    xyb;          // 3 planes
 StructuredBuffer<uint>     rawQf;
+StructuredBuffer<float>    qf;           // per block: the float field (quant_norm16)
+StructuredBuffer<int>      cmapX;        // per tile: YtoX
+StructuredBuffer<int>      cmapB;        // per tile: YtoB
+RWStructuredBuffer<float>  largeY;       // scratch plane: the Y coefficient of every pixel position
 StructuredBuffer<float>    dequant;
 StructuredBuffer<uint>     quantizer;    // [3] globalScaleFloat
 StructuredBuffer<float>    sbCost;       // per 32x32 superblock
-RWStructuredBuffer<float>  rowPass;      // scratch, one plane used
+RWStructuredBuffer<float>  rowPass;      // scratch, three planes
 RWStructuredBuffer<float>  candQf;       // regions * kCandsPerRegion (0: invalid)
 RWStructuredBuffer<uint>   candBits;     // fixed point
 RWStructuredBuffer<uint>   candDist;
-RWStructuredBuffer<uint>   candNz;
+RWStructuredBuffer<uint>   candNz;       // per channel: [c][candidate]
 RWStructuredBuffer<uint>   acs;
 RWStructuredBuffer<uint>   firstBlock;
 ConstantBuffer<LargeParams> params;
@@ -73,6 +80,16 @@ float nzCost(uint nz) {
     return kZerosMul * float(ceilLog2Nonzero(nbits + 17) + nbits);
 }
 
+static const float kXWeight = 4.0f;   // EstimateEntropy's ringing weight of X: 1 + min(3, blocks / 8), 4 from 32 blocks up
+
+uint numCandidates() { return params.regionsX * ((params.blocksY + 7) / 8) * kCandsPerRegion; }
+
+float quantise(float val, bool lowFreq) {
+    if (params.deadZone == 0) return round(val);
+    const float threshold = lowFreq ? 0.56f : 0.62f;
+    return abs(val) < threshold ? 0.0f : round(val);
+}
+
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void largeQf(uint3 tid: SV_DispatchThreadID) {
@@ -83,21 +100,20 @@ void largeQf(uint3 tid: SV_DispatchThreadID) {
     candidate(region, c, fam, fbx, fby, cx, cy);
     candBits[tid.x] = 0;
     candDist[tid.x] = 0;
-    candNz[tid.x] = 0;
+    const uint numCands = regions * kCandsPerRegion;
+    for (uint ch = 0; ch < 3; ++ch) candNz[ch * numCands + tid.x] = 0;
     const bool valid = fbx + cx <= params.blocksX && fby + cy <= params.blocksY && ((params.largeMask >> fam) & 1u) != 0;
     if (!valid) { candQf[tid.x] = 0.0f; return; }
-    float mx = 0.0f, mean = 0.0f;
+    // quant_norm16 of the float field over the covered blocks.
+    float sum = 0.0f;
     for (uint y = 0; y < cy; ++y) {
         for (uint x = 0; x < cx; ++x) {
-            const float q = float(rawQf[(fby + y) * params.blocksX + fbx + x]);
-            mx = max(mx, q);
-            mean += q;
+            float v = qf[(fby + y) * params.blocksX + fbx + x];
+            v *= v; v *= v; v *= v;
+            sum += v * v;
         }
     }
-    mean /= float(cx * cy);
-    float mixer = 1.0f;
-    if (params.distance > 1.54138f) mixer = max(0.0f, 1.0f - (params.distance - 1.54138f) * 0.56391f);
-    candQf[tid.x] = mx * mixer + (1.0f - mixer) * mean;
+    candQf[tid.x] = pow(sum / float(cx * cy), 1.0f / 16.0f);
 }
 
 /// The candidate index and varblock origin (pixels) of pixel (px, py) in the family being scored.
@@ -116,47 +132,55 @@ uint candidateAt(uint px, uint py, out uint x0, out uint y0) {
 [numthreads(64, 1, 1)]
 void largeRows(uint3 tid: SV_DispatchThreadID) {
     const uint n = params.paddedWidth * params.paddedHeight;
-    if (tid.x >= n) return;
-    const uint px = tid.x % params.paddedWidth, py = tid.x / params.paddedWidth;
+    if (tid.x >= 3 * n) return;
+    const uint c = tid.x / n, pixel = tid.x % n;
+    if (c != 1 && params.threeChannels == 0) return;
+    const uint px = pixel % params.paddedWidth, py = pixel / params.paddedWidth;
     uint x0, y0;
     const uint cand = candidateAt(px, py, x0, y0);
     if (candQf[cand] == 0.0f) return;
     const uint nx = kFamNx[params.family];
     const uint u = px - x0;
-    const uint rowBase = n + py * params.paddedWidth + x0;   // the Y plane
+    const uint rowBase = c * n + py * params.paddedWidth + x0;
     float sum = 0.0f;
     for (uint x = 0; x < nx; ++x) sum += xyb[rowBase + x] * fdctBasis(u, x, nx);
-    rowPass[tid.x] = sum;
+    rowPass[c * n + pixel] = sum;
 }
 
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void largeCols(uint3 tid: SV_DispatchThreadID) {
     const uint n = params.paddedWidth * params.paddedHeight;
-    if (tid.x >= n) return;
-    const uint px = tid.x % params.paddedWidth, py = tid.x / params.paddedWidth;
+    // Pass 0: Y (n threads); pass 1: X then B (2 n threads), residuals against Y's coefficients.
+    const uint c = params.channelPass == 0 ? 1 : (tid.x < n ? 0 : 2);
+    const uint pixel = tid.x % n;
+    if (tid.x >= (params.channelPass == 0 ? n : 2 * n)) return;
+    const uint px = pixel % params.paddedWidth, py = pixel / params.paddedWidth;
     uint x0, y0;
     const uint cand = candidateAt(px, py, x0, y0);
-    const float qf = candQf[cand];
-    if (qf == 0.0f) return;
+    const float qfv = candQf[cand];
+    if (qfv == 0.0f) return;
     const uint nx = kFamNx[params.family], ny = kFamNy[params.family];
     const uint cx = nx / 8, cy = ny / 8;
     const uint u = px - x0, v = py - y0;
-    if (v < cy && u < cx) return;   // lowest frequencies: coded as DC
     float coef = 0.0f;
-    for (uint y = 0; y < ny; ++y) coef += rowPass[(y0 + y) * params.paddedWidth + px] * fdctBasis(v, y, ny);
+    for (uint y = 0; y < ny; ++y) coef += rowPass[c * n + (y0 + y) * params.paddedWidth + px] * fdctBasis(v, y, ny);
+    if (c == 1) largeY[pixel] = coef;
+    if (v < cy && u < cx) return;   // lowest frequencies: coded as DC
     const uint strategy = kFamStrategy[params.family];
     const uint tableBase = kTableBase[kStrategyToTable[strategy]];
     const uint size = nx * ny;
-    const float quantMul = asfloat(quantizer[3]) * qf;
-    const float val = coef * quantMul / dequant[tableBase + 1 * size + memIndex(v, u, ny, nx)];
-    const float threshold = (v < ny / 2 && u < nx / 2) ? 0.56f : 0.62f;
-    const float q = abs(val) < threshold ? 0.0f : round(val);
+    const float quantMul = qfv;   // the float field (raw value x global scale)
+    const uint tile = (py / 64) * params.tilesX + px / 64;
+    const float factor = c == 0 ? float(cmapX[tile]) / 84.0f : (c == 2 ? float(cmapB[tile]) / 84.0f + 1.0f : 0.0f);
+    const float val = (coef - factor * (c == 1 ? 0.0f : largeY[pixel])) * quantMul / dequant[tableBase + c * size + memIndex(v, u, ny, nx)];
+    const float q = quantise(val, v < ny / 2 && u < nx / 2);
     const float err = val - q;
+    const float w = c == 0 ? kXWeight : 1.0f;
     uint before;
-    InterlockedAdd(candBits[cand], uint(entropyOf(q) * kCostScale), before);
-    InterlockedAdd(candDist[cand], uint(min(err * err, 64.0f) * kCostScale), before);
-    if (q != 0.0f) InterlockedAdd(candNz[cand], 1u, before);
+    InterlockedAdd(candBits[cand], uint(w * entropyOf(q) * kCostScale), before);
+    InterlockedAdd(candDist[cand], uint(w * min(err * err, 64.0f) * kCostScale), before);
+    if (q != 0.0f) InterlockedAdd(candNz[c * numCandidates() + cand], 1u, before);
 }
 
 [shader("compute")]
@@ -170,7 +194,10 @@ void mergeLarge(uint3 tid: SV_DispatchThreadID) {
     float cost[kCandsPerRegion];
     for (uint c = 0; c < kCandsPerRegion; ++c) {
         const uint i = region * kCandsPerRegion + c;
-        cost[c] = candQf[i] != 0.0f ? kEntropyMul64 * (float(candBits[i]) / kCostScale + nzCost(candNz[i])) + params.lambda * float(candDist[i]) / kCostScale
+        const uint numCands = numCandidates();
+        float nzBits = nzCost(candNz[numCands + i]);
+        if (params.threeChannels != 0) nzBits += kXWeight * nzCost(candNz[i]) + nzCost(candNz[2 * numCands + i]);
+        cost[c] = candQf[i] != 0.0f ? kEntropyMul64 * (float(candBits[i]) / kCostScale + nzBits) + params.lambda * float(candDist[i]) / kCostScale
                                     : kInvalid;
     }
     // The superblocks' layouts: the 2x2 superblocks of the region that exist.

@@ -1393,3 +1393,50 @@ as patches of an earlier frame (cjxl's patch dictionary); several disjoint
 changed regions are one bounding box; the rectangle is not aligned to the
 8-pixel block grid of the frame before it (harmless for correctness, a few
 bits of block-boundary mismatch for lossy frames).
+
+## Three-channel strategy costs (2026-10-29)
+
+The transform selection scored the Y channel only. libjxl's `EstimateEntropy`
+transforms all three channels and codes X and B as chroma-from-luma residuals
+with the tile's factors, so a block whose chroma is expensive, or whose chroma
+the CfL predicts well, was invisible to our search. Now, in `strategy.slang`
+and `large.slang`:
+
+- **Three channels, Y first**: each family's Y coefficients are kept
+  (`gYCoef`, or the `largeY` plane for the 64-pixel families) and X and B are
+  scored as `coef − factor · coefY` with the factors of the 64 px tile
+  (`cmapX/84`, `cmapB/84 + 1`); the entropy sums over the channels, the
+  non-zero count's bits are charged per channel and X in a block larger than
+  8×8 weighs `1 + min(3, blocks/8)` (libjxl's ringing penalty). The 8×8
+  specials search does the same per block.
+- **A first CfL pass before the search**: libjxl's ACS runs after an initial
+  CfL. The host sets every block to DCT8 (`selectStrategies` disabled), runs
+  the DCT and `cflTile`, then the search; the real CfL pass after the chosen
+  transforms is unchanged.
+- **quant_norm16**: the estimate quantises with libjxl's norm of the float
+  quant field over the covered blocks (one block its value, two their max,
+  else the 16-norm), not the AdjustQuantField value the coder will write. The
+  float field already carries the global scale (a first version multiplied by
+  it again and lost 5 to 7 points at d = 3).
+- **The coder's dead zones stay in the estimate** (0.56 / 0.62 quant steps):
+  libjxl's estimate rounds, but with our λ·L2 distortion the dead zones score
+  +0.3 SSIMULACRA2 better on the small images (`SJXL_ACS_ROUND=1` tries the
+  rounding, `SJXL_ACS_YONLY=1` the old single-channel proxy).
+
+Matched size against cjxl -e 5, Δ SSIMULACRA2 (λ = 128; λ = 64 averages
++0.18 and λ = 256 −0.83 on the small set):
+
+| image | d | before | now |
+|---|---|---|---|
+| berlin_200 | 1 / 3 | −1.41 / −1.78 | −0.48 / −0.56 |
+| sveti_crop_257x129 | 1 / 3 | +0.13 / +2.05 | +0.59 / +2.34 |
+| sveti_stefan_320 | 1 / 3 | 0.00 / −1.41 | −0.03 / +0.06 |
+| berlin_central (4K) | 1 / 3 | +0.23 / +0.57 | +0.39 / +1.19 |
+| sveti_stefan (4K) | 1 / 3 | +0.08 / +0.60 | −0.14 / +1.18 |
+
+Small images average +0.32 (was −0.40), the 4K photos +0.66 (was +0.37).
+
+Not done: libjxl's pixel-domain loss (the inverse transform of the
+quantisation error weighted by the 1×1 masking field, 8th norm), which needs
+the per-pixel masking output of the adaptive quantisation; the first CfL pass
+costs one extra DCT8 of the frame.

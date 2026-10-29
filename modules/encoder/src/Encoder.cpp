@@ -651,71 +651,6 @@ Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, cons
             c["params"]["paddedHeight"].setData(dim.ysizePadded);
         });
     }
-    // The strategy of every block, the field per varblock, the
-    // varblock DCTs, their DC, chroma-from-luma, quantisation, and the AC tokens
-    // with their context histograms.
-    const uint32_t superblocksX = (dim.xsizeBlocks + 3) / 4;
-    const uint32_t superblocksY = (dim.ysizeBlocks + 3) / 4;
-    const uint32_t regionsX = (dim.xsizeBlocks + 7) / 8;
-    const uint32_t regionsY = (dim.ysizeBlocks + 7) / 8;
-    SJXL_ASSIGN(auto sbCost, gpu::Buffer::ofType<float>(dev, uint64_t{superblocksX} * superblocksY, "enc.sbCost"));
-    SJXL_ASSIGN(auto candQf, gpu::Buffer::ofType<float>(dev, uint64_t{regionsX} * regionsY * 5, "enc.candQf"));
-    SJXL_ASSIGN(auto candBits, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{regionsX} * regionsY * 5, "enc.candBits"));
-    SJXL_ASSIGN(auto candDist, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{regionsX} * regionsY * 5, "enc.candDist"));
-    SJXL_ASSIGN(auto candNz, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{regionsX} * regionsY * 5, "enc.candNz"));
-    uint32_t familyMask = 0x3FF;
-    if (const std::string m = platform::env("SJXL_ACS_MASK"); !m.empty()) familyMask = static_cast<uint32_t>(std::strtoul(m.c_str(), nullptr, 0));
-    if (jpeg == nullptr) selectStrategies_.dispatchGroups(batch, {superblocksX * superblocksY, 1, 1}, [&](rhi::ShaderCursor c) {
-        c["xyb"].setBinding(planes.rhi());
-        c["rawQf"].setBinding(rawQf.rhi());
-        c["dequant"].setBinding(dequantAll_.rhi());
-        c["quantizer"].setBinding(quantizer.rhi());
-        c["acs"].setBinding(acs.rhi());
-        c["firstBlock"].setBinding(firstBlock.rhi());
-        c["sbCost"].setBinding(sbCost.rhi());
-        c["params"]["blocksX"].setData(dim.xsizeBlocks);
-        c["params"]["blocksY"].setData(dim.ysizeBlocks);
-        c["params"]["paddedWidth"].setData(dim.xsizePadded);
-        c["params"]["paddedHeight"].setData(dim.ysizePadded);
-        c["params"]["superblocksX"].setData(superblocksX);
-        c["params"]["lambda"].setData(options.acsLambda);
-        c["params"]["distance"].setData(options.distance);
-        c["params"]["enabled"].setData(uint32_t{options.acStrategy ? 1u : 0u});
-        c["params"]["familyMask"].setData(familyMask & 0x7Fu);
-        c["params"]["specials"].setData(uint32_t{options.acsSpecials ? 1u : 0u});
-    });
-    // The 64-pixel families against the superblocks' layouts.
-    if (options.acStrategy && (familyMask >> 7) != 0) {
-        const auto bindLarge = [&](rhi::ShaderCursor c, uint32_t family) {
-            c["xyb"].setBinding(planes.rhi());
-            c["rawQf"].setBinding(rawQf.rhi());
-            c["dequant"].setBinding(dequantAll_.rhi());
-            c["quantizer"].setBinding(quantizer.rhi());
-            c["sbCost"].setBinding(sbCost.rhi());
-            c["rowPass"].setBinding(rowPass.rhi());
-            c["candQf"].setBinding(candQf.rhi());
-            c["candBits"].setBinding(candBits.rhi());
-            c["candDist"].setBinding(candDist.rhi());
-            c["candNz"].setBinding(candNz.rhi());
-            c["acs"].setBinding(acs.rhi());
-            c["firstBlock"].setBinding(firstBlock.rhi());
-            c["params"]["blocksX"].setData(dim.xsizeBlocks);
-            c["params"]["blocksY"].setData(dim.ysizeBlocks);
-            c["params"]["paddedWidth"].setData(dim.xsizePadded);
-            c["params"]["paddedHeight"].setData(dim.ysizePadded);
-            c["params"]["regionsX"].setData(regionsX);
-            c["params"]["family"].setData(family);
-            c["params"]["lambda"].setData(options.acsLambda);
-            c["params"]["distance"].setData(options.distance);
-            c["params"]["largeMask"].setData(familyMask >> 7);
-        };
-        if (jpeg == nullptr) largeQf_.dispatch(batch, {regionsX * regionsY * 5, 1, 1}, [&](rhi::ShaderCursor c) { bindLarge(c, 0); });
-        for (uint32_t family = 0; family < 3; ++family) {
-            if (jpeg == nullptr) largeRows_.dispatch(batch, {static_cast<uint32_t>(planePixels), 1, 1}, [&](rhi::ShaderCursor c) { bindLarge(c, family); });
-            if (jpeg == nullptr) largeCols_.dispatch(batch, {static_cast<uint32_t>(planePixels), 1, 1}, [&](rhi::ShaderCursor c) { bindLarge(c, family); });
-        }
-        if (jpeg == nullptr) mergeLarge_.dispatch(batch, {regionsX * regionsY, 1, 1}, [&](rhi::ShaderCursor c) { bindLarge(c, 0); });
-    }
     const auto bindTransform = [&](rhi::ShaderCursor c) {
         c["xyb"].setBinding(planes.rhi());
         c["acs"].setBinding(acs.rhi());
@@ -758,6 +693,113 @@ Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, cons
         c["params"]["hshift"].setData(hshift);
         c["params"]["vshift"].setData(vshift);
     };
+    const auto bindCfl = [&](rhi::ShaderCursor c) {
+        c["coeffs"].setBinding(coeffs.rhi());
+        c["dequant"].setBinding(dequantAll_.rhi());
+        c["acs"].setBinding(acs.rhi());
+        c["rawQf"].setBinding(rawQf.rhi());
+        c["quantizer"].setBinding(quantizer.rhi());
+        c["cmapX"].setBinding(cmapX.rhi());
+        c["cmapB"].setBinding(cmapB.rhi());
+        c["params"]["blocksX"].setData(dim.xsizeBlocks);
+        c["params"]["blocksY"].setData(dim.ysizeBlocks);
+        c["params"]["tilesX"].setData(tilesX);
+        c["params"]["tilesY"].setData(tilesY);
+    };
+    // The strategy of every block, the field per varblock, the
+    // varblock DCTs, their DC, chroma-from-luma, quantisation, and the AC tokens
+    // with their context histograms.
+    const uint32_t superblocksX = (dim.xsizeBlocks + 3) / 4;
+    const uint32_t superblocksY = (dim.ysizeBlocks + 3) / 4;
+    const uint32_t regionsX = (dim.xsizeBlocks + 7) / 8;
+    const uint32_t regionsY = (dim.ysizeBlocks + 7) / 8;
+    SJXL_ASSIGN(auto sbCost, gpu::Buffer::ofType<float>(dev, uint64_t{superblocksX} * superblocksY, "enc.sbCost"));
+    SJXL_ASSIGN(auto candQf, gpu::Buffer::ofType<float>(dev, uint64_t{regionsX} * regionsY * 5, "enc.candQf"));
+    SJXL_ASSIGN(auto candBits, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{regionsX} * regionsY * 5, "enc.candBits"));
+    SJXL_ASSIGN(auto candDist, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{regionsX} * regionsY * 5, "enc.candDist"));
+    SJXL_ASSIGN(auto candNz, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{3} * regionsX * regionsY * 5, "enc.candNz"));
+    SJXL_ASSIGN(auto largeY, gpu::Buffer::ofType<float>(dev, static_cast<uint64_t>(planePixels), "enc.largeY"));
+    uint32_t familyMask = 0x3FF;
+    if (const std::string m = platform::env("SJXL_ACS_MASK"); !m.empty()) familyMask = static_cast<uint32_t>(std::strtoul(m.c_str(), nullptr, 0));
+    const uint32_t threeChannels = platform::env("SJXL_ACS_YONLY").empty() ? 1u : 0u;
+    const uint32_t acsDeadZone = platform::env("SJXL_ACS_ROUND").empty() ? 1u : 0u;   // the coder's dead zones in the estimate (+0.3 SSIMULACRA2 over libjxl's rounding)
+    const auto bindStrategy = [&](rhi::ShaderCursor c, bool enabled) {
+        c["xyb"].setBinding(planes.rhi());
+        c["rawQf"].setBinding(rawQf.rhi());
+        c["qf"].setBinding(qfField.rhi());
+        c["cmapX"].setBinding(cmapX.rhi());
+        c["cmapB"].setBinding(cmapB.rhi());
+        c["dequant"].setBinding(dequantAll_.rhi());
+        c["quantizer"].setBinding(quantizer.rhi());
+        c["acs"].setBinding(acs.rhi());
+        c["firstBlock"].setBinding(firstBlock.rhi());
+        c["sbCost"].setBinding(sbCost.rhi());
+        c["params"]["blocksX"].setData(dim.xsizeBlocks);
+        c["params"]["blocksY"].setData(dim.ysizeBlocks);
+        c["params"]["paddedWidth"].setData(dim.xsizePadded);
+        c["params"]["paddedHeight"].setData(dim.ysizePadded);
+        c["params"]["superblocksX"].setData(superblocksX);
+        c["params"]["lambda"].setData(options.acsLambda);
+        c["params"]["distance"].setData(options.distance);
+        c["params"]["enabled"].setData(uint32_t{enabled ? 1u : 0u});
+        c["params"]["familyMask"].setData(familyMask & 0x7Fu);
+        c["params"]["specials"].setData(uint32_t{options.acsSpecials ? 1u : 0u});
+        c["params"]["tilesX"].setData(tilesX);
+        c["params"]["threeChannels"].setData(threeChannels);
+        c["params"]["deadZone"].setData(acsDeadZone);
+    };
+    // A first chroma-from-luma pass on DCT8 coefficients (libjxl's ACS runs after
+    // an initial CfL): the strategy search scores X and B as residuals of it.
+    if (jpeg == nullptr && options.acStrategy && options.chromaFromLuma && threeChannels != 0) {
+        selectStrategies_.dispatchGroups(batch, {superblocksX * superblocksY, 1, 1}, [&](rhi::ShaderCursor c) { bindStrategy(c, false); });
+        dctRows_.dispatch(batch, {static_cast<uint32_t>(3 * planePixels), 1, 1}, bindTransform);
+        dctCols_.dispatch(batch, {static_cast<uint32_t>(3 * planePixels), 1, 1}, bindTransform);
+        cflTile_.dispatch(batch, {tilesX * tilesY, 1, 1}, bindCfl);
+    }
+    if (jpeg == nullptr) selectStrategies_.dispatchGroups(batch, {superblocksX * superblocksY, 1, 1}, [&](rhi::ShaderCursor c) { bindStrategy(c, true); });
+    // The 64-pixel families against the superblocks' layouts.
+    if (options.acStrategy && (familyMask >> 7) != 0) {
+        const auto bindLarge = [&](rhi::ShaderCursor c, uint32_t family, uint32_t channelPass) {
+            c["xyb"].setBinding(planes.rhi());
+            c["rawQf"].setBinding(rawQf.rhi());
+            c["qf"].setBinding(qfField.rhi());
+            c["cmapX"].setBinding(cmapX.rhi());
+            c["cmapB"].setBinding(cmapB.rhi());
+            c["largeY"].setBinding(largeY.rhi());
+            c["params"]["channelPass"].setData(channelPass);
+            c["params"]["tilesX"].setData(tilesX);
+            c["params"]["threeChannels"].setData(threeChannels);
+            c["params"]["deadZone"].setData(acsDeadZone);
+            c["dequant"].setBinding(dequantAll_.rhi());
+            c["quantizer"].setBinding(quantizer.rhi());
+            c["sbCost"].setBinding(sbCost.rhi());
+            c["rowPass"].setBinding(rowPass.rhi());
+            c["candQf"].setBinding(candQf.rhi());
+            c["candBits"].setBinding(candBits.rhi());
+            c["candDist"].setBinding(candDist.rhi());
+            c["candNz"].setBinding(candNz.rhi());
+            c["acs"].setBinding(acs.rhi());
+            c["firstBlock"].setBinding(firstBlock.rhi());
+            c["params"]["blocksX"].setData(dim.xsizeBlocks);
+            c["params"]["blocksY"].setData(dim.ysizeBlocks);
+            c["params"]["paddedWidth"].setData(dim.xsizePadded);
+            c["params"]["paddedHeight"].setData(dim.ysizePadded);
+            c["params"]["regionsX"].setData(regionsX);
+            c["params"]["family"].setData(family);
+            c["params"]["lambda"].setData(options.acsLambda);
+            c["params"]["distance"].setData(options.distance);
+            c["params"]["largeMask"].setData(familyMask >> 7);
+        };
+        if (jpeg == nullptr) largeQf_.dispatch(batch, {regionsX * regionsY * 5, 1, 1}, [&](rhi::ShaderCursor c) { bindLarge(c, 0, 0); });
+        for (uint32_t family = 0; family < 3; ++family) {
+            if (jpeg == nullptr) largeRows_.dispatch(batch, {static_cast<uint32_t>(3 * planePixels), 1, 1}, [&](rhi::ShaderCursor c) { bindLarge(c, family, 0); });
+            if (jpeg == nullptr) largeCols_.dispatch(batch, {static_cast<uint32_t>(planePixels), 1, 1}, [&](rhi::ShaderCursor c) { bindLarge(c, family, 0); });
+            if (jpeg == nullptr && threeChannels != 0) {
+                largeCols_.dispatch(batch, {static_cast<uint32_t>(2 * planePixels), 1, 1}, [&](rhi::ShaderCursor c) { bindLarge(c, family, 1); });
+            }
+        }
+        if (jpeg == nullptr) mergeLarge_.dispatch(batch, {regionsX * regionsY, 1, 1}, [&](rhi::ShaderCursor c) { bindLarge(c, 0, 0); });
+    }
     if (jpeg == nullptr) adjustQuantField_.dispatch(batch, {nblocks, 1, 1}, bindTransform);
     // Oracle experiment: another encoder's quant field and strategy map (as the
     // decoder's SJXL_DEBUG_MAPS dumps them) replace ours.
@@ -790,19 +832,7 @@ Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, cons
     if (jpeg == nullptr) specialTransform_.dispatch(batch, {3 * nblocks, 1, 1}, bindTransform);
     if (jpeg == nullptr) dcFromLlf_.dispatch(batch, {3 * nblocks, 1, 1}, bindTransform);
     if (options.chromaFromLuma) {
-        if (jpeg == nullptr) cflTile_.dispatch(batch, {tilesX * tilesY, 1, 1}, [&](rhi::ShaderCursor c) {
-            c["coeffs"].setBinding(coeffs.rhi());
-            c["dequant"].setBinding(dequantAll_.rhi());
-            c["acs"].setBinding(acs.rhi());
-            c["rawQf"].setBinding(rawQf.rhi());
-            c["quantizer"].setBinding(quantizer.rhi());
-            c["cmapX"].setBinding(cmapX.rhi());
-            c["cmapB"].setBinding(cmapB.rhi());
-            c["params"]["blocksX"].setData(dim.xsizeBlocks);
-            c["params"]["blocksY"].setData(dim.ysizeBlocks);
-            c["params"]["tilesX"].setData(tilesX);
-            c["params"]["tilesY"].setData(tilesY);
-        });
+        if (jpeg == nullptr) cflTile_.dispatch(batch, {tilesX * tilesY, 1, 1}, bindCfl);
     }
     if (jpeg == nullptr) quantize_.dispatch(batch, {nblocks, 1, 1}, [&](rhi::ShaderCursor c) {
         c["coeffs"].setBinding(coeffs.rhi());

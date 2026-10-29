@@ -18,8 +18,8 @@ record. The encoder is VarDCT with transforms from 8×8 to 64×64 chosen by
 libjxl's entropy model, libjxl's adaptive quant field, chroma-from-luma,
 Gaborish + EPF, the weighted predictor and fixed trees for the DC, and ANS
 with clustered contexts throughout: at the file size `cjxl -e 5` produces it
-scores slightly above it on 4K photos (+0.1 to +0.6 SSIMULACRA2) and within
-a point or two on 200-pixel images; alpha (coded losslessly as an extra
+scores above it on 4K photos (+0.4 to +1.2 SSIMULACRA2 at d 1 and 3) and
+about level on the 200-pixel test images (−0.5 to +2.3); alpha (coded losslessly as an extra
 channel) and 16-bit input are accepted, `sjxl animate` writes an animation
 (lossy or lossless) whose frames code only the rectangle that changed, `--progressive`/`--qprogressive` split the AC
 coefficients over frequency or precision passes and `--progressive-dc` puts a
