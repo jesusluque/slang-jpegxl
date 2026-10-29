@@ -551,12 +551,20 @@ for comparison, which learns a tree per image and uses the weighted predictor):
 | sveti_crop_257x129 | 46141 B | 40975 B |
 | sveti_stefan_320 | 84703 B | 78385 B |
 
-8–13 % larger than cjxl. Known headroom, in order: a tree with more
-properties (cjxl learns one from the image), the weighted predictor (needs a
-serial per-group pass for the residuals, as the error state propagates),
-Squeeze/palette choices for flat or few-colour images, and the LZ77 RLE cjxl
-uses at this effort. Encode time is dominated by the serial ANS chain (270 ms
-Debug for 320×180 as the two groups' threads each walk 29k tokens twice).
+8–13 % larger than cjxl with the Gradient predictor and the gradient tree.
+
+**Weighted predictor** (later the same day): with the DC streams' machinery
+in place, the lossless channels went through the weighted predictor and the
+fixed WP-property tree (`modTokenize`, one thread per group: the error state
+is serial, so the residuals and contexts come out of one pass per group and
+channel, kept per sample for the ANS pass; the global stream of a small image
+reads the same tokens). Sizes: sveti_64 3643 B (cjxl 3707), berlin_200
+28 206 (27 684), sveti_crop 41 426 (40 975), sveti_stefan_320 78 928 (78 385):
+within 2 % of cjxl -d 0 -e 5, which at this effort picks per channel between
+Gradient and the weighted predictor and learns its tree. Remaining headroom:
+that per-channel choice ("Best"), a learned tree, Squeeze/palette for flat or
+few-colour images, and the LZ77 RLE. Encode time is dominated by the serial WP
+and ANS passes per group (300 ms Debug for 320×180).
 
 **Alpha and 16 bits.** The same path takes RGBA and 16-bit input
 (`image::readImage` keeps both): the alpha channel is the modular image's

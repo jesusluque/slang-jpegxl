@@ -14,6 +14,29 @@
 
 static const uint kModTreeWords = 8;
 static const uint kModPropGradient = 9;
+static const uint kModPropWp = 15;
+static const uint kModPredZero = 0, kModPredLeft = 1, kModPredGradient = 5, kModPredWeighted = 6;
+
+/// The tree walk over the properties the encoder's trees read: 0 channel, 2 y,
+/// 6 N (top), 7 W (left), 9 the gradient W + N - NW, 15 the WP property.
+uint modTreeLeaf(StructuredBuffer<uint> tree, uint c, uint y, int top, int left, int topleft, int wpProp, out uint predictor, out int offset) {
+    uint node = 0;
+    for (;;) {
+        const int prop = int(tree[node * kModTreeWords + 0]);
+        if (prop < 0) break;
+        int v = 0;
+        if (prop == 0) v = int(c);
+        else if (prop == 2) v = int(y);
+        else if (prop == 6) v = top;
+        else if (prop == 7) v = left;
+        else if (prop == 9) v = int(uint(left) + uint(top) - uint(topleft));
+        else if (prop == 15) v = wpProp;
+        node = v > int(tree[node * kModTreeWords + 1]) ? tree[node * kModTreeWords + 2] : tree[node * kModTreeWords + 3];
+    }
+    predictor = tree[node * kModTreeWords + 5];
+    offset = int(tree[node * kModTreeWords + 6]);
+    return tree[node * kModTreeWords + 4];
+}
 
 int modClampedGradient(int n, int w, int l) {
     const int m = min(n, w);

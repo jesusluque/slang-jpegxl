@@ -108,7 +108,7 @@ Result<std::unique_ptr<Encoder>> Encoder::create(std::shared_ptr<gpu::ShaderLibr
     SJXL_ASSIGN(enc->accumulateClusters_, gpu::ComputeKernel::create(lib, "sjxl/enc/cluster", "accumulateClusters"));
     SJXL_ASSIGN(enc->acSections_, gpu::ComputeKernel::create(lib, "sjxl/enc/ac_sections", "acSections"));
     SJXL_ASSIGN(enc->rctYCoCg_, gpu::ComputeKernel::create(lib, "sjxl/enc/modular", "rctYCoCg"));
-    SJXL_ASSIGN(enc->modHist_, gpu::ComputeKernel::create(lib, "sjxl/enc/modular", "modHist"));
+    SJXL_ASSIGN(enc->modTokenize_, gpu::ComputeKernel::create(lib, "sjxl/enc/modular", "modTokenize"));
     SJXL_ASSIGN(enc->modGroupSections_, gpu::ComputeKernel::create(lib, "sjxl/enc/modular", "modGroupSections"));
     SJXL_ASSIGN(enc->modularGlobalBlob_, gpu::ComputeKernel::create(lib, "sjxl/enc/codes", "buildModularGlobalBlob"));
     SJXL_ASSIGN(enc->dcGroupBlobs_, gpu::ComputeKernel::create(lib, "sjxl/enc/codes", "buildDcGroupBlobs"));
@@ -562,6 +562,7 @@ Result<std::vector<uint8_t>> Encoder::encode(const image::Rgb8& image, const Opt
         c["ansReverse"].setBinding(ansReverse.rhi());
         c["planes"].setBinding(dummyInt_.rhi());
         c["treeNodes"].setBinding(dummy_.rhi());
+        c["modTokens"].setBinding(dummy_.rhi());
         c["dcTree"].setBinding(dcTree.rhi());
         c["metaTree"].setBinding(metaTree.rhi());
         c["codes"].setBinding(codes.rhi());
@@ -796,8 +797,9 @@ Result<std::vector<uint8_t>> Encoder::encodeLossless(const image::Rgb8& image, c
     const uint64_t pixels = uint64_t{image.width} * image.height;
     const uint32_t channels = image.channels;
 
+    // libjxl's weighted predictor with the fixed WP-property tree (its DC tree) for every channel.
     uint32_t numLeaves = 0;
-    const std::vector<uint32_t> treeWords = fixedGradientTree(channels * pixels, numLeaves);
+    const std::vector<uint32_t> treeWords = fixedTree(kModPropWp, kPredWeighted, channels * pixels, numLeaves);
     const uint32_t numTreeNodes = static_cast<uint32_t>(treeWords.size() / kModTreeWords);
     SJXL_ASSIGN(auto treeNodes, gpu::Buffer::fromSpan<uint32_t>(dev, treeWords, "enc.treeNodes"));
 
@@ -805,6 +807,9 @@ Result<std::vector<uint8_t>> Encoder::encodeLossless(const image::Rgb8& image, c
     std::memcpy(rgbWords.data(), image.pixels.data(), image.pixels.size());
     SJXL_ASSIGN(auto rgb, gpu::Buffer::fromSpan<uint32_t>(dev, rgbWords, "enc.rgb8"));
     SJXL_ASSIGN(auto planes, gpu::Buffer::ofType<int32_t>(dev, channels * pixels, "enc.planes"));
+    SJXL_ASSIGN(auto modTokens, gpu::Buffer::ofType<uint32_t>(dev, channels * pixels, "enc.modTokens"));
+    const uint32_t wpWordsPerGroup = 5 * 2 * (dim.groupDim + 2);
+    SJXL_ASSIGN(auto wpScratch, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{numGroups} * wpWordsPerGroup, "enc.wpScratchMod"));
     SJXL_ASSIGN(auto ctxHist, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{numLeaves} * kHistBins, "enc.ctxHist"));
     SJXL_ASSIGN(auto ctxMap, gpu::Buffer::ofType<uint32_t>(dev, numLeaves, "enc.ctxMap"));
     SJXL_ASSIGN(auto ctxTotal, gpu::Buffer::ofType<float>(dev, numLeaves, "enc.ctxTotal"));
@@ -831,6 +836,8 @@ Result<std::vector<uint8_t>> Encoder::encodeLossless(const image::Rgb8& image, c
         c["planes"].setBinding(planes.rhi());
         c["planesIn"].setBinding(planes.rhi());
         c["treeNodes"].setBinding(treeNodes.rhi());
+        c["wpScratch"].setBinding(wpScratch.rhi());
+        c["modTokens"].setBinding(modTokens.rhi());
         c["ctxHist"].setBinding(ctxHist.rhi());
         c["ctxMap"].setBinding(ctxMap.rhi());
         c["ansInfo"].setBinding(ansInfo.rhi());
@@ -847,9 +854,10 @@ Result<std::vector<uint8_t>> Encoder::encodeLossless(const image::Rgb8& image, c
         c["params"]["mode"].setData(mode);
         c["params"]["numChannels"].setData(channels);
         c["params"]["bitDepth"].setData(image.bitDepth);
+        c["params"]["wpWordsPerGroup"].setData(wpWordsPerGroup);
     };
     rctYCoCg_.dispatch(batch, {image.width, image.height, 1}, [&](rhi::ShaderCursor c) { bindMod(c, 0, dummy_, dummy_); });
-    modHist_.dispatch(batch, {static_cast<uint32_t>(channels * pixels), 1, 1}, [&](rhi::ShaderCursor c) { bindMod(c, 0, dummy_, dummy_); });
+    modTokenize_.dispatch(batch, {numGroups, 1, 1}, [&](rhi::ShaderCursor c) { bindMod(c, 0, dummy_, dummy_); });
     const auto bindCluster = [&](rhi::ShaderCursor c) {
         c["ctxHist"].setBinding(ctxHist.rhi());
         c["ctxTotal"].setBinding(ctxTotal.rhi());
@@ -879,6 +887,7 @@ Result<std::vector<uint8_t>> Encoder::encodeLossless(const image::Rgb8& image, c
         c["ansReverse"].setBinding(ansReverse.rhi());
         c["planes"].setBinding(planes.rhi());
         c["treeNodes"].setBinding(treeNodes.rhi());
+        c["modTokens"].setBinding(modTokens.rhi());
         c["dcTree"].setBinding(dummy_.rhi());
         c["metaTree"].setBinding(dummy_.rhi());
         c["codes"].setBinding(codes.rhi());

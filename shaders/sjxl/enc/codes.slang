@@ -70,6 +70,7 @@ RWStructuredBuffer<uint>   ansInfo;    // ANS symbol info per code region (the c
 RWStructuredBuffer<uint>   ansReverse; // ANS reverse maps per code region
 StructuredBuffer<int>      planes;     // modular: 3 * width * height channel values
 StructuredBuffer<uint>     treeNodes;  // modular: the fixed tree, kModTreeWords per node
+StructuredBuffer<uint>     modTokens;  // modular: ctx << 18 | value per channel sample
 StructuredBuffer<uint>     dcTree;     // VarDCT DC groups: the kWPFixedDC tree
 StructuredBuffer<uint>     metaTree;   // VarDCT DC groups: the kACMeta tree
 RWStructuredBuffer<uint>   codes;      // depth << 16 | bits
@@ -698,8 +699,8 @@ void writeModularImageStream(RWStructuredBuffer<uint> buf, inout SerialWriter w)
         for (int c = int(params.numChannels) - 1; c >= 0; --c) {
             for (int y = int(params.height) - 1; y >= 0; --y) {
                 for (int x = int(params.width) - 1; x >= 0; --x) {
-                    uint ctx, value;
-                    modToken(planes, params.width, params.height, 0, 0, uint(c), uint(x), uint(y), treeNodes, ctx, value);
+                    const uint t = modTokens[uint(c) * params.width * params.height + uint(y) * params.width + uint(x)];
+                    const uint ctx = t >> 18, value = t & 0x3FFFFu;
                     uint tok, nbits, raw;
                     hybridEncode(value, tok, nbits, raw);
                     const uint cluster = ctxMap[ctx];
