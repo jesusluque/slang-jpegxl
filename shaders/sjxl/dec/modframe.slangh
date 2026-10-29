@@ -83,6 +83,7 @@ void decodeModularGroup(inout Dec d, uint x0, uint y0, uint w, uint h, int minSh
     const uint fullOff = arena[kGsModChansOff];
     const uint numFull = arena[kGsModNumChannels];
     const uint beginC = arena[kGsModBeginC];
+    if (beginC >= numFull) return;   // nothing left for the groups (a VarDCT frame without extra channels): no bits, no arena
     const uint localOff = alloc(d, kMaxChannels * kChanWords);
     if (d.error != kErrNone) return;
     uint numLocal = 0;
