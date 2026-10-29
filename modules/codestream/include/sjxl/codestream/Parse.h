@@ -161,7 +161,12 @@ struct Parsed {
     std::vector<ParsedFrame> frames;       // in codestream order; the last one is displayed
     ParsedFrame              frame;        // the displayed (last) frame, a copy of frames.back()
     bool                     incomplete = false;   // frames.back() has a permuted TOC still to finish (finishToc)
+    bool                     iccPending = false;   // an ICC profile (entropy coded) precedes the frames: finishIcc() first
+    size_t                   iccBit = 0;           // where it starts
 };
+
+/// After a kernel decoded the ICC stream that ends at `endBit`: parses the frames.
+[[nodiscard]] Result<void> finishIcc(Parsed& p, size_t endBit);
 
 /// After a kernel decoded the permutation of frames.back()'s TOC (`permutation[j]` is the
 /// codestream index of logical section j; `endBit` the bit after it): reads the sizes,

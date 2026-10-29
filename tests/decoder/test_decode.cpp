@@ -390,3 +390,42 @@ TEST_CASE("the decoder matches djxl on recompressed JPEGs", "[decoder][conforman
     WARN(std::format("jpeg {} q{}: vs djxl PSNR {:.2f} dB, max diff {}", name, quality, metrics->psnr, metrics->maxAbsDiff));
     CHECK(metrics->maxAbsDiff <= 1);
 }
+
+TEST_CASE("the decoder matches djxl on images with an ICC profile", "[decoder][conformance][cjxl][icc]") {
+    const std::filesystem::path djxl = test::findTool("djxl");
+    const std::filesystem::path cjxl = test::findTool("cjxl");
+    if (djxl.empty() || cjxl.empty()) SKIP("cjxl/djxl are not installed");
+    // djxl writes JPEGs with an embedded ICC profile; cjxl keeps it in the codestream.
+    const std::filesystem::path tmpJxl = test::scratchDir() / "icc_source.jxl";
+    const std::filesystem::path jpg = test::scratchDir() / "icc_source.jpg";
+    REQUIRE(test::run(std::format("\"{}\" \"{}\" \"{}\" -d 0 -e 1 >/dev/null 2>&1", cjxl.string(), test::testData("berlin_200.png").string(), tmpJxl.string())));
+    REQUIRE(test::run(std::format("\"{}\" \"{}\" \"{}\" >/dev/null 2>&1", djxl.string(), tmpJxl.string(), jpg.string())));
+    // "" transcodes the JPEG (cjxl's default even with -d 0); --lossless_jpeg=0 encodes its pixels.
+    const std::string options = GENERATE(std::string(""), std::string("--lossless_jpeg=0 -d 0 -e 3"),
+                                         std::string("--lossless_jpeg=0 -d 0 -e 7 --responsive=1"));
+    CAPTURE(options);
+    std::string tag = options.empty() ? "transcode" : options;
+    for (char& ch : tag) if (ch == ' ' || ch == '-' || ch == '=') ch = '_';
+    const std::filesystem::path jxl = test::scratchDir() / std::format("dec_icc_{}.jxl", tag);
+    const std::filesystem::path png = test::scratchDir() / std::format("dec_icc_{}.djxl.png", tag);
+    REQUIRE(test::run(std::format("\"{}\" \"{}\" \"{}\" {} >/dev/null 2>&1", cjxl.string(), jpg.string(), jxl.string(), options)));
+    REQUIRE(test::run(std::format("\"{}\" \"{}\" \"{}\" >/dev/null 2>&1", djxl.string(), jxl.string(), png.string())));
+    auto bytes = image::readFile(jxl);
+    REQUIRE(bytes);
+    auto parsed = dec::Decoder::info(*bytes);
+    REQUIRE(parsed);
+    REQUIRE(parsed->metadata.wantIcc);
+    auto reference = image::readRgb8(png);
+    REQUIRE(reference);
+    auto ours = decoder().decode(*bytes);
+    if (!ours && ours.error().code() == ErrorCode::Unsupported) {
+        WARN(std::format("icc {}: unsupported: {}", tag, ours.error().message()));
+        SUCCEED();
+        return;
+    }
+    REQUIRE(ours);
+    auto metrics = test::compare(*reference, *ours);
+    REQUIRE(metrics);
+    WARN(std::format("icc {}: vs djxl PSNR {:.2f} dB, max diff {}", tag, metrics->psnr, metrics->maxAbsDiff));
+    CHECK(metrics->maxAbsDiff <= (options.empty() ? 1 : 0));   // the transcode goes through YCbCr floats; lossless is exact
+}

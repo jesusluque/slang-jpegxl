@@ -60,11 +60,13 @@ private:
         size_t endBit = 0;
     };
     [[nodiscard]] Result<TocPermutation> decodeTocPermutation(const codestream::Parsed& parsed, const codestream::ParsedFrame& frame);
+    /// The bit after the ICC stream at parsed.iccBit, decoded by a kernel.
+    [[nodiscard]] Result<size_t> decodeIccEnd(const codestream::Parsed& parsed);
 
     std::shared_ptr<gpu::ShaderLibrary> library_;
     gpu::Device*                        device_ = nullptr;
     gpu::ComputeKernel globals_, dcGroups_, acGroups_, tables_, smoothDc_, computeSigma_, dequantCoeffs_, llfFromDc_, idctRows_, idctCols_, transformSpecial_,
-        gaborish_, epf_, output_, modularGlobals_, modularDcGroups_, modularAcGroups_, modularFinalize_, modularToPlanes_, ecToPlanes_, bucketPatches_, applyPatches_, tocPermutation_, dcFromFrame_, upsample_, noiseRandom_, noiseConvolve_, noiseAdd_, chromaUpsample_;
+        gaborish_, epf_, output_, modularGlobals_, modularDcGroups_, modularAcGroups_, modularFinalize_, modularToPlanes_, ecToPlanes_, bucketPatches_, applyPatches_, tocPermutation_, dcFromFrame_, upsample_, noiseRandom_, noiseConvolve_, noiseAdd_, chromaUpsample_, icc_;
     Stats stats_;
 };
 

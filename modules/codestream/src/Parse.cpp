@@ -578,6 +578,13 @@ Result<void> parseFramesFrom(Parsed& p, size_t startByte) {
 
 }   // namespace
 
+Result<void> finishIcc(Parsed& p, size_t endBit) {
+    if (!p.iccPending) return Error(ErrorCode::InternalError, "finishIcc without a pending ICC");
+    p.iccPending = false;
+    p.incomplete = false;
+    return parseFramesFrom(p, (endBit + 7) / 8);   // JumpToByteBoundary after the ICC
+}
+
 Result<void> finishToc(Parsed& p, std::span<const uint32_t> permutation, size_t endBit) {
     if (!p.incomplete || p.frames.empty()) return Error(ErrorCode::InternalError, "finishToc without a pending TOC");
     ParsedFrame& frame = p.frames.back();
@@ -603,7 +610,6 @@ Result<Parsed> parse(std::span<const uint8_t> file) {
     if (!br.withinBounds()) return corrupt("truncated headers");
 
     // What M2 does not do yet.
-    if (m.wantIcc) return unsupported("ICC colour profiles");
     if (m.havePreview) return unsupported("preview frames");
     if (m.haveAnimation) return unsupported("animation");
     if (m.orientation != 1) return unsupported("orientation other than identity");
@@ -612,6 +618,14 @@ Result<Parsed> parse(std::span<const uint8_t> file) {
         return unsupported("transfer functions other than sRGB, linear, gamma and DCI (PQ/HLG/709)");
     }
 
+    if (m.wantIcc) {
+        // The ICC profile follows the metadata, entropy coded: a kernel decodes it to find
+        // the frames (icc_codec.cc ICCReader; the pixels do not depend on its bytes).
+        p.iccPending = true;
+        p.iccBit = br.bitPosition();
+        p.incomplete = true;
+        return p;
+    }
     SJXL_TRY(parseFramesFrom(p, (br.bitPosition() + 7) / 8));
     return p;
 }

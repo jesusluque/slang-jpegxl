@@ -68,6 +68,7 @@ Result<std::unique_ptr<Decoder>> Decoder::create(std::shared_ptr<gpu::ShaderLibr
     SJXL_ASSIGN(dec->modularToPlanes_, gpu::ComputeKernel::create(lib, "sjxl/dec/modular_out", "modularToPlanes"));
     SJXL_ASSIGN(dec->ecToPlanes_, gpu::ComputeKernel::create(lib, "sjxl/dec/modular_out", "ecToPlanes"));
     SJXL_ASSIGN(dec->tocPermutation_, gpu::ComputeKernel::create(lib, "sjxl/dec/toc", "decodeTocPermutation"));
+    SJXL_ASSIGN(dec->icc_, gpu::ComputeKernel::create(lib, "sjxl/dec/toc", "decodeIcc"));
     SJXL_ASSIGN(dec->upsample_, gpu::ComputeKernel::create(lib, "sjxl/dec/upsample", "upsample"));
     SJXL_ASSIGN(dec->chromaUpsample_, gpu::ComputeKernel::create(lib, "sjxl/dec/filters", "chromaUpsample"));
     SJXL_ASSIGN(dec->noiseRandom_, gpu::ComputeKernel::create(lib, "sjxl/dec/noise", "noiseRandom"));
@@ -84,11 +85,39 @@ Result<std::unique_ptr<Decoder>> Decoder::create(std::shared_ptr<gpu::ShaderLibr
 
 Result<codestream::Parsed> Decoder::parseAll(std::span<const uint8_t> file) {
     SJXL_ASSIGN(codestream::Parsed parsed, codestream::parse(file));
+    if (parsed.iccPending) {
+        SJXL_ASSIGN(const size_t end, decodeIccEnd(parsed));
+        SJXL_TRY(codestream::finishIcc(parsed, end));
+    }
     while (parsed.incomplete) {
         SJXL_ASSIGN(const TocPermutation perm, decodeTocPermutation(parsed, parsed.frames.back()));
         SJXL_TRY(codestream::finishToc(parsed, perm.order, perm.endBit));
     }
     return parsed;
+}
+
+Result<size_t> Decoder::decodeIccEnd(const codestream::Parsed& parsed) {
+    gpu::Device& dev = *device_;
+    std::vector<uint32_t> csWords((parsed.codestream.size() + 3) / 4 + 2, 0);
+    std::memcpy(csWords.data(), parsed.codestream.data(), parsed.codestream.size());
+    SJXL_ASSIGN(auto cs, gpu::Buffer::fromSpan<uint32_t>(dev, csWords, "dec.icc.cs"));
+    constexpr uint32_t kIccArenaWords = 1u << 20;
+    SJXL_ASSIGN(auto arena, gpu::Buffer::ofType<uint32_t>(dev, kIccArenaWords, "dec.icc.arena"));
+    SJXL_ASSIGN(auto out, gpu::Buffer::ofType<uint32_t>(dev, 4, "dec.icc.out"));
+    gpu::CommandBatch batch(dev);
+    icc_.dispatch(batch, {1, 1, 1}, [&](rhi::ShaderCursor c) {
+        c["cs"].setBinding(cs.rhi());
+        c["arena"].setBinding(arena.rhi());
+        c["tocOut"].setBinding(out.rhi());
+        c["params"]["tocBit"].setData(static_cast<uint32_t>(parsed.iccBit));
+        c["params"]["tocEntries"].setData(0u);
+        c["params"]["arenaCap"].setData(kIccArenaWords);
+    });
+    SJXL_TRY(batch.submit(true));
+    SJXL_ASSIGN(const std::vector<uint32_t> words, out.readAll<uint32_t>(dev));
+    if (words[0] != kErrNone) return Error::make(ErrorCode::Corrupt, "{} in the ICC profile", describe(words[0]));
+    log::debug("decoder: ICC profile of {} encoded bytes, frames start at bit {}", words[2], words[1]);
+    return size_t{words[1]};
 }
 
 Result<image::Rgb8> Decoder::decode(std::span<const uint8_t> file) {

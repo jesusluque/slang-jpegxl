@@ -54,9 +54,10 @@ per subsystem or milestone, appended to as the work goes. Dates are absolute.
 - **M3 encoder quality**: inverse Gaborish + default LoopFilter, EPF sharpness,
   CfL per tile, adaptive quant field, DCT16/32 strategy search, context
   clustering (≤ 32, fixed-point costs as cujpegxl), ANS for AC.
-- **M4 decoder completeness**: splines, >8-bit output, ICC profiles,
-  animation, grey JPEG transcodes, loop filters on YCbCr frames, extra
-  channel blending in patches, premultiplied alpha handling. (64–256 px
+- **M4 decoder completeness**: splines, >8-bit output, animation, grey
+  JPEG transcodes, loop filters on YCbCr frames, extra channel blending in
+  patches, premultiplied alpha handling, writing the ICC profile into the
+  output file. (64–256 px
   transforms, Modular frames with RCT/palette/Squeeze, lossy modular,
   patches, progressive passes, DC frames, permuted TOCs, upsampling, noise,
   extra channels with alpha output, JPEG recompression: done.)
@@ -431,3 +432,20 @@ Not done: grey JPEGs (one component), JPEGs with an embedded ICC profile (the
 ICC stream is entropy coded and must be decoded to be skipped), loop filters
 on YCbCr frames (cjxl writes none for transcodes), reconstruction of the
 original JPEG file (jbrd box).
+
+## ICC profiles (2026-10-29)
+
+An image whose colour encoding is an ICC profile (`want_icc`) carries the
+profile right after the image metadata, entropy coded (`icc_codec.cc`): a
+U64 size, histograms over 41 contexts, one ANS symbol per byte with a
+context from the two previous bytes (`ICCANSContext`), the final-state check,
+then the frames start at the next byte boundary. The pixels never depend on
+the profile's bytes: an XYB image with an ICC profile is output as sRGB (and
+djxl without a CMS refuses to decode it at all), a non-XYB one passes its
+samples through. So `toc.slang decodeIcc` only decodes the stream to find
+its end; `parse()` stops at the ICC (`Parsed::iccPending`), `Decoder::parseAll`
+runs the kernel, `finishIcc()` continues with the frames. Reconstructing the
+profile (`UnpredictICC`, for embedding it in the PNG) is not done.
+
+Measured (`[icc]` test): a JPEG written by djxl (with its ICC), transcoded,
+re-encoded losslessly and as responsive modular: within 1 LSB / bit-exact.
