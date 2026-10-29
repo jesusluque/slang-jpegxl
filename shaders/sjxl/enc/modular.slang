@@ -25,7 +25,7 @@ struct ModParams {
     uint numChannels; // 3, or 4 with alpha
     uint bitDepth;    // 8 or 16
     uint wpWordsPerGroup;
-    uint pad1;
+    uint pass;        // modTokenize: which predictor pass (tokens and histograms land at its offset)
     uint pad2;
 };
 
@@ -34,7 +34,12 @@ RWStructuredBuffer<int>    planes;        // numChannels * width * height: Y, Co
 StructuredBuffer<int>      planesIn;      // the same buffer, read by the token kernels
 StructuredBuffer<uint>     treeNodes;     // kModTreeWords per node
 RWStructuredBuffer<uint>   wpScratch;     // numGroups * wpWordsPerGroup
-RWStructuredBuffer<uint>   modTokens;     // numChannels * width * height: ctx << 18 | value
+RWStructuredBuffer<uint>   passTokens;    // 2 passes * numChannels * width * height: ctx << 18 | value per predictor tree
+RWStructuredBuffer<uint>   passHist;      // 2 passes * numChannels * kSetContexts * kHistBins
+RWStructuredBuffer<float>  passBits;      // 2 passes * numChannels: the entropy estimate
+StructuredBuffer<uint>     choice;        // per channel: the pass chosen
+StructuredBuffer<uint>     leafMap;       // per channel * kSetContexts: the chosen pass's leaf -> the combined tree's leaf
+RWStructuredBuffer<uint>   modTokens;     // numChannels * width * height: the final ctx << 18 | value
 RWStructuredBuffer<uint>   ctxHist;       // numLeaves * kHistBins
 StructuredBuffer<uint>     ctxMap;        // leaf -> cluster
 StructuredBuffer<uint>     ansInfo;
@@ -45,6 +50,7 @@ RWStructuredBuffer<uint>   body;          // mode 2 output
 ConstantBuffer<ModParams>  params;
 
 static const uint kHistBins = 128;
+static const uint kSetContexts = 64;
 
 uint byteAt(uint index) {
     return (rgb8[index >> 2] >> ((index & 3) * 8)) & 0xFFu;
@@ -77,8 +83,10 @@ void rctYCoCg(uint3 tid: SV_DispatchThreadID) {
 }
 
 /// One thread per group: its channels in raster order through the weighted
-/// predictor and the tree (the decoder's edge rules inside the group's
-/// rectangle), the tokens kept per pixel and counted per context.
+/// predictor state and the pass's tree (the decoder's edge rules inside the
+/// group's rectangle), the tokens kept per sample and counted per channel and
+/// context. Two passes (the WP tree, the gradient tree) feed the per-channel
+/// choice libjxl's Predictor::Best makes.
 [shader("compute")]
 [numthreads(1, 1, 1)]
 void modTokenize(uint3 tid: SV_DispatchThreadID) {
@@ -112,15 +120,53 @@ void modTokenize(uint3 tid: SV_DispatchThreadID) {
                 else if (predictor == kModPredGradient) guess += int64_t(modClampedGradient(left, top, topleft));
                 else if (predictor == kModPredLeft) guess += int64_t(left);
                 const uint value = packSigned(int(int64_t(v) - guess));
-                modTokens[at] = (ctx << 18) | value;
+                passTokens[params.pass * params.numChannels * plane + at] = (ctx << 18) | value;
                 uint tok, nbits, raw;
                 hybridEncode(value, tok, nbits, raw);
                 uint before;
-                InterlockedAdd(ctxHist[ctx * kHistBins + min(tok, kHistBins - 1)], 1u, before);
+                InterlockedAdd(passHist[((params.pass * params.numChannels + c) * kSetContexts + ctx) * kHistBins + min(tok, kHistBins - 1)], 1u, before);
                 wpUpdateErrors(wpScratch, wp, int64_t(v), lx, ly);
             }
         }
     }
+}
+
+/// One thread per (pass, channel): the bits its tokens would take under an
+/// ideal code per context, sum of n log2(N / n).
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void channelEntropy(uint3 tid: SV_DispatchThreadID) {
+    if (tid.x >= 2 * params.numChannels) return;
+    float bits = 0.0f;
+    for (uint ctx = 0; ctx < kSetContexts; ++ctx) {
+        const uint base = (tid.x * kSetContexts + ctx) * kHistBins;
+        float total = 0.0f;
+        for (uint sym = 0; sym < kHistBins; ++sym) total += float(passHist[base + sym]);
+        if (total == 0.0f) continue;
+        for (uint sym = 0; sym < kHistBins; ++sym) {
+            const float n = float(passHist[base + sym]);
+            if (n > 0.0f) bits += n * log2(total / n);
+        }
+    }
+    passBits[tid.x] = bits;
+}
+
+/// One thread per sample: the chosen pass's token with its leaf renumbered
+/// into the combined tree, and the final context histograms.
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void remapTokens(uint3 tid: SV_DispatchThreadID) {
+    const uint plane = params.width * params.height;
+    if (tid.x >= params.numChannels * plane) return;
+    const uint c = tid.x / plane;
+    const uint t = passTokens[choice[c] * params.numChannels * plane + tid.x];
+    const uint ctx = leafMap[c * kSetContexts + (t >> 18)];
+    const uint value = t & 0x3FFFFu;
+    modTokens[tid.x] = (ctx << 18) | value;
+    uint tok, nbits, raw;
+    hybridEncode(value, tok, nbits, raw);
+    uint before;
+    InterlockedAdd(ctxHist[ctx * kHistBins + min(tok, kHistBins - 1)], 1u, before);
 }
 
 struct AnsWriter {

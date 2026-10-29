@@ -561,10 +561,26 @@ channel, kept per sample for the ANS pass; the global stream of a small image
 reads the same tokens). Sizes: sveti_64 3643 B (cjxl 3707), berlin_200
 28 206 (27 684), sveti_crop 41 426 (40 975), sveti_stefan_320 78 928 (78 385):
 within 2 % of cjxl -d 0 -e 5, which at this effort picks per channel between
-Gradient and the weighted predictor and learns its tree. Remaining headroom:
-that per-channel choice ("Best"), a learned tree, Squeeze/palette for flat or
-few-colour images, and the LZ77 RLE. Encode time is dominated by the serial WP
-and ANS passes per group (300 ms Debug for 320×180).
+Gradient and the weighted predictor (Predictor::Best) and learns its tree.
+
+**Best** (the per-channel choice): `modTokenize` runs twice, once with the WP
+tree and once with the gradient tree, into separate token and per-channel
+histogram buffers; `channelEntropy` estimates each channel's bits under an
+ideal code per context (n log2(N / n)); the host picks the cheaper predictor
+per channel (bookkeeping on eight numbers) and builds the frame's tree: the
+chosen tree when the channels agree, else the per-channel subtrees joined
+under a chain of splits on the channel property, re-serialised breadth-first
+with a leaf map; `remapTokens` renumbers the chosen pass's contexts into it
+and counts the final histograms. On the 8-bit test images every channel keeps
+the weighted predictor; the synthetic 16-bit variant (a deterministic
+low-byte ramp) switches all channels to Gradient and goes from 98 754 (WP) to
+88 150 bytes (cjxl 74 386 with its learned tree; the per-channel subtrees,
+when tried on it with the same predictor everywhere, gave 85 615, so
+channel-separated contexts help wide alphabets while costing 0.3 % on the
+8-bit images, which is why the unanimous case keeps one tree). Remaining
+headroom: a learned tree, Squeeze/palette for flat or few-colour images, and
+the LZ77 RLE. Encode time is dominated by the serial WP and ANS passes per group (two
+tokenising passes now; 300 ms Debug for 320×180).
 
 **Alpha and 16 bits.** The same path takes RGBA and 16-bit input
 (`image::readImage` keeps both): the alpha channel is the modular image's

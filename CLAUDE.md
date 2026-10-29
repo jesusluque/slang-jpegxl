@@ -151,9 +151,11 @@ honoured as libjxl does (`image::Rgb8::gamma`; ICC profiles are not).
 
 Lossless (`--lossless`, RGB or RGBA at 8 or 16 bits; the lossy path takes
 8-bit RGB): a Modular frame, YCoCg RCT over the colour channels (alpha is the
-fourth modular channel and an extra channel in the headers), the weighted
-predictor and libjxl's fixed WP-property tree (built on the host from the
-pixel count, uploaded; `modTokenize` is serial per group),
+fourth modular channel and an extra channel in the headers), per channel the
+weighted predictor with libjxl's fixed WP-property tree or Gradient with the
+gradient tree, whichever `channelEntropy` estimates cheaper (`modTokenize`
+runs both passes, serial per group; the host joins the chosen subtrees under
+channel splits and `remapTokens` renumbers the contexts),
 residual tokens kept per sample (`enc/modular.slangh` `modTreeLeaf`, the
 decoder's group-local edge rules), clustered ANS histograms,
 the global section by one thread (`codes.slang buildModularGlobalBlob`; it
