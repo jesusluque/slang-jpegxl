@@ -55,10 +55,15 @@ struct Options {
     /// Modular frames: learn the MA tree from the image (libjxl's ComputeBestTree
     /// at its hare tier) instead of the fixed WP / gradient trees per channel.
     bool learnedTree = true;
+    /// Animations: a frame codes only the rectangle that changed since the frame
+    /// before it (a partial frame blended over the saved canvas); identical frames
+    /// extend the previous frame's duration. Off: every frame a full canvas.
+    bool cropFrames = true;
 };
 
 /// What the last encode measured, for tests and the CLI.
 struct Stats {
+    uint32_t              frames = 0;      ///< animations: frames emitted (identical frames merge)
     uint32_t              headBytes = 0;
     uint32_t              bodyBytes = 0;
     std::vector<uint32_t> sectionBytes;
@@ -92,9 +97,12 @@ public:
 private:
     Encoder() = default;
     /// One frame's bytes (frame header, TOC, body), byte-aligned, without the codestream header.
+    /// `rgbDevice`: the image's bytes already on the device (a cropped frame); `image` then
+    /// carries the size, channels and depth only.
     [[nodiscard]] Result<std::vector<uint8_t>> encodeFrame(const image::Rgb8& image, const Options& options, const codestream::FrameInfo& info,
-                                                           const image::JpegFile* jpeg = nullptr);
-    [[nodiscard]] Result<std::vector<uint8_t>> encodeLossless(const image::Rgb8& image, const Options& options, const codestream::FrameInfo& info);
+                                                           const image::JpegFile* jpeg = nullptr, const gpu::Buffer* rgbDevice = nullptr);
+    [[nodiscard]] Result<std::vector<uint8_t>> encodeLossless(const image::Rgb8& image, const Options& options, const codestream::FrameInfo& info,
+                                                              const gpu::Buffer* rgbDevice = nullptr);
     /// A Modular frame of `planes` (channels of width x height int32 samples,
     /// already on the device): the frame header, TOC and body. `rct` writes the
     /// YCoCg RCT over channels 0..2 (the planes must hold its output); a DC frame
@@ -134,7 +142,7 @@ private:
     gpu::ComputeKernel                  unpackPlanes_, rctCost_, rctApply_, dcFramePlanes_, modTokenize_;
     gpu::ComputeKernel                  paletteCount_, paletteBuild_, paletteIndex_, paletteVerify_, compactStats_, compactBuild_, compactApply_;
     gpu::ComputeKernel                  rleScan_, rleHistograms_, uintConfigHist_, uintConfigChoose_;
-    gpu::ComputeKernel                  jpegDecodeScan_, jpegToCoeffs_, jpegBlockCtx_, quantTableBlob_;
+    gpu::ComputeKernel                  jpegDecodeScan_, jpegToCoeffs_, jpegBlockCtx_, quantTableBlob_, changeBounds_, cropBytes_;
     gpu::ComputeKernel                  extractAlpha_, channelEntropy_, remapTokens_, modGroupSections_, modularGlobalBlob_;
     gpu::ComputeKernel                  dcGroupBlobs_, globalBlobs_, layout_, blobEmit_;
     gpu::PrefixSum                      prefixSum_;

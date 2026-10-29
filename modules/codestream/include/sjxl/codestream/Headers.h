@@ -34,6 +34,15 @@ struct FrameInfo {
     bool     isLast = true;
     bool     animated = false;   ///< the ImageMetadata has an animation: the duration field is written
     uint32_t duration = 0;
+    /// save_as_reference: the slot that keeps this frame (0: none for a displayed frame).
+    uint32_t saveAsReference = 0;
+    /// A partial frame: custom_size_or_origin with this rectangle of the image,
+    /// blended (kReplace) over reference slot `blendSource`; the frame's own
+    /// size is the rectangle's.
+    bool     haveCrop = false;
+    int32_t  x0 = 0, y0 = 0;
+    uint32_t cropWidth = 0, cropHeight = 0;
+    uint32_t blendSource = 0;
 };
 
 /// `gamma` 0: the all_default sRGB encoding; else a gamma transfer (e.g. 0.45455)

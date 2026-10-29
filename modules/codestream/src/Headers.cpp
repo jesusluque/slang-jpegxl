@@ -197,6 +197,9 @@ void writeCodestreamHeadersRgb(BitWriter& w, uint32_t xsize, uint32_t ysize, uin
     w.zeroPadToByte();
 }
 
+/// PackSigned: 0, -1, 1, -2, ... to 0, 1, 2, 3, ...
+uint32_t packSigned(int32_t v) { return v >= 0 ? 2u * static_cast<uint32_t>(v) : 2u * static_cast<uint32_t>(-(v + 1)) + 1u; }
+
 /// After the blending fields: the duration (animations), is_last and, for a
 /// frame that is not last, save_as_reference 0.
 void writeFrameEnd(BitWriter& w, const FrameInfo& info) {
@@ -205,7 +208,28 @@ void writeFrameEnd(BitWriter& w, const FrameInfo& info) {
     }
     w.writeBool(info.isLast);
     if (!info.isLast) {
-        writeU32(w, U32Enc{{Val(0), Val(1), Val(2), Val(3)}}, 0);   // save_as_reference
+        writeU32(w, U32Enc{{Val(0), Val(1), Val(2), Val(3)}}, info.saveAsReference);
+        // CanBeReferenced (a displayed frame with a slot), kReplace and not partial:
+        // save_before_color_transform false (the composited canvas is what is kept).
+        if (info.saveAsReference != 0 && !info.haveCrop) w.writeBool(false);
+    }
+}
+
+/// custom_size_or_origin (the crop of a partial frame) and the BlendingInfo of
+/// the colour channels and every extra channel: kReplace, with the reference
+/// slot `source` when the frame is partial.
+void writeCropAndBlending(BitWriter& w, const FrameInfo& info, uint32_t numExtraChannels) {
+    w.writeBool(info.haveCrop);                                    // custom_size_or_origin
+    if (info.haveCrop) {
+        const U32Enc enc{{Bits(8), BitsOffset(11, 256), BitsOffset(14, 2304), BitsOffset(30, 18688)}};
+        writeU32(w, enc, packSigned(info.x0));
+        writeU32(w, enc, packSigned(info.y0));
+        writeU32(w, enc, info.cropWidth);
+        writeU32(w, enc, info.cropHeight);
+    }
+    for (uint32_t i = 0; i < 1 + numExtraChannels; ++i) {
+        writeU32(w, U32Enc{{Val(0), Val(1), Val(2), BitsOffset(2, 3)}}, 0);   // blending mode kReplace
+        if (info.haveCrop) writeU32(w, U32Enc{{Val(0), Val(1), Val(2), Val(3)}}, info.blendSource);   // source (partial frames)
     }
 }
 
@@ -221,11 +245,7 @@ void writeModularFrameHeader(BitWriter& w, uint32_t numExtraChannels, const Fram
     }
     w.write(2, groupSizeShift);                                    // group_size_shift: 128 << shift px groups
     writeU32(w, U32Enc{{Val(1), Val(2), Val(3), BitsOffset(3, 4)}}, 1);   // num_passes = 1
-    w.writeBool(false);                                            // custom_size_or_origin
-    writeU32(w, U32Enc{{Val(0), Val(1), Val(2), BitsOffset(2, 3)}}, 0);   // blending mode kReplace
-    for (uint32_t i = 0; i < numExtraChannels; ++i) {
-        writeU32(w, U32Enc{{Val(0), Val(1), Val(2), BitsOffset(2, 3)}}, 0);   // the extra channel's BlendingInfo: kReplace
-    }
+    writeCropAndBlending(w, info, numExtraChannels);
     writeFrameEnd(w, info);
     writeU32(w, U32Enc{{Val(0), Bits(4), BitsOffset(5, 16), BitsOffset(10, 48)}}, 0);   // name length
     w.writeBool(false);                                            // LoopFilter all_default
@@ -284,11 +304,7 @@ void writeFrameHeader(BitWriter& w, const FrameParams& params, uint32_t numExtra
         for (uint32_t i = 0; i < params.numDownsample; ++i) writeU32(w, U32Enc{{Val(1), Val(2), Val(4), Val(8)}}, params.downsample[i]);
         for (uint32_t i = 0; i < params.numDownsample; ++i) writeU32(w, U32Enc{{Val(0), Val(1), Val(2), Bits(3)}}, params.lastPass[i]);
     }
-    w.writeBool(false);                                            // custom_size_or_origin
-    writeU32(w, U32Enc{{Val(0), Val(1), Val(2), BitsOffset(2, 3)}}, 0);   // blending mode kReplace
-    for (uint32_t i = 0; i < numExtraChannels; ++i) {
-        writeU32(w, U32Enc{{Val(0), Val(1), Val(2), BitsOffset(2, 3)}}, 0);   // the extra channel's BlendingInfo: kReplace
-    }
+    writeCropAndBlending(w, info, numExtraChannels);
     writeFrameEnd(w, info);
     writeU32(w, U32Enc{{Val(0), Bits(4), BitsOffset(5, 16), BitsOffset(10, 48)}}, 0);   // name length
     // LoopFilter (loop_filter.cc VisitFields).

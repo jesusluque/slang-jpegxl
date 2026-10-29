@@ -165,6 +165,8 @@ Result<std::unique_ptr<Encoder>> Encoder::create(std::shared_ptr<gpu::ShaderLibr
     SJXL_ASSIGN(enc->jpegDecodeScan_, gpu::ComputeKernel::create(lib, "sjxl/enc/jpeg", "jpegDecodeScan"));
     SJXL_ASSIGN(enc->jpegToCoeffs_, gpu::ComputeKernel::create(lib, "sjxl/enc/jpeg", "jpegToCoeffs"));
     SJXL_ASSIGN(enc->jpegBlockCtx_, gpu::ComputeKernel::create(lib, "sjxl/enc/jpeg", "jpegBlockCtx"));
+    SJXL_ASSIGN(enc->changeBounds_, gpu::ComputeKernel::create(lib, "sjxl/enc/crop", "changeBounds"));
+    SJXL_ASSIGN(enc->cropBytes_, gpu::ComputeKernel::create(lib, "sjxl/enc/crop", "cropBytes"));
     SJXL_ASSIGN(enc->rleHistograms_, gpu::ComputeKernel::create(lib, "sjxl/enc/lz77", "rleHistograms"));
     SJXL_ASSIGN(enc->uintConfigHist_, gpu::ComputeKernel::create(lib, "sjxl/enc/lz77", "uintConfigHist"));
     SJXL_ASSIGN(enc->uintConfigChoose_, gpu::ComputeKernel::create(lib, "sjxl/enc/lz77", "uintConfigChoose"));
@@ -281,14 +283,108 @@ Result<std::vector<uint8_t>> Encoder::encodeAnimation(const std::vector<image::R
         codestream::writeCodestreamHeaders(head, first.width, first.height, first.gamma, first.bitDepth, first.channels == 4, &animation);
     }
     std::vector<uint8_t> out = head.take();
-    for (size_t i = 0; i < frames.size(); ++i) {
+    gpu::Device& dev = *device_;
+    const uint32_t bytesPerPixel = first.channels * (first.bitDepth / 8);
+    // Which frames to emit and what rectangle each one changes: a frame identical
+    // to the one before it only lengthens that frame's duration; a frame that
+    // differs in a sub-rectangle is coded as that rectangle (a partial frame,
+    // kReplace over the canvas kept in reference slot 1 by the frame before it).
+    struct Emitted {
+        size_t   index;
+        uint32_t duration;
+        uint32_t x0, y0, w, h;   // the rectangle coded (the whole frame for the first one)
+    };
+    std::vector<Emitted> emitted;
+    emitted.push_back({0, durations[0], 0, 0, first.width, first.height});
+    std::vector<gpu::Buffer> uploads(frames.size());
+    const auto upload = [&](size_t i) -> Result<void> {
+        if (uploads[i].valid()) return ok();
+        std::vector<uint32_t> words(std::max<size_t>(1, (frames[i].pixels.size() + 3) / 4), 0);
+        std::memcpy(words.data(), frames[i].pixels.data(), frames[i].pixels.size());
+        SJXL_ASSIGN(uploads[i], gpu::Buffer::fromSpan<uint32_t>(dev, words, "enc.animFrame"));
+        return ok();
+    };
+    SJXL_TRY(upload(0));
+    for (size_t i = 1; i < frames.size(); ++i) {
+        SJXL_TRY(upload(i));
+        const size_t prev = emitted.back().index;
+        const std::array<uint32_t, 4> start{0xFFFFFFFFu, 0xFFFFFFFFu, 0u, 0u};
+        SJXL_ASSIGN(auto bounds, gpu::Buffer::fromSpan<uint32_t>(dev, start, "enc.changeBounds"));
+        gpu::CommandBatch batch(dev);
+        changeBounds_.dispatch(batch, {first.width, first.height, 1}, [&](rhi::ShaderCursor c) {
+            c["src"].setBinding(uploads[i].rhi());
+            c["other"].setBinding(uploads[prev].rhi());
+            c["bounds"].setBinding(bounds.rhi());
+            c["params"]["srcWidth"].setData(first.width);
+            c["params"]["srcHeight"].setData(first.height);
+            c["params"]["bytesPerPixel"].setData(bytesPerPixel);
+        });
+        SJXL_TRY(batch.submit(true));
+        SJXL_ASSIGN(const auto box, bounds.readAll<uint32_t>(dev));
+        if (!platform::env("SJXL_DEBUG").empty()) log::info("enc debug: frame {} vs {}: change box x {}..{} y {}..{}", i, prev, box[0], box[2], box[1], box[3]);
+        if (box[2] < box[0]) {   // nothing differs
+            emitted.back().duration += durations[i];
+            uploads[i] = gpu::Buffer{};
+            continue;
+        }
+        Emitted e{i, durations[i], 0, 0, first.width, first.height};
+        if (options.cropFrames) {
+            e.x0 = box[0];
+            e.y0 = box[1];
+            e.w = box[2] - box[0] + 1;
+            e.h = box[3] - box[1] + 1;
+        }
+        emitted.push_back(e);
+        uploads[prev] = gpu::Buffer{};
+    }
+    for (size_t j = 0; j < emitted.size(); ++j) {
+        const Emitted& e = emitted[j];
+        const image::Rgb8& image = frames[e.index];
+        const bool partial = e.w != first.width || e.h != first.height;
+        const bool nextPartial = j + 1 < emitted.size() && (emitted[j + 1].w != first.width || emitted[j + 1].h != first.height);
         codestream::FrameInfo info;
         info.animated = true;
-        info.isLast = i + 1 == frames.size();
-        info.duration = durations[i];
-        SJXL_ASSIGN(const std::vector<uint8_t> frame, encodeFrame(frames[i], options, info));
+        info.isLast = j + 1 == emitted.size();
+        info.duration = e.duration;
+        info.saveAsReference = nextPartial ? 1 : 0;
+        std::vector<uint8_t> frame;
+        if (!partial) {
+            SJXL_ASSIGN(frame, encodeFrame(image, options, info));
+        } else {
+            info.haveCrop = true;
+            info.x0 = static_cast<int32_t>(e.x0);
+            info.y0 = static_cast<int32_t>(e.y0);
+            info.cropWidth = e.w;
+            info.cropHeight = e.h;
+            info.blendSource = 1;
+            SJXL_TRY(upload(e.index));
+            const uint32_t cropWords = (e.w * e.h * bytesPerPixel + 3) / 4;
+            SJXL_ASSIGN(auto cropped, gpu::Buffer::ofType<uint32_t>(dev, cropWords, "enc.cropFrame"));
+            gpu::CommandBatch batch(dev);
+            cropBytes_.dispatch(batch, {cropWords, 1, 1}, [&](rhi::ShaderCursor c) {
+                c["src"].setBinding(uploads[e.index].rhi());
+                c["dst"].setBinding(cropped.rhi());
+                c["params"]["srcWidth"].setData(first.width);
+                c["params"]["srcHeight"].setData(first.height);
+                c["params"]["bytesPerPixel"].setData(bytesPerPixel);
+                c["params"]["x0"].setData(e.x0);
+                c["params"]["y0"].setData(e.y0);
+                c["params"]["width"].setData(e.w);
+                c["params"]["height"].setData(e.h);
+            });
+            SJXL_TRY(batch.submit(true));
+            image::Rgb8 stub;
+            stub.width = e.w;
+            stub.height = e.h;
+            stub.channels = image.channels;
+            stub.bitDepth = image.bitDepth;
+            stub.gamma = image.gamma;
+            SJXL_ASSIGN(frame, encodeFrame(stub, options, info, nullptr, &cropped));
+        }
         out.insert(out.end(), frame.begin(), frame.end());
+        uploads[e.index] = gpu::Buffer{};
     }
+    stats_.frames = static_cast<uint32_t>(emitted.size());
     return out;
 }
 
@@ -317,9 +413,9 @@ Result<std::vector<uint8_t>> Encoder::encodeJpeg(const image::JpegFile& jpeg, co
 }
 
 Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, const Options& options, const codestream::FrameInfo& info,
-                                                   const image::JpegFile* jpeg) {
+                                                   const image::JpegFile* jpeg, const gpu::Buffer* rgbDevice) {
     if (options.lossless && jpeg == nullptr) {
-        return encodeLossless(image, options, info);
+        return encodeLossless(image, options, info, rgbDevice);
     }
     if (jpeg == nullptr && (!(options.distance > 0.0f) || options.distance > 25.0f)) {
         return Error::make(ErrorCode::InvalidArgument, "distance {} is not in (0, 25]", options.distance);
@@ -395,10 +491,14 @@ Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, cons
     const uint32_t numSections = dim.numSections(numPasses);
     const bool singleSection = dim.singleSection(numPasses);
 
-    // Input, padded to whole words.
-    std::vector<uint32_t> rgbWords(std::max<size_t>(1, (image.pixels.size() + 3) / 4), 0);
-    std::memcpy(rgbWords.data(), image.pixels.data(), image.pixels.size());
-    SJXL_ASSIGN(auto rgb, gpu::Buffer::fromSpan<uint32_t>(dev, rgbWords, "enc.rgb8"));
+    // Input, padded to whole words (or already on the device: a cropped frame).
+    gpu::Buffer rgbOwned;
+    if (rgbDevice == nullptr) {
+        std::vector<uint32_t> rgbWords(std::max<size_t>(1, (image.pixels.size() + 3) / 4), 0);
+        std::memcpy(rgbWords.data(), image.pixels.data(), image.pixels.size());
+        SJXL_ASSIGN(rgbOwned, gpu::Buffer::fromSpan<uint32_t>(dev, rgbWords, "enc.rgb8"));
+    }
+    const gpu::Buffer& rgb = rgbDevice != nullptr ? *rgbDevice : rgbOwned;
 
     const uint64_t planePixels = uint64_t{dim.xsizePadded} * dim.ysizePadded;
     SJXL_ASSIGN(auto xyb, gpu::Buffer::ofType<float>(dev, 3 * planePixels, "enc.xyb"));
@@ -1481,7 +1581,8 @@ std::vector<uint32_t> acMetaTree(uint32_t& numLeaves) {
 
 }   // namespace
 
-Result<std::vector<uint8_t>> Encoder::encodeLossless(const image::Rgb8& image, const Options& options, const codestream::FrameInfo& info) {
+Result<std::vector<uint8_t>> Encoder::encodeLossless(const image::Rgb8& image, const Options& options, const codestream::FrameInfo& info,
+                                                      const gpu::Buffer* rgbDevice) {
     gpu::Device& dev = *device_;
     const uint32_t pixels = image.width * image.height;
     const uint32_t channels = image.channels;
@@ -1489,9 +1590,13 @@ Result<std::vector<uint8_t>> Encoder::encodeLossless(const image::Rgb8& image, c
     const FrameDim dim = codestream::frameDim(image.width, image.height, groupSizeShift);
     const uint32_t numGroups = dim.numGroups();
     const bool grouped = !(image.width <= dim.groupDim && image.height <= dim.groupDim);
-    std::vector<uint32_t> rgbWords((image.pixels.size() + 3) / 4, 0);
-    std::memcpy(rgbWords.data(), image.pixels.data(), image.pixels.size());
-    SJXL_ASSIGN(auto rgb, gpu::Buffer::fromSpan<uint32_t>(dev, rgbWords, "enc.rgb8"));
+    gpu::Buffer rgbOwned;
+    if (rgbDevice == nullptr) {
+        std::vector<uint32_t> rgbWords(std::max<size_t>(1, (image.pixels.size() + 3) / 4), 0);
+        std::memcpy(rgbWords.data(), image.pixels.data(), image.pixels.size());
+        SJXL_ASSIGN(rgbOwned, gpu::Buffer::fromSpan<uint32_t>(dev, rgbWords, "enc.rgb8"));
+    }
+    const gpu::Buffer& rgb = rgbDevice != nullptr ? *rgbDevice : rgbOwned;
     // The raw channels as flat int planes, then (libjxl's hare tier, try_palettes) a
     // palette over every channel when the image has few enough colours, else a
     // compaction palette per channel that uses few of its values; the final planes

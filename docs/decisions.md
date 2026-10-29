@@ -1350,3 +1350,46 @@ Not done: cjxl's custom coefficient order (`used_orders` 1), a jbrd box to
 reconstruct the JPEG byte-exact, progressive and arithmetic JPEGs, Huffman
 decoding in parallel without restart markers (one thread per scan: 80 ms for
 a 320-pixel JPEG, mostly fixed cost).
+
+## Partial frames in animations (2026-10-29)
+
+`encodeAnimation` no longer writes every frame as a full canvas. Two kernels
+in `enc/crop.slang` decide and prepare what a frame codes:
+
+- **changeBounds**, one thread per pixel of two uploaded frames, grows the
+  bounding box of the pixels whose bytes differ (`InterlockedMin`/`Max` on four
+  counters, read back as the frame's rectangle). An empty box means the frame
+  repeats the previous one: it is not coded and its duration is added to that
+  frame's (durations are ticks, so this is bookkeeping).
+- **cropBytes** lays the rectangle's bytes out as the uploaded image of a
+  frame of that size; `encodeFrame` / `encodeLossless` take the bytes already
+  on the device (`rgbDevice`) and run the usual pipeline, lossy or lossless,
+  on a frame of the rectangle's size.
+
+The headers follow libjxl's APNG importer: a partial frame has
+`custom_size_or_origin` with x0, y0 (PackSigned) and its size, BlendingInfo
+kReplace with `source` 1 for the colour channels and every extra channel, and
+the frame before it carries `save_as_reference 1` (a displayed frame is only
+kept when it names a slot) and, being a full kReplace frame,
+`save_before_color_transform false`. A partial frame that is itself referenced
+writes no save_before_color_transform (it must keep the composited canvas).
+`Options::cropFrames` (CLI `--full-frames` turns it off) and `Stats::frames`
+(frames coded) expose it.
+
+Measured (`[partial]` test, four 200×112 frames: the image, a 50×40 rectangle
+inverted, the same frame again, another 30×20 rectangle inverted):
+
+| | partial frames | full frames |
+|---|---|---|
+| lossless | 32297 B, 3 frames coded, bit-exact | 84094 B |
+| lossy d=1 | 6678 B | 16687 B |
+
+djxl decodes the files, our decoder returns three frames with durations
+1, 2, 1 and the composited canvases match the sources (lossless) or score the
+full-frame PSNR (lossy).
+
+Not done: a frame that is cheaper as a blend (kBlend/kAdd) over the canvas, or
+as patches of an earlier frame (cjxl's patch dictionary); several disjoint
+changed regions are one bounding box; the rectangle is not aligned to the
+8-pixel block grid of the frame before it (harmless for correctness, a few
+bits of block-boundary mismatch for lossy frames).

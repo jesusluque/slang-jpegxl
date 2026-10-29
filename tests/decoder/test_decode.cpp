@@ -792,3 +792,59 @@ TEST_CASE("JPEG transcodes decode like the JPEG and djxl reads them", "[encoder]
     CHECK(vsDjxl->maxAbsDiff <= 1);
     CHECK(vsJpeg->psnr >= 40.0);   // two IDCTs and chroma upsamplings; the coefficients are the JPEG's
 }
+
+TEST_CASE("the encoder's partial animation frames compose like full ones", "[encoder][decoder][conformance][animation][partial]") {
+    const std::filesystem::path djxl = test::findTool("djxl");
+    if (djxl.empty()) SKIP("djxl is not installed");
+    const bool lossless = GENERATE(false, true);
+    CAPTURE(lossless);
+    auto base = image::readRgb8(test::testData("berlin_200.png"));
+    REQUIRE(base);
+    // Four frames: the image; a 50x40 rectangle inverted; the same again (merges into the
+    // previous frame's duration); another 30x20 rectangle inverted near the bottom left (the image is 200x112).
+    const auto invert = [](image::Rgb8& f, uint32_t x0, uint32_t y0, uint32_t w, uint32_t h) {
+        for (uint32_t y = y0; y < y0 + h; ++y)
+            for (uint32_t x = x0; x < x0 + w; ++x)
+                for (uint32_t c = 0; c < 3; ++c) f.pixels[(y * f.width + x) * 3 + c] = static_cast<uint8_t>(255 - f.pixels[(y * f.width + x) * 3 + c]);
+    };
+    std::vector<image::Rgb8> frames{*base, *base, *base, *base};
+    invert(frames[1], 120, 30, 50, 40);
+    frames[2] = frames[1];
+    frames[3] = frames[1];
+    invert(frames[3], 10, 80, 30, 20);
+    const std::vector<uint32_t> durations{1, 1, 1, 1};
+    enc::Options options;
+    options.lossless = lossless;
+    options.distance = 1.0f;
+    auto encoded = encoder().encodeAnimation(frames, durations, 10, 0, options);
+    REQUIRE(encoded);
+    CHECK(encoder().stats().frames == 3);
+    options.cropFrames = false;
+    auto full = encoder().encodeAnimation(frames, durations, 10, 0, options);
+    REQUIRE(full);
+    WARN(std::format("partial animation lossless {}: {} bytes with partial frames, {} with full frames", lossless, encoded->size(), full->size()));
+    CHECK(encoded->size() * 2 < full->size());
+    const std::filesystem::path jxl = test::scratchDir() / std::format("enc_partial_{}.jxl", lossless);
+    const std::filesystem::path out = test::scratchDir() / std::format("enc_partial_{}.djxl.png", lossless);
+    REQUIRE(image::writeFile(jxl, *encoded));
+    REQUIRE(test::run(std::format("\"{}\" \"{}\" \"{}\" >/dev/null 2>&1", djxl.string(), jxl.string(), out.string())));
+    auto ours = decoder().decodeAll(*encoded);
+    REQUIRE(ours);
+    REQUIRE(ours->size() == 3);
+    const std::array<size_t, 3> source{0, 1, 3};
+    const std::array<uint32_t, 3> expectedDurations{1, 2, 1};
+    for (size_t i = 0; i < 3; ++i) {
+        CHECK((*ours)[i].duration == expectedDurations[i]);
+        auto metrics = test::compare(frames[source[i]], (*ours)[i].image);
+        REQUIRE(metrics);
+        WARN(std::format("partial animation lossless {} frame {}: PSNR {:.2f} dB, max diff {}", lossless, i, metrics->psnr, metrics->maxAbsDiff));
+        if (lossless) CHECK(metrics->maxAbsDiff == 0);
+        else CHECK(metrics->psnr >= 30.0);
+    }
+    // djxl writes the animation as an APNG; stb reads its first frame.
+    auto theirs = image::readRgb8(out);
+    REQUIRE(theirs);
+    auto metrics = test::compare((*ours)[0].image, *theirs);
+    REQUIRE(metrics);
+    CHECK(metrics->maxAbsDiff <= 1);
+}

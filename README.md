@@ -20,8 +20,8 @@ Gaborish + EPF, the weighted predictor and fixed trees for the DC, and ANS
 with clustered contexts throughout: at the file size `cjxl -e 5` produces it
 scores slightly above it on 4K photos (+0.1 to +0.6 SSIMULACRA2) and within
 a point or two on 200-pixel images; alpha (coded losslessly as an extra
-channel) and 16-bit input are accepted, `sjxl animate` writes an animation of
-full frames, lossy or lossless, `--progressive`/`--qprogressive` split the AC
+channel) and 16-bit input are accepted, `sjxl animate` writes an animation
+(lossy or lossless) whose frames code only the rectangle that changed, `--progressive`/`--qprogressive` split the AC
 coefficients over frequency or precision passes and `--progressive-dc` puts a
 1/8-size DC frame first. `--lossless` writes a Modular frame
 (palettes or per-group RCTs, a learned MA tree over the weighted and gradient

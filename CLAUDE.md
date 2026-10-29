@@ -20,7 +20,7 @@ build/macos-arm64-debug/bin/sjxl info [in.jxl]              # device info, or a 
 build/macos-arm64-debug/bin/sjxl encode in.png out.jxl --distance 1.0 [--no-aq] [--no-cfl] [--no-filters] [--no-acs] [--lambda x] [--clusters n] [--progressive | --qprogressive] [--progressive-dc] [--fixed-tree]
 build/macos-arm64-debug/bin/sjxl encode in.png out.jxl --lossless   # Modular frame, bit-exact; RGB/RGBA, 8/16-bit
 build/macos-arm64-debug/bin/sjxl encode in.jpg out.jxl              # JPEG recompression: Huffman decode + transcode on the GPU
-build/macos-arm64-debug/bin/sjxl animate out.jxl --fps 10 [--loops n] [--lossless] [-d d] f1.png f2.png ...   # animation, one tick per frame
+build/macos-arm64-debug/bin/sjxl animate out.jxl --fps 10 [--loops n] [--lossless] [--full-frames] [-d d] f1.png f2.png ...   # animation, one tick per frame; changed rectangles only
 build/macos-arm64-debug/bin/sjxl decode in.jxl out.png                  # every stage on the GPU; animations write out_000.png, ...
 build/macos-arm64-debug/bin/sjxl compare a.png b.png                    # PSNR + largest diff, on the GPU
 build/macos-arm64-debug/bin/sjxl pixel a.png x y ; sjxl convert in.png out.png   # one pixel; re-save as RGB8
@@ -167,9 +167,12 @@ the TOC one AC section per (pass, group); `SJXL_PASSES` overrides the list.
 from `dcFramePlanes`, its DcGlobal carrying the frame's DC steps as dc_quant,
 through `encodeModularFrame`) and the VarDCT frame with kUseDcFrame and no DC
 stream; cjxl's `-p` is `--progressive --progressive-dc`.
-`Encoder::encodeAnimation` writes the animation metadata and one frame per
-image through the same `encodeFrame` (full canvas, kReplace, duration in
-ticks, `is_last` on the final frame).
+`Encoder::encodeAnimation` writes the animation metadata and then the frames
+through the same `encodeFrame`: the first a full canvas, every other one the
+bounding box of what changed (`enc/crop.slang changeBounds` + `cropBytes`, a
+partial kReplace frame with `source` 1 over the canvas the previous frame saved
+in slot 1); an unchanged frame extends the previous duration. `--full-frames`
+(`Options::cropFrames = false`) codes full canvases.
 A JPEG input (`image::readJpeg`, markers only) is transcoded (`encodeJpeg`):
 `enc/jpeg.slang` decodes the Huffman scans one thread per restart interval,
 moves the blocks to libjxl's layout on the padded frame grid and builds

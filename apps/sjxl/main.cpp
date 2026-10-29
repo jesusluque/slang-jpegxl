@@ -30,7 +30,7 @@ int usage() {
                  "                                              [--fixed-tree]  lossless: libjxl's fixed trees instead of a learned MA tree\n"
                  "                                              a .jpg input is recompressed losslessly (its DCT coefficients kept); --pixels encodes its pixels instead\n"
                  "                                              lossy VarDCT (default distance 1.0)\n"
-                 "  sjxl animate out.jxl [--fps n] [--loops n] [--lossless] [-d d] frame1.png frame2.png ...\n"
+                 "  sjxl animate out.jxl [--fps n] [--loops n] [--lossless] [--full-frames] [-d d] frame1.png frame2.png ...\n"
                  "  sjxl decode in.jxl out.png                  any frame type; animations write out_000.png, out_001.png, ...\n"
                  "  sjxl compare a.png b.png                    PSNR and largest difference, measured on the GPU\n"
                  "  sjxl pixel a.png x y                        one pixel's RGB\n"
@@ -194,6 +194,7 @@ int animate(int argc, char** argv) {
         if (arg == "--fps" && i + 1 < argc) fps = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 10));
         else if (arg == "--loops" && i + 1 < argc) loops = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 10));
         else if (arg == "--lossless") options.lossless = true;
+        else if (arg == "--full-frames") options.cropFrames = false;
         else if ((arg == "--distance" || arg == "-d") && i + 1 < argc) options.distance = std::strtof(argv[++i], nullptr);
         else inputs.emplace_back(arg);
     }
@@ -213,7 +214,7 @@ int animate(int argc, char** argv) {
     auto bytes = (*encoder)->encodeAnimation(frames, durations, fps, loops, options);
     if (!bytes) return fail(bytes.error());
     if (auto written = sjxl::image::writeFile(argv[2], *bytes); !written) return fail(written.error());
-    std::printf("%zu frames %ux%u at %u fps -> %zu bytes\n", frames.size(), frames[0].width, frames[0].height, fps, bytes->size());
+    std::printf("%zu frames (%u coded) %ux%u at %u fps -> %zu bytes\n", frames.size(), (*encoder)->stats().frames, frames[0].width, frames[0].height, fps, bytes->size());
     return 0;
 }
 
