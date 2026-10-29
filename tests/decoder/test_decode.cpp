@@ -237,7 +237,7 @@ TEST_CASE("the decoder matches djxl on cjxl's progressive output", "[decoder][co
                                       std::string("sveti_stefan_320.png"));
     // -p: passes with a DC frame (VarDCT), a permuted TOC (modular).
     const std::string options = GENERATE(std::string("-p -d 1 -e 5"), std::string("-p -d 1 -e 7"), std::string("-p -d 0 -e 7"),
-                                         std::string("-p -m 1 -d 1 -e 7"));
+                                         std::string("-p -m 1 -d 1 -e 7"), std::string("-d 1 -e 7 --progressive_dc=2"));
     CAPTURE(name, options);
     std::string tag = options;
     for (char& ch : tag) if (ch == ' ' || ch == '-') ch = '_';
@@ -535,4 +535,36 @@ TEST_CASE("the decoder matches djxl on animations", "[decoder][conformance][cjxl
         const bool exact = options.find("-d 0") != std::string::npos && (layout == "full" || i == 0);
         CHECK(metrics->maxAbsDiff <= (exact ? 0u : 1u));
     }
+}
+
+TEST_CASE("the decoder matches djxl across modular group sizes", "[decoder][conformance][cjxl][groups]") {
+    const std::filesystem::path djxl = test::findTool("djxl");
+    const std::filesystem::path cjxl = test::findTool("cjxl");
+    if (djxl.empty() || cjxl.empty()) SKIP("cjxl/djxl are not installed");
+    const std::string name = GENERATE(std::string("berlin_200.png"), std::string("sveti_stefan_320.png"));
+    // -g 0: 128 px groups, where cjxl chooses an RCT per group (group-local transforms).
+    const std::string options = GENERATE(std::string("-d 0 -e 7 -g 0"), std::string("-d 0 -e 9 -g 0"), std::string("-m 1 -d 1 -e 7 -g 0"),
+                                         std::string("-d 0 -e 7 -g 3"));
+    CAPTURE(name, options);
+    std::string tag = options;
+    for (char& ch : tag) if (ch == ' ' || ch == '-' || ch == '=') ch = '_';
+    const std::filesystem::path jxl = test::scratchDir() / std::format("dec_groups_{}{}.jxl", name, tag);
+    const std::filesystem::path png = test::scratchDir() / std::format("dec_groups_{}{}.djxl.png", name, tag);
+    REQUIRE(test::run(std::format("\"{}\" \"{}\" \"{}\" {} >/dev/null 2>&1", cjxl.string(), test::testData(name).string(), jxl.string(), options)));
+    REQUIRE(test::run(std::format("\"{}\" \"{}\" \"{}\" >/dev/null 2>&1", djxl.string(), jxl.string(), png.string())));
+    auto bytes = image::readFile(jxl);
+    REQUIRE(bytes);
+    auto reference = image::readRgb8(png);
+    REQUIRE(reference);
+    auto ours = decoder().decode(*bytes);
+    if (!ours && ours.error().code() == ErrorCode::Unsupported) {
+        WARN(std::format("groups {} {}: unsupported: {}", name, options, ours.error().message()));
+        SUCCEED();
+        return;
+    }
+    REQUIRE(ours);
+    auto metrics = test::compare(*reference, *ours);
+    REQUIRE(metrics);
+    WARN(std::format("groups {} {}: vs djxl PSNR {:.2f} dB, max diff {}", name, options, metrics->psnr, metrics->maxAbsDiff));
+    CHECK(metrics->maxAbsDiff <= (options.find("-d 0") != std::string::npos ? 0u : 1u));
 }

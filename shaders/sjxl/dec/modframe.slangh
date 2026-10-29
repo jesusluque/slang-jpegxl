@@ -100,13 +100,40 @@ void decodeModularGroup(inout Dec d, uint x0, uint y0, uint w, uint h, int minSh
         ++numLocal;
     }
     if (numLocal == 0) return;   // nothing to read: the section is empty
+    // Keep the views: a group with its own transforms (cjxl picks an RCT per group with
+    // small groups) decodes into local storage, undoes them, and is copied into the image.
+    const uint viewsOff = alloc(d, numLocal * kChanWords);
+    if (d.error != kErrNone) return;
+    for (uint i = 0; i < numLocal; ++i) storeChannel(viewsOff, i, loadChannel(localOff, i));
     uint n = numLocal;
     const StreamHeader gh = readStreamHeader(d, localOff, n);
     if (d.error != kErrNone) return;
-    // Group-local transforms would need their own storage; libjxl's encoder never
-    // emits them, so they are reported rather than decoded.
-    if (gh.numTransforms != 0) { fail(d, kErrUnsupported); return; }
+    if (gh.numTransforms == 0) {
+        decodeStreamChannels(d, gh, localOff, n, streamId, globalTree(), windowOff, 0xFFFFFFFFu);
+        return;
+    }
+    // MetaApply may have inserted meta channels (local already) and dropped some views:
+    // every remaining view becomes a local channel of the same shape.
+    for (uint i = 0; i < n; ++i) {
+        Channel c = loadChannel(localOff, i);
+        if (c.stride == c.w) continue;   // local (palette) channel
+        bool isView = false;
+        for (uint v = 0; v < numLocal && !isView; ++v) isView = loadChannel(viewsOff, v).data == c.data;
+        if (!isView) continue;
+        storeChannel(localOff, i, newChannel(d, c.w, c.h, c.hshift, c.vshift));
+        if (d.error != kErrNone) return;
+    }
     decodeStreamChannels(d, gh, localOff, n, streamId, globalTree(), windowOff, 0xFFFFFFFFu);
+    if (d.error != kErrNone) return;
+    undoTransforms(d, gh, localOff, n, arena[kGsModBitDepth]);
+    if (d.error != kErrNone) return;
+    if (n != numLocal) { fail(d, kErrCorrupt); return; }
+    for (uint i = 0; i < numLocal; ++i) {   // CopyImageTo
+        const Channel src = loadChannel(localOff, i);
+        const Channel dst = loadChannel(viewsOff, i);
+        if (src.w != dst.w || src.h != dst.h) { fail(d, kErrCorrupt); return; }
+        for (uint y = 0; y < dst.h; ++y) for (uint x = 0; x < dst.w; ++x) setPx(dst, x, y, px(src, x, y));
+    }
 }
 
 /// FinalizeDecoding: the inverse transforms over the full image.

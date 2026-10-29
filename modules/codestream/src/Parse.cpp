@@ -522,7 +522,6 @@ Result<void> parseFramesFrom(Parsed& p, size_t startByte) {
             if (f.colorTransform == 1) return unsupported("VarDCT frames in RGB without a colour transform");
             if (f.colorTransform == 2 && (f.loopFilter.gab || f.loopFilter.epfIters != 0)) return unsupported("loop filters on YCbCr frames");
             if (referenceOnly) return unsupported("VarDCT reference-only frames");
-            if (dcFrame) return unsupported("VarDCT DC frames");
         }
         if (f.frameType == 3) return unsupported("skip-progressive frames");
         if (f.flags & FrameHeader::kSplines) return unsupported("splines");

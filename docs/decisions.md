@@ -254,12 +254,17 @@ image and a 768 px gradient with `-g 0`, `-g 2` and `-g 3` (128, 512 and
 "[modular]"`). Lossy modular (`cjxl -m 1 -d 1`, efforts 3 and 7) is within
 1 LSB (≈54 dB).
 
-Not done: YCbCr modular frames, extra channels, floating point and >8-bit
-output (16-bit samples decode but the output is 8-bit), group-local
-transforms, patches (the reference-frame plumbing: parsing a second frame
-and keeping the first), the per-pixel finalise (RCT, palette and Squeeze run
-in one thread; fine at these sizes, kernels later: Squeeze is one thread
-per row or column).
+Group-local transforms (2026-10-29): with 128 px groups cjxl picks an RCT
+per group. A group whose GroupHeader declares transforms decodes into local
+channels of the views' shapes (meta channels MetaApply inserted are local
+already), undoes the transforms there and copies the result into the image
+(libjxl's DecodeGroup + CopyImageTo); groups without transforms keep writing
+through the views. `[groups]` test: `-g 0` lossless at efforts 7 and 9
+bit-exact, lossy modular within 1.
+
+Not done: YCbCr modular frames, floating point output, the per-pixel finalise
+(RCT, palette and Squeeze run in one thread; fine at these sizes, kernels
+later: Squeeze is one thread per row or column).
 
 ## Patches and multiple frames (2026-10-29)
 
@@ -327,8 +332,10 @@ a permuted TOC. Three pieces:
   logical section table (`permuted_offsets[j] = offsets[permutation[j]]`) and
   parses the frames that follow. `Decoder::parseAll` does the loop; `sjxl
   info` uses it.
-- **DC frames**: a DC frame of level L is a Modular XYB frame of size
-  ⌈size / 8^L⌉, decoded like any frame and kept as planes in `dcFrames[L]`.
+- **DC frames**: a DC frame of level L is a frame of size ⌈size / 8^L⌉
+  (Modular, or VarDCT itself taking its DC from level L+1 with
+  `--progressive_dc=2`), decoded like any frame and kept as planes in
+  `dcFrames[L]`.
   The frame below it (kUseDcFrame) reads no VarDCT DC in its DC groups (not
   even extra_precision), skips AdaptiveDCSmoothing (FinalizeDC), and takes
   its DC image from the planes (`dc_finalize.slang dcFromFrame`); its DC
