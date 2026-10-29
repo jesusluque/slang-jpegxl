@@ -220,20 +220,32 @@ int animate(int argc, char** argv) {
 
 int decode(int argc, char** argv) {
     if (argc < 4) return usage();
+    const bool phases = std::getenv("SJXL_TIMING") != nullptr;   // the process's phases around the decode
+    auto t0 = std::chrono::steady_clock::now();
+    const auto phase = [&](const char* what) {
+        if (!phases) return;
+        const auto now = std::chrono::steady_clock::now();
+        sjxl::log::info("timing process: {:<16} {:7.1f} ms", what, std::chrono::duration<double, std::milli>(now - t0).count());
+        t0 = now;
+    };
     auto bytes = sjxl::image::readFile(argv[2]);
     if (!bytes) return fail(bytes.error());
     auto device = sjxl::gpu::Device::create();
     if (!device) return fail(device.error());
+    phase("device");
     auto library = std::make_shared<sjxl::gpu::ShaderLibrary>(*device);
     auto decoder = sjxl::dec::Decoder::create(library);
     if (!decoder) return fail(decoder.error());
+    phase("decoder create");
     const auto start = std::chrono::steady_clock::now();
     auto frames = (*decoder)->decodeAll(*bytes);
     if (!frames) return fail(frames.error());
     const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    phase("decode");
     const auto& first = frames->front().image;
     if (frames->size() == 1) {
         if (auto written = sjxl::image::writePng(argv[3], first); !written) return fail(written.error());
+        phase("png write");
     } else {
         // An animation: one PNG per displayed frame, out.png -> out_000.png, out_001.png, ...
         const std::filesystem::path out(argv[3]);

@@ -38,18 +38,21 @@ public:
     /// Queues exactly `groups` thread groups.
     void dispatchGroups(CommandBatch& batch, std::array<uint32_t, 3> groups, const Bind& bind) const;
 
-    [[nodiscard]] const std::array<uint32_t, 3>& threadGroup() const noexcept { return program_->threadGroup; }
+    /// The thread group size from reflection (loads the program if it is not yet).
+    [[nodiscard]] const std::array<uint32_t, 3>& threadGroup() const;
     [[nodiscard]] const std::string& name() const noexcept { return name_; }
-    [[nodiscard]] bool valid() const noexcept { return program_ != nullptr; }
+    [[nodiscard]] bool valid() const noexcept { return library_ != nullptr; }
 
-    /// Builds the pipeline now (the first dispatch does it otherwise): the backend
-    /// compile of a big kernel takes seconds, so it is paid only by kernels used.
+    /// Loads the program and builds the pipeline now (the first dispatch does it
+    /// otherwise): loading a module and compiling a big kernel's backend code take
+    /// from milliseconds to seconds, so they are paid only by the kernels a run uses.
     [[nodiscard]] Result<void> prepare() const;
 
 private:
-    std::string                                name_;
-    std::shared_ptr<const Program>             program_;
-    rhi::IDevice*                              device_ = nullptr;
+    std::string                                name_, module_, entry_;
+    std::vector<LinkConstant>                  constants_;
+    ShaderLibrary*                             library_ = nullptr;
+    mutable std::shared_ptr<const Program>     program_;
     mutable rhi::ComPtr<rhi::IComputePipeline> pipeline_;
     mutable bool                               failed_ = false;
 };

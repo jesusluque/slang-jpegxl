@@ -1785,3 +1785,27 @@ without a second kernel for the global stream), 92 s more for the first
 single-section image. The disk cache (`SJXL_SHADER_CACHE`) makes every later
 run start in under a second. `SJXL_DEBUG=1` still lists the pipelines over
 500 ms.
+
+## Release timings and what a run spends outside the codec (2026-10-29)
+
+Every number above came from the Debug preset, which leaves the CPU chains
+unoptimised. With `macos-arm64-release` (RelWithDebInfo), 1920x1080 on the
+M5 Pro, the pipeline timers (`SJXL_TIMING=1`) read: lossy encode 150 ms, lossy
+decode 77 ms, lossless encode 168 ms, lossless decode 100 ms; the files and
+pixels are identical to the Debug build's. cjxl -e 5 / djxl take 82-102 ms
+end to end on the same image.
+
+End to end the `sjxl` process took 570-620 ms, so the CLI now reports its
+phases under `SJXL_TIMING` as well: device creation 65 ms (the Slang session
+above all), decoder creation 220 ms, the decode, the PNG write 150 ms. Two
+changes: `ComputeKernel::create` no longer loads anything (the program and
+the pipeline are built at first dispatch, `ComputeKernel::prepare`), which
+makes decoder and encoder creation free and loads only the kernels a run
+dispatches, about 7 ms each from the disk cache (Metal's pipeline creation
+from cached code; 20 kernels for a lossy decode); and stb's PNG writer no
+longer tries five filters per row with a deep hash search (filter Sub, level
+2: 150 → 135 ms, a few percent larger files). The wall clock is 450-500 ms
+for the four paths; the remaining fixed costs are the device (65 ms), the
+pipelines a run uses (about 140 ms) and the PNG I/O (135 ms write, 40 ms
+read), none of them the codec. The build preset for measurements is the
+release one from here on.

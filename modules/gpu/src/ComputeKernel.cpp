@@ -11,24 +11,36 @@ namespace sjxl::gpu {
 
 Result<ComputeKernel> ComputeKernel::create(ShaderLibrary& library, const std::string& module, const std::string& entry,
                                             const std::vector<LinkConstant>& constants) {
-    auto program = library.load(module, {entry}, constants);
-    if (!program) {
-        return std::move(program).error();
-    }
     ComputeKernel kernel;
     kernel.name_ = module + ":" + entry;
-    kernel.program_ = *program;
-    kernel.device_ = library.device().rhi();
+    kernel.module_ = module;
+    kernel.entry_ = entry;
+    kernel.constants_ = constants;
+    kernel.library_ = &library;
     return kernel;
+}
+
+const std::array<uint32_t, 3>& ComputeKernel::threadGroup() const {
+    static const std::array<uint32_t, 3> kOne{1, 1, 1};
+    if (program_ == nullptr && !prepare()) return kOne;
+    return program_->threadGroup;
 }
 
 Result<void> ComputeKernel::prepare() const {
     if (pipeline_ != nullptr) return ok();
-    if (failed_ || program_ == nullptr) return Error::make(ErrorCode::ShaderFailure, "cannot make a pipeline for {}", name_);
+    if (failed_ || library_ == nullptr) return Error::make(ErrorCode::ShaderFailure, "cannot make a pipeline for {}", name_);
+    if (program_ == nullptr) {
+        auto program = library_->load(module_, {entry_}, constants_);
+        if (!program) {
+            failed_ = true;
+            return std::move(program).error();
+        }
+        program_ = *program;
+    }
     rhi::ComputePipelineDesc desc;
     desc.program = program_->program.get();
     const auto t0 = std::chrono::steady_clock::now();
-    if (SLANG_FAILED(device_->createComputePipeline(desc, pipeline_.writeRef()))) {
+    if (SLANG_FAILED(library_->device().rhi()->createComputePipeline(desc, pipeline_.writeRef()))) {
         failed_ = true;
         return Error::make(ErrorCode::ShaderFailure, "cannot make a pipeline for {}", name_);
     }
@@ -41,7 +53,7 @@ Result<void> ComputeKernel::prepare() const {
 }
 
 void ComputeKernel::dispatch(CommandBatch& batch, std::array<uint32_t, 3> threads, const Bind& bind) const {
-    const auto& group = program_->threadGroup;
+    const auto& group = threadGroup();
     dispatchGroups(batch, {groupsFor(threads[0], group[0]), groupsFor(threads[1], group[1]), groupsFor(threads[2], group[2])},
                    bind);
 }

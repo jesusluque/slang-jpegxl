@@ -183,6 +183,11 @@ Result<void> writePng(const std::filesystem::path& path, const Rgb8& image) {
         return Error(ErrorCode::InvalidArgument, "image pixel count does not match its size");
     }
     if (image.bitDepth == 16) return writePng16(path, image);
+    // stb tries five filters per row and searches its hash chains deeply by default: 150 ms
+    // for a 1080p image, more than the decode. One filter and a shallow search cost a few
+    // percent of file size and a fraction of the time.
+    stbi_write_force_png_filter = 1;
+    stbi_write_png_compression_level = 2;
     if (stbi_write_png(path.string().c_str(), static_cast<int>(image.width), static_cast<int>(image.height), static_cast<int>(image.channels),
                        image.pixels.data(), static_cast<int>(image.width * image.channels)) == 0) {
         return Error::make(ErrorCode::IoFailure, "cannot write '{}'", path.string());

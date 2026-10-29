@@ -1,6 +1,8 @@
 // Copyright (c) 2026 jesus luque.
 #include "sjxl/gpu/ShaderLibrary.h"
 
+#include <chrono>
+
 #include <functional>
 #include <string_view>
 
@@ -104,9 +106,14 @@ Result<std::shared_ptr<const Program>> ShaderLibrary::link(const std::string& ke
     if (!platform::env("SJXL_DEBUG").empty()) log::info("shaders: compiling '{}' [{}]", module, entries.empty() ? std::string() : entries.front());
     rhi::ShaderProgramDesc desc;
     desc.slangGlobalScope = program->linked.get();
+    const auto t0 = std::chrono::steady_clock::now();
     if (SLANG_FAILED(device_->rhi()->createShaderProgram(desc, program->program.writeRef(), diag.writeRef()))) {
         return Error::make(ErrorCode::ShaderFailure, "cannot compile '{}' for {}:\n{}", module,
                            toString(device_->backend()), diagnostics(diag.get()));
+    }
+    if (!platform::env("SJXL_TIMING").empty()) {
+        log::info("timing shader program {}:{}: {:.1f} ms", module, entries.empty() ? std::string() : entries.front(),
+                  std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
     }
     if (std::string warnings = diagnostics(diag.get()); !warnings.empty()) {
         log::warn("slang '{}': {}", module, warnings);
