@@ -74,15 +74,25 @@ struct CodeParams {
     uint lz77Modular;     // modular frames: the set carries run-length tokens (an extra distance context)
     uint modLogAlpha;     // modular frames: the set's log_alpha_size
     uint histogramTries;  // ANS histogram precisions tried (7: libjxl's approximate strategy); runtime so no unrolling
+    uint jpeg;            // JPEG recompression: custom DC quant, zero DC chroma-from-luma, the raw DCT table
+    uint qtRegion;        // the code region of the quant table stream
+    uint qtCount;         // samples of the raw table (192); runtime so the writer's loops are not unrolled
+    uint numQuantKinds;   // 17
+    uint qtBlobRegion;    // blob region of the quant table stream (between AcGlobal's two parts)
+    uint acPostRegion;    // blob region of AcGlobal after the dequant matrices
+    float dcQuantJpegX;   // DequantMatrices::DecodeDC values (q0 / (8 x 255)) per channel X, Y, B
+    float dcQuantJpegY;
+    float dcQuantJpegB;
     uint dcQuantCustom;   // modular frames: 1 writes dc_quant (DequantMatrices::DecodeDC) as the three F16s below
     uint useDcFrame;      // VarDCT frames: 1 leaves the DC groups' DC stream out (kUseDcFrame)
     float dcQuantX;       // the custom dc_quant per channel (X, Y, B)
     float dcQuantY;
     float dcQuantB;
+    uint numAcCtxsUsed;   // contexts of each AC set actually coded (block contexts x 495; the stride stays numAcContexts)
 };
 
 /// dc_quant as the decoder will hold it: F16 of 128 x the value, back to float.
-float dcQuantF16(float v) { return f16tof32(f32tof16(v * 128.0f)) / 128.0f; }
+float dcQuantF16(float v) { return f16tof32(f32tof16Trunc(v * 128.0f)) / 128.0f; }
 
 StructuredBuffer<uint4>    dcGroups;   // bx0, by0, w, h in blocks
 StructuredBuffer<uint>     acs;        // per block: strategy << 1 | first
@@ -96,7 +106,10 @@ StructuredBuffer<uint>     streamTokens;  // modular frames: the compact per-str
 StructuredBuffer<uint>     streamStart;   // per stream (groups, then the global one)
 StructuredBuffer<uint>     streamLen;
 StructuredBuffer<uint>     clusterCfg;    // per code region: hybrid-uint config split | msb << 8 | lsb << 16
+StructuredBuffer<int>      rawQuant;      // JPEG recompression: the DCT8 table, 3 x 64 in libjxl's layout (kQuantModeRAW)
+StructuredBuffer<uint>     qtTree;        // JPEG recompression: the quant table stream's tree (one leaf, predictor Zero)
 StructuredBuffer<uint>     clusterInfo;   // [0] number of AC clusters
+StructuredBuffer<uint>     bctxMap;       // JPEG recompression: jpegBlockCtx's BlockCtxMap ([0] DC contexts, [1] block contexts, [2..9) thresholds, [16..) the map)
 RWStructuredBuffer<uint>   ctxMapMtf;  // scratch: the context map after the move-to-front transform
 RWStructuredBuffer<uint>   ansInfo;    // ANS symbol info per code region (the context map's code is region kAcClusters)
 RWStructuredBuffer<uint>   ansReverse; // ANS reverse maps per code region
@@ -779,6 +792,55 @@ void writeExtraChannelGlobal(RWStructuredBuffer<uint> buf, inout SerialWriter w)
     if (params.ecInGlobal != 0) writeModularImageStream(buf, w, ecSet());
 }
 
+/// The raw DCT quant table of a JPEG recompression (ModularFrameEncoder::
+/// EncodeQuantTable): a modular stream of three 8x8 channels under a local
+/// one-leaf tree (predictor Zero), one histogram, then the tokens.
+void writeQuantTableStream(RWStructuredBuffer<uint> buf, inout SerialWriter w) {
+    writeLocalGroupHeader(buf, w);
+    writeTreeFromNodes(buf, w, qtTree, 1);
+    // One context: lz77 off, no context map, ANS, alphabet 7 bits, the default uint config.
+    serialWrite(buf, w, 1, 0);
+    serialWrite(buf, w, 1, 0);
+    serialWrite(buf, w, 2, 7 - 5);
+    encodeUintConfigAt(buf, w, 7, 4, 2, 0);
+    for (uint i = 0; i < kMaxAlphabet; ++i) gHist[i] = 0;
+    uint length = 1;
+    for (uint i = 0; i < params.qtCount; ++i) {
+        uint tok, nbits, raw;
+        hybridEncode(packSigned(rawQuant[i]), tok, nbits, raw);
+        ++gHist[tok];
+        length = max(length, tok + 1);
+    }
+    for (uint i = 0; i < kMaxAlphabet; ++i) gAnsCounts[i] = gHist[i];
+    ansWriteBestHistogram(buf, w, length, params.histogramTries);
+    ansBuildTables(ansInfo, ansReverse, params.qtRegion, length, 7);
+    // The tokens (channel-major, raster) as one ANS stream: size, then placement from the end.
+    uint total = 32;
+    for (uint pass = 1; pass <= 2; ++pass) {
+        uint state = kAnsSignature << 16;
+        uint pos = w.pos + total;
+        for (int i = int(params.qtCount) - 1; i >= 0; --i) {
+            uint tok, nbits, raw;
+            hybridEncode(packSigned(rawQuant[uint(i)]), tok, nbits, raw);
+            const uint e = ansInfo[params.qtRegion * kAnsInfoStride + tok];
+            if (pass == 2) {
+                pos -= nbits;
+                serialWriteAt(buf, w.base, pos, nbits, raw);
+            }
+            uint ansBits, ansN;
+            ansPut(state, e & 0xFFFFu, e >> 16, ansReverse, params.qtRegion * kAnsReverseStride, ansN, ansBits);
+            if (pass == 2) {
+                pos -= ansN;
+                serialWriteAt(buf, w.base, pos, ansN, ansBits);
+            } else {
+                total += nbits + ansN;
+            }
+        }
+        if (pass == 2) serialWriteAt(buf, w.base, w.pos, 32, state);
+    }
+    w.pos += total;
+}
+
 [shader("compute")]
 [numthreads(1, 1, 1)]
 void buildGlobalBlobs(uint3 gid: SV_GroupID) {
@@ -790,13 +852,53 @@ void buildGlobalBlobs(uint3 gid: SV_GroupID) {
     SerialWriter dc;
     dc.base = 0;
     dc.pos = 0;
-    serialWrite(blobs, dc, 1, 1);
+    if (params.jpeg != 0) {
+        // DequantMatrices::DecodeDC: the JPEG DC quant steps q0 / (8 x 255) as F16 of 128 x the value.
+        serialWrite(blobs, dc, 1, 0);
+        serialWrite(blobs, dc, 16, f32tof16Trunc(params.dcQuantJpegX * 128.0f));
+        serialWrite(blobs, dc, 16, f32tof16Trunc(params.dcQuantJpegY * 128.0f));
+        serialWrite(blobs, dc, 16, f32tof16Trunc(params.dcQuantJpegB * 128.0f));
+    } else {
+        serialWrite(blobs, dc, 1, 1);   // DequantMatrices DC all_default
+    }
     serialWriteU32(blobs, dc, distrBitsOffset(11, 1), distrBitsOffset(11, 2049), distrBitsOffset(12, 4097),
                    distrBitsOffset(16, 8193), quantizer[0]);
     serialWriteU32(blobs, dc, distrVal(16), distrBitsOffset(5, 1), distrBitsOffset(8, 1), distrBitsOffset(16, 1),
                    quantizer[1]);
-    serialWrite(blobs, dc, 1, 1);   // default block context map
-    serialWrite(blobs, dc, 1, 1);   // default DC chroma-from-luma
+    if (params.jpeg != 0) {
+        // BlockCtxMap, not default: luma DC thresholds (jpegBlockCtx), no quant field
+        // thresholds, the map in the simple context-map form (at most 8 block contexts).
+        const uint numDc = bctxMap[0];
+        const uint numCtxs = bctxMap[1];
+        serialWrite(blobs, dc, 1, 0);
+        for (uint j = 0; j < 3; ++j) {
+            const uint n = j == 1 ? numDc - 1 : 0;
+            serialWrite(blobs, dc, 4, n);
+            for (uint t = 0; t < n; ++t) {
+                serialWriteU32(blobs, dc, distrBitsOffset(4, 0), distrBitsOffset(8, 16), distrBitsOffset(16, 272), distrBitsOffset(32, 65808),
+                               packSigned(int(bctxMap[2 + t])));
+            }
+        }
+        serialWrite(blobs, dc, 4, 0);   // no quant field thresholds
+        const uint entries = 3 * 13 * numDc;   // kNumOrders orders per channel
+        const uint entryBits = ceilLog2Nonzero(numCtxs);
+        serialWrite(blobs, dc, 1, 1);   // is_simple
+        serialWrite(blobs, dc, 2, entryBits);
+        for (uint i = 0; i < entries; ++i) serialWrite(blobs, dc, entryBits, bctxMap[16 + i]);
+    } else {
+        serialWrite(blobs, dc, 1, 1);   // default block context map
+    }
+    if (params.jpeg != 0) {
+        // ColorCorrelation::DecodeDC with libjxl's non-XYB defaults: colour factor 84, bases 0, no DC offsets.
+        serialWrite(blobs, dc, 1, 0);
+        serialWrite(blobs, dc, 2, 0);
+        serialWrite(blobs, dc, 16, f32tof16Trunc(0.0f));
+        serialWrite(blobs, dc, 16, f32tof16Trunc(0.0f));
+        serialWrite(blobs, dc, 8, 128);
+        serialWrite(blobs, dc, 8, 128);
+    } else {
+        serialWrite(blobs, dc, 1, 1);   // default DC chroma-from-luma
+    }
     if (params.numEcSets != 0) {
         writeExtraChannelGlobal(blobs, dc);
     } else {
@@ -809,13 +911,42 @@ void buildGlobalBlobs(uint3 gid: SV_GroupID) {
     SerialWriter ac;
     ac.base = kBlobStrideWords;
     ac.pos = 0;
-    serialWrite(blobs, ac, 1, 1);
+    if (params.jpeg != 0) {
+        // DequantMatrices::Decode: the DCT8 table raw (kQuantModeRAW: denominator 1 / (8 x 255),
+        // the table as a modular stream), every other transform's table from the library.
+        serialWrite(blobs, ac, 1, 0);
+        serialWrite(blobs, ac, 3, 7);   // kind 0 (DCT8): raw: the denominator, then the table stream (its own blob region, buildQuantTableBlob)
+        serialWrite(blobs, ac, 16, f32tof16Trunc(1.0f / (8.0f * 255.0f)));
+    } else {
+        serialWrite(blobs, ac, 1, 1);
+    }
+    blobBits[1] = ac.pos;
+    // The rest of AcGlobal in its own region (after the quant table stream when there is one).
+    SerialWriter post;
+    post.base = params.acPostRegion * kBlobStrideWords;
+    post.pos = 0;
+    if (params.jpeg != 0) {
+        for (uint kind = 1; kind < params.numQuantKinds; ++kind) serialWrite(blobs, post, 3, 0);   // library tables (runtime count: no unrolling)
+    }
+    ac = post;
     serialWrite(blobs, ac, ceilLog2Nonzero(params.numGroups), 0);
     for (uint p = 0; p < params.numAcSets; ++p) {
         serialWrite(blobs, ac, 2, 2);   // used_orders: Val(0) is the third distribution
-        writeHistogramSet(blobs, ac, kNumAcContexts, clusterInfo[p], kAcLogAlpha, p);
+        writeHistogramSet(blobs, ac, params.numAcCtxsUsed, clusterInfo[p], kAcLogAlpha, p);
     }
-    blobBits[1] = ac.pos;
+    blobBits[params.acPostRegion] = ac.pos;
+}
+
+/// The raw DCT quant table's modular stream (JPEG recompression) in its blob region.
+[shader("compute")]
+[numthreads(1, 1, 1)]
+void buildQuantTableBlob(uint3 gid: SV_GroupID) {
+    if (gid.x != 0) return;
+    SerialWriter w;
+    w.base = params.qtBlobRegion * kBlobStrideWords;
+    w.pos = 0;
+    writeQuantTableStream(blobs, w);
+    blobBits[params.qtBlobRegion] = w.pos;
 }
 
 /// DcGlobal of a lossless Modular frame: the DC dequant defaults, the global
@@ -833,9 +964,9 @@ void buildModularGlobalBlob(uint3 gid: SV_GroupID) {
         // DequantMatrices::DecodeDC: dc_quant per channel as F16 of 128 x the value
         // (a DC frame's integers scale by these into XYB).
         serialWrite(blobs, dc, 1, 0);
-        serialWrite(blobs, dc, 16, f32tof16(params.dcQuantX * 128.0f));
-        serialWrite(blobs, dc, 16, f32tof16(params.dcQuantY * 128.0f));
-        serialWrite(blobs, dc, 16, f32tof16(params.dcQuantB * 128.0f));
+        serialWrite(blobs, dc, 16, f32tof16Trunc(params.dcQuantX * 128.0f));
+        serialWrite(blobs, dc, 16, f32tof16Trunc(params.dcQuantY * 128.0f));
+        serialWrite(blobs, dc, 16, f32tof16Trunc(params.dcQuantB * 128.0f));
     } else {
         serialWrite(blobs, dc, 1, 1);    // DequantMatrices DC all_default
     }

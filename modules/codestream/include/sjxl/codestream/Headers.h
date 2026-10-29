@@ -75,6 +75,13 @@ struct FrameParams {
     /// kUseDcFrame: the DC comes from the DC frame before this one (dc_level 1);
     /// the DC groups carry no DC stream and the header no upsampling fields.
     bool useDcFrame = false;
+    /// A frame of a non-XYB image (JPEG recompression): `ycbcr` is the
+    /// do_YCbCr field, `chromaMode` the YCbCrChromaSubsampling channel modes
+    /// (X, Y, B), `skipDcSmoothing` flag kSkipAdaptiveDCSmoothing.
+    bool xyb = true;
+    bool ycbcr = false;
+    std::array<uint32_t, 3> chromaMode{};
+    bool skipDcSmoothing = false;
 };
 
 /// The DC frame of a VarDCT frame: a Modular frame in XYB at 1/8 size (frame

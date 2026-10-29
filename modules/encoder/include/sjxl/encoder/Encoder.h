@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "sjxl/codestream/Headers.h"
+#include "sjxl/image/Jpeg.h"
 #include "sjxl/core/Result.h"
 #include "sjxl/gpu/Buffer.h"
 #include "sjxl/gpu/ComputeKernel.h"
@@ -82,12 +83,17 @@ public:
     /// one's size, channels and depth. `numLoops` 0 repeats forever.
     [[nodiscard]] Result<std::vector<uint8_t>> encodeAnimation(const std::vector<image::Rgb8>& frames, const std::vector<uint32_t>& durations,
                                                                uint32_t ticksPerSecond, uint32_t numLoops, const Options& options);
+    /// JPEG recompression: the JPEG's quantised DCT coefficients as a VarDCT
+    /// frame in YCbCr (or RGB) with its quantisation tables, decoded by a kernel
+    /// (baseline Huffman scans). Lossless in the coefficients, as cjxl does.
+    [[nodiscard]] Result<std::vector<uint8_t>> encodeJpeg(const image::JpegFile& jpeg, const Options& options);
     [[nodiscard]] const Stats& stats() const noexcept { return stats_; }
 
 private:
     Encoder() = default;
     /// One frame's bytes (frame header, TOC, body), byte-aligned, without the codestream header.
-    [[nodiscard]] Result<std::vector<uint8_t>> encodeFrame(const image::Rgb8& image, const Options& options, const codestream::FrameInfo& info);
+    [[nodiscard]] Result<std::vector<uint8_t>> encodeFrame(const image::Rgb8& image, const Options& options, const codestream::FrameInfo& info,
+                                                           const image::JpegFile* jpeg = nullptr);
     [[nodiscard]] Result<std::vector<uint8_t>> encodeLossless(const image::Rgb8& image, const Options& options, const codestream::FrameInfo& info);
     /// A Modular frame of `planes` (channels of width x height int32 samples,
     /// already on the device): the frame header, TOC and body. `rct` writes the
@@ -128,6 +134,7 @@ private:
     gpu::ComputeKernel                  unpackPlanes_, rctCost_, rctApply_, dcFramePlanes_, modTokenize_;
     gpu::ComputeKernel                  paletteCount_, paletteBuild_, paletteIndex_, paletteVerify_, compactStats_, compactBuild_, compactApply_;
     gpu::ComputeKernel                  rleScan_, rleHistograms_, uintConfigHist_, uintConfigChoose_;
+    gpu::ComputeKernel                  jpegDecodeScan_, jpegToCoeffs_, jpegBlockCtx_, quantTableBlob_;
     gpu::ComputeKernel                  extractAlpha_, channelEntropy_, remapTokens_, modGroupSections_, modularGlobalBlob_;
     gpu::ComputeKernel                  dcGroupBlobs_, globalBlobs_, layout_, blobEmit_;
     gpu::PrefixSum                      prefixSum_;

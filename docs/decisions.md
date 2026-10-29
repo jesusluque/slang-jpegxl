@@ -1272,3 +1272,81 @@ Measured lossless (bytes, this encoder vs `cjxl -d 0 -e 5`): sveti_stefan_320
 images: 200 colours 100×80 2243 vs 2253, 16 colours 300×200 11650 vs 10764
 (+8 %: libjxl's tree has 179 nodes there to our 133). All bit-exact in djxl
 and our decoder, 16-bit and RGBA included.
+
+## JPEG recompression in the encoder (2026-10-29)
+
+`sjxl encode in.jpg out.jxl` transcodes a baseline JPEG as cjxl does: a VarDCT
+frame in YCbCr (RGB when the JPEG says so through Adobe/JFIF ids), its
+quantised DCT coefficients copied, not requantised. The CPU (`image::readJpeg`)
+parses the markers only: SOF/DQT/DHT/DRI/SOS and the byte offsets of the
+restart intervals; it refuses progressive, arithmetic and 12-bit JPEGs with
+`Unsupported`. Everything else is `enc/jpeg.slang`:
+
+- **Huffman decoding on the GPU**: one thread per restart interval (the whole
+  scan when there is no DRI), a bit reader with 0xFF00 unstuffing that stops at
+  a marker, canonical decode by code length (limit / valoffset tables built from
+  the DHT counts on the host — bookkeeping), DC prediction and the run/size AC
+  loop into natural order. Interleaved scans walk MCUs; single-component scans
+  walk the component's unpadded block grid.
+- **jpegToCoeffs** moves each component's blocks to libjxl's layout: the frame
+  grid is padded to the subsampling multiple (`frameDim(..., maxHShift,
+  maxVShift)`), a subsampled channel keeps its block at the co-located
+  full-grid block (as the decoder expects), coefficients are transposed into
+  `[horizontal][vertical]`, DC is the JPEG's DC (plus 1024/q0 for RGB JPEGs:
+  libjxl's DCzero rule), every block is DCT8 with quant field 1 and no
+  chroma-from-luma. Channels X and B of a grey JPEG are empty (zero).
+- **Headers**: quantizer global_scale 65536 and quant_dc 1 (inverse scale 1),
+  DC dequant F16s of q0/(8·255), the DCT8 table in kQuantModeRAW (denominator
+  1/2040 and the table as a 3-channel modular stream, `buildQuantTableBlob`
+  in its own blob region between the two halves of AcGlobal), the other 16
+  kinds from the library, kSkipAdaptiveDCSmoothing as cjxl writes it on every
+  transcode, no loop filter, `x_qm`/`b_qm` absent (not XYB), chroma modes per
+  channel (`kH = {0,1,1,0}`, `kV = {0,1,0,1}`).
+- **Block context map** as cjxl's (`jpegBlockCtx`): the luma DC histogram is
+  cut into equal buckets (1..7 thresholds from the block count and the first
+  chroma table's low frequencies, capped so the map has at most 8 contexts
+  and fits the simple context-map form), Y gets one AC context per bucket, X
+  and B one per two buckets (one for both when grey). `acTokenize` takes the
+  block context from the map and the block's luma DC; the AC histogram set
+  then has `contexts × 495` entries instead of 7425 (the buffer stride stays).
+  The context count is read back as one counter for the cluster and code
+  stages.
+- **DC and AcMetadata** as any VarDCT frame (weighted predictor, fixed trees,
+  ANS), on the per-channel grids.
+
+Two defects found on the way, both general: `jpegToCoeffs` wrote the
+chroma-from-luma factors per block into buffers sized per 64-pixel tile, and
+the overrun landed in `dcQuant` (five chroma DC values of one row vanished);
+and the context clustering seeded from the context with most tokens, which for
+a grey transcode is the all-zero non-zero-count context of X and B, whose
+distance to everything is its whole count, so the farthest-first seeding
+stopped at two clusters (the AC stream was 24 % bigger). Seeds now rank a
+one-symbol context last. F16 fields are written as libjxl writes them
+(mantissa truncated, not rounded), which made the 4:2:0 transcodes
+pixel-identical to cjxl's through djxl.
+
+Measured against `cjxl -e 5` on six JPEGs (PIL and sips, qualities 75..92):
+
+| JPEG | JPEG bytes | sjxl | cjxl | djxl(sjxl) vs djxl(cjxl) |
+|---|---|---|---|---|
+| 320×180 4:4:4 | 24767 | 21211 | 21259 | cjxl uses CfL (see below) |
+| 320×180 4:2:0 | 15029 | 12952 | 13310 | identical |
+| 320×180 4:2:2 | 16523 | 14272 | 14631 | identical |
+| 200×112 4:2:0 | 4637 | 4060 | 4514 | identical |
+| 320×180 grey | 12449 | 11108 | 11330 | max diff 1 |
+| 320×213 4:2:0, DRI 20 | 26582 | 22175 | 22618 | identical |
+
+Every file is smaller than cjxl's. For 4:4:4 cjxl applies its JPEG-domain
+chroma-from-luma (an integer, exactly reversible residual); djxl's *pixel*
+decode of such a file scales the CfL term by the luma table instead of the
+chroma one and lands up to 25 LSB from the JPEG's own decode, where ours
+(no CfL, 50 dB PSNR against the JPEG) is 4 LSB off. We leave CfL off: the
+file is already smaller and decodes closer. The `[jpeg]` test makes 4:2:0
+and grey JPEGs with `sips` at two qualities, requires our file smaller than
+the JPEG, our decoder within 1 LSB of djxl and 40 dB against the JPEG's
+decode.
+
+Not done: cjxl's custom coefficient order (`used_orders` 1), a jbrd box to
+reconstruct the JPEG byte-exact, progressive and arithmetic JPEGs, Huffman
+decoding in parallel without restart markers (one thread per scan: 80 ms for
+a 320-pixel JPEG, mostly fixed cost).

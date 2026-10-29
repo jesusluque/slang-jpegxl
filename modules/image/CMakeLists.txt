@@ -2,6 +2,7 @@
 sjxl_add_module(image
     SOURCES
         src/Image.cpp
+        src/Jpeg.cpp
     PUBLIC_LIBS
         sjxl::core
     PRIVATE_LIBS

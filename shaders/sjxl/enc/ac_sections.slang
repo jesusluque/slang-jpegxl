@@ -29,7 +29,11 @@ struct AcSectionParams {
     uint height;
     uint groupDim;
     uint numPasses;     // AC sections: pass p of group g is section 2 + numDcGroups + p * numGroups + g
+    uint4 hshift;       // chroma subsampling per channel (X, Y, B)
+    uint4 vshift;
 };
+
+uint shiftOf(uint4 v, uint c) { return c == 0 ? v.x : c == 1 ? v.y : v.z; }
 
 StructuredBuffer<uint4>    groups;         // AC groups: bx0, by0, w, h (blocks)
 StructuredBuffer<uint>     acs;
@@ -102,6 +106,8 @@ void acSections(uint3 tid: SV_DispatchThreadID) {
             const Varblock vb = varblockOf(block, acs[block] >> 1, params.blocksX);
             for (int ci = 2; ci >= 0; --ci) {
                 const uint c = physicalChannel(uint(ci));
+                const uint hs = shiftOf(params.hshift, c), vs = shiftOf(params.vshift, c);
+                if (((vb.fbx >> hs) << hs) != vb.fbx || ((vb.fby >> vs) << vs) != vb.fby) continue;   // a subsampled channel codes one block per 2x2
                 const uint n = numTokens[pb + c * params.nblocks + block];
                 for (int k = int(vb.covered + n) - 1; k >= int(vb.covered); --k) {
                     const uint t = acTokens[pb * 64 + coeffSlot(vb, c, params.nblocks, params.blocksX, uint(k))];

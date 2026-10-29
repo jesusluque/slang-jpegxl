@@ -87,6 +87,26 @@ void serialWriteU32(RWStructuredBuffer<uint> buf, inout SerialWriter w, Distr d0
     }
 }
 
+/// F16Coder::Write: libjxl truncates the mantissa (no rounding), subnormals
+/// below 2^-24 become zero. The decoder's value of every F16 field is this one.
+uint f32tof16Trunc(float value) {
+    const uint bits32 = asuint(value);
+    const uint sign = bits32 >> 31;
+    const int exp = int((bits32 >> 23) & 0xFFu) - 127;
+    const uint mantissa32 = bits32 & 0x7FFFFFu;
+    if (exp < -24) return 0;
+    uint biasedExp16, mantissa16;
+    if (exp < -14) {
+        biasedExp16 = 0;
+        const uint subExp = uint(-14 - exp);
+        mantissa16 = (1u << (10 - subExp)) + (mantissa32 >> (13 + subExp));
+    } else {
+        biasedExp16 = uint(exp + 15);
+        mantissa16 = mantissa32 >> 13;
+    }
+    return (sign << 15) | (biasedExp16 << 10) | mantissa16;
+}
+
 uint ceilLog2Nonzero(uint x) {
     return x <= 1 ? 0 : firstbithigh(x - 1) + 1;
 }

@@ -13,6 +13,7 @@
 #include "sjxl/decoder/Decoder.h"
 #include "sjxl/encoder/Encoder.h"
 #include "sjxl/image/Image.h"
+#include "sjxl/image/Jpeg.h"
 
 using namespace sjxl;
 
@@ -750,4 +751,44 @@ TEST_CASE("lossless palettes decode bit-exact", "[encoder][decoder][conformance]
                      encoder().stats().palette));
     CHECK(vsDjxl->maxAbsDiff == 0);
     CHECK(vsOurs->maxAbsDiff == 0);
+}
+
+TEST_CASE("JPEG transcodes decode like the JPEG and djxl reads them", "[encoder][decoder][conformance][jpeg]") {
+    const std::filesystem::path djxl = test::findTool("djxl");
+    const std::filesystem::path sips = test::findTool("sips");   // macOS's JPEG writer: 4:2:0 baseline with restart markers, or one component
+    if (djxl.empty() || sips.empty()) SKIP("djxl or sips is not installed");
+    const int quality = GENERATE(75, 92);
+    const bool grey = GENERATE(false, true);
+    CAPTURE(quality, grey);
+    const std::filesystem::path png = test::testData(grey ? "sveti_crop_257x129.png" : "berlin_200.png");
+    const std::filesystem::path jpg = test::scratchDir() / std::format("enc_jpeg_{}_{}.jpg", quality, grey);
+    const std::string profile = grey ? " --matchTo '/System/Library/ColorSync/Profiles/Generic Gray Profile.icc'" : "";
+    REQUIRE(test::run(std::format("\"{}\" -s format jpeg -s formatOptions {}{} \"{}\" --out \"{}\" >/dev/null 2>&1", sips.string(), quality,
+                                  profile, png.string(), jpg.string())));
+    auto jpeg = image::readJpeg(jpg);
+    REQUIRE(jpeg);
+    CHECK(jpeg->components.size() == (grey ? 1u : 3u));
+    auto encoded = encoder().encodeJpeg(*jpeg, enc::Options{});
+    REQUIRE(encoded);
+    const std::filesystem::path jxl = test::scratchDir() / std::format("enc_jpeg_{}_{}.jxl", quality, grey);
+    const std::filesystem::path viaDjxl = test::scratchDir() / std::format("enc_jpeg_{}_{}.djxl.png", quality, grey);
+    const std::filesystem::path viaSips = test::scratchDir() / std::format("enc_jpeg_{}_{}.sips.png", quality, grey);
+    REQUIRE(image::writeFile(jxl, *encoded));
+    REQUIRE(test::run(std::format("\"{}\" \"{}\" \"{}\" >/dev/null 2>&1", djxl.string(), jxl.string(), viaDjxl.string())));
+    REQUIRE(test::run(std::format("\"{}\" -s format png \"{}\" --out \"{}\" >/dev/null 2>&1", sips.string(), jpg.string(), viaSips.string())));
+    auto fromDjxl = image::readRgb8(viaDjxl);
+    REQUIRE(fromDjxl);
+    auto fromSips = image::readRgb8(viaSips);
+    REQUIRE(fromSips);
+    auto ours = decoder().decode(*encoded);
+    REQUIRE(ours);
+    auto vsDjxl = test::compare(*ours, *fromDjxl);
+    REQUIRE(vsDjxl);
+    auto vsJpeg = test::compare(*ours, *fromSips);
+    REQUIRE(vsJpeg);
+    WARN(std::format("jpeg q{} grey {}: {} -> {} bytes; vs djxl max diff {}, vs the JPEG's own decode PSNR {:.2f} dB", quality, grey,
+                     std::filesystem::file_size(jpg), encoded->size(), vsDjxl->maxAbsDiff, vsJpeg->psnr));
+    CHECK(encoded->size() < std::filesystem::file_size(jpg));
+    CHECK(vsDjxl->maxAbsDiff <= 1);
+    CHECK(vsJpeg->psnr >= 40.0);   // two IDCTs and chroma upsamplings; the coefficients are the JPEG's
 }

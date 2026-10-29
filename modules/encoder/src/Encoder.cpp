@@ -162,6 +162,9 @@ Result<std::unique_ptr<Encoder>> Encoder::create(std::shared_ptr<gpu::ShaderLibr
     SJXL_ASSIGN(enc->compactBuild_, gpu::ComputeKernel::create(lib, "sjxl/enc/palette", "compactBuild"));
     SJXL_ASSIGN(enc->compactApply_, gpu::ComputeKernel::create(lib, "sjxl/enc/palette", "compactApply"));
     SJXL_ASSIGN(enc->rleScan_, gpu::ComputeKernel::create(lib, "sjxl/enc/lz77", "rleScan"));
+    SJXL_ASSIGN(enc->jpegDecodeScan_, gpu::ComputeKernel::create(lib, "sjxl/enc/jpeg", "jpegDecodeScan"));
+    SJXL_ASSIGN(enc->jpegToCoeffs_, gpu::ComputeKernel::create(lib, "sjxl/enc/jpeg", "jpegToCoeffs"));
+    SJXL_ASSIGN(enc->jpegBlockCtx_, gpu::ComputeKernel::create(lib, "sjxl/enc/jpeg", "jpegBlockCtx"));
     SJXL_ASSIGN(enc->rleHistograms_, gpu::ComputeKernel::create(lib, "sjxl/enc/lz77", "rleHistograms"));
     SJXL_ASSIGN(enc->uintConfigHist_, gpu::ComputeKernel::create(lib, "sjxl/enc/lz77", "uintConfigHist"));
     SJXL_ASSIGN(enc->uintConfigChoose_, gpu::ComputeKernel::create(lib, "sjxl/enc/lz77", "uintConfigChoose"));
@@ -183,6 +186,7 @@ Result<std::unique_ptr<Encoder>> Encoder::create(std::shared_ptr<gpu::ShaderLibr
     SJXL_ASSIGN(enc->modularGlobalBlob_, gpu::ComputeKernel::create(lib, "sjxl/enc/codes", "buildModularGlobalBlob"));
     SJXL_ASSIGN(enc->dcGroupBlobs_, gpu::ComputeKernel::create(lib, "sjxl/enc/codes", "buildDcGroupBlobs"));
     SJXL_ASSIGN(enc->globalBlobs_, gpu::ComputeKernel::create(lib, "sjxl/enc/codes", "buildGlobalBlobs"));
+    SJXL_ASSIGN(enc->quantTableBlob_, gpu::ComputeKernel::create(lib, "sjxl/enc/codes", "buildQuantTableBlob"));
     SJXL_ASSIGN(enc->layout_, gpu::ComputeKernel::create(lib, "sjxl/enc/layout", "layoutSections"));
     SJXL_ASSIGN(enc->blobEmit_, gpu::ComputeKernel::create(lib, "sjxl/enc/layout", "blobEmit"));
     SJXL_ASSIGN(enc->prefixSum_, gpu::PrefixSum::create(lib));
@@ -288,17 +292,85 @@ Result<std::vector<uint8_t>> Encoder::encodeAnimation(const std::vector<image::R
     return out;
 }
 
-Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, const Options& options, const codestream::FrameInfo& info) {
-    if (options.lossless) {
+Result<std::vector<uint8_t>> Encoder::encodeJpeg(const image::JpegFile& jpeg, const Options& options) {
+    if (jpeg.progressive) return Error(ErrorCode::Unsupported, "progressive JPEG (only baseline Huffman scans are decoded)");
+    if (jpeg.components.size() != 1 && jpeg.components.size() != 3) return Error(ErrorCode::Unsupported, "JPEG component count");
+    for (const image::JpegScan& scan : jpeg.scans) {
+        if (scan.ss != 0 || scan.se != 63 || scan.ah != 0 || scan.al != 0) return Error(ErrorCode::Unsupported, "JPEG scan spectral selection");
+        for (const image::JpegScan::Component& sc : scan.components) {
+            if (!jpeg.dcTables[sc.dcTable].present || !jpeg.acTables[sc.acTable].present) return Error(ErrorCode::Corrupt, "JPEG scan without its Huffman tables");
+        }
+    }
+    // The headers: an 8-bit sRGB image, not XYB; then one VarDCT frame fed by the JPEG.
+    image::Rgb8 stub;
+    stub.width = jpeg.width;
+    stub.height = jpeg.height;
+    stub.channels = 3;
+    stub.bitDepth = 8;
+    codestream::BitWriter head;
+    codestream::writeCodestreamHeadersRgb(head, jpeg.width, jpeg.height, 8, false);
+    std::vector<uint8_t> out = head.take();
+    SJXL_ASSIGN(const std::vector<uint8_t> frame, encodeFrame(stub, options, codestream::FrameInfo{}, &jpeg));
+    stats_.headBytes += static_cast<uint32_t>(out.size());
+    out.insert(out.end(), frame.begin(), frame.end());
+    return out;
+}
+
+Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, const Options& options, const codestream::FrameInfo& info,
+                                                   const image::JpegFile* jpeg) {
+    if (options.lossless && jpeg == nullptr) {
         return encodeLossless(image, options, info);
     }
-    if (!(options.distance > 0.0f) || options.distance > 25.0f) {
+    if (jpeg == nullptr && (!(options.distance > 0.0f) || options.distance > 25.0f)) {
         return Error::make(ErrorCode::InvalidArgument, "distance {} is not in (0, 25]", options.distance);
     }
     gpu::Device& dev = *device_;
-    const FrameDim dim = codestream::frameDim(image.width, image.height);
     codestream::FrameParams frame = frameParamsFor(options);
-    frame.useDcFrame = options.progressiveDc && image.channels == 3;   // libjxl: no DC frames with extra channels
+    frame.useDcFrame = options.progressiveDc && image.channels == 3 && jpeg == nullptr;   // libjxl: no DC frames with extra channels
+    // JPEG recompression: a YCbCr (or RGB) frame with the JPEG's subsampling, no filters, no
+    // DC smoothing unless 4:4:4 (libjxl's defaults), every block a DCT8 with quant field 1.
+    std::array<uint32_t, 4> hshift{}, vshift{};
+    std::array<uint32_t, 4> jpegOf{0, 1, 2, 0};
+    std::array<float, 3> dcQuantJpeg{};
+    std::array<int32_t, 192> rawQuant{};
+    std::array<uint32_t, 4> dcOffsetJpeg{};
+    uint32_t maxHShift = 0, maxVShift = 0;
+    const bool grayJpeg = jpeg != nullptr && jpeg->components.size() == 1;
+    if (jpeg != nullptr) {
+        frame.xyb = false;
+        frame.ycbcr = !jpeg->rgb || grayJpeg;
+        frame.gaborish = false;
+        frame.epfIters = 0;
+        frame.xQmScale = frame.bQmScale = 2;
+        // Channel order: X <- Cb, Y <- Y, B <- Cr (JpegOrder); RGB frames keep the component order.
+        if (frame.ycbcr && !grayJpeg) jpegOf = {1, 0, 2, 0};
+        if (grayJpeg) jpegOf = {0, 0, 0, 0};
+        static constexpr uint32_t kH[4] = {0, 1, 1, 0}, kV[4] = {0, 1, 0, 1};
+        for (uint32_t c = 0; c < 3; ++c) {
+            const image::JpegComponent& comp = jpeg->components[jpegOf[c]];
+            uint32_t mode = 4;
+            for (uint32_t i = 0; i < 4; ++i) {
+                if ((1u << kH[i]) == comp.hSamp && (1u << kV[i]) == comp.vSamp) mode = i;
+            }
+            if (mode == 4) return Error(ErrorCode::Unsupported, "JPEG sampling factors");
+            frame.chromaMode[c] = mode;
+            maxHShift = std::max(maxHShift, kH[mode]);
+            maxVShift = std::max(maxVShift, kV[mode]);
+        }
+        for (uint32_t c = 0; c < 3; ++c) {
+            hshift[c] = maxHShift - kH[frame.chromaMode[c]];
+            vshift[c] = maxVShift - kV[frame.chromaMode[c]];
+            const image::JpegComponent& comp = jpeg->components[jpegOf[c]];
+            const std::array<int32_t, 64>& q = jpeg->quant[comp.quantIndex];
+            dcQuantJpeg[c] = static_cast<float>(q[0]) / (8.0f * 255.0f);
+            for (uint32_t y = 0; y < 8; ++y)
+                for (uint32_t x = 0; x < 8; ++x) rawQuant[c * 64 + 8 * x + y] = q[8 * y + x];   // libjxl's transposed layout
+            dcOffsetJpeg[c] = frame.ycbcr ? 0u : static_cast<uint32_t>(1024 / q[0]);
+        }
+        frame.skipDcSmoothing = true;   // as cjxl writes every transcode (its lfs option off)
+        if (!frame.ycbcr) frame.chromaMode = {0, 0, 0};
+    }
+    const FrameDim dim = codestream::frameDim(image.width, image.height, 1, maxHShift, maxVShift);
     // The quant field's distance: libjxl lowers it when the Gaborish is off.
     const float fieldDistance = options.distance * (frame.gaborish ? 1.0f : 0.62f);
     // The field's unit: libjxl's adaptive scale, or the flat 0.79 / d of its
@@ -307,8 +379,10 @@ Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, cons
     const float fieldScale = options.adaptiveQuant ? codestream::initialQuantAc(fieldDistance) : 0.79f / options.distance;
     const codestream::QuantParams qp = codestream::quantParamsFor(options.adaptiveQuant ? 0.39f / options.distance : fieldScale,
                                                                   codestream::initialQuantDc(options.distance));
-    const std::array<uint32_t, 4> quantizerWords{qp.globalScale, qp.quantDc, std::bit_cast<uint32_t>(qp.invGlobalScale),
-                                                 std::bit_cast<uint32_t>(qp.globalScaleFloat)};
+    gpu::Buffer rawQuantDev;
+    const std::array<uint32_t, 4> quantizerWords = jpeg != nullptr
+        ? std::array<uint32_t, 4>{65536u, 1u, std::bit_cast<uint32_t>(1.0f), std::bit_cast<uint32_t>(1.0f)}
+        : std::array<uint32_t, 4>{qp.globalScale, qp.quantDc, std::bit_cast<uint32_t>(qp.invGlobalScale), std::bit_cast<uint32_t>(qp.globalScaleFloat)};
     const uint32_t nblocks = dim.numBlocks();
     const uint32_t tilesX = (dim.xsizeBlocks + 7) / 8;
     const uint32_t tilesY = (dim.ysizeBlocks + 7) / 8;
@@ -322,7 +396,7 @@ Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, cons
     const bool singleSection = dim.singleSection(numPasses);
 
     // Input, padded to whole words.
-    std::vector<uint32_t> rgbWords((image.pixels.size() + 3) / 4, 0);
+    std::vector<uint32_t> rgbWords(std::max<size_t>(1, (image.pixels.size() + 3) / 4), 0);
     std::memcpy(rgbWords.data(), image.pixels.data(), image.pixels.size());
     SJXL_ASSIGN(auto rgb, gpu::Buffer::fromSpan<uint32_t>(dev, rgbWords, "enc.rgb8"));
 
@@ -347,6 +421,11 @@ Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, cons
     SJXL_ASSIGN(auto cmapB, gpu::Buffer::ofType<int32_t>(dev, uint64_t{tilesX} * tilesY, "enc.cmapB"));
     SJXL_ASSIGN(auto acQuant, gpu::Buffer::ofType<int32_t>(dev, uint64_t{3} * nblocks * 64, "enc.acQuant"));
     SJXL_ASSIGN(auto dcQuant, gpu::Buffer::ofType<int32_t>(dev, uint64_t{3} * nblocks, "enc.dcQuant"));
+    // The block context map: libjxl's default (15 contexts) unless a JPEG transcode
+    // builds one from the luma DC (jpegBlockCtx; read back as one counter).
+    SJXL_ASSIGN(auto bctxMap, gpu::Buffer::ofType<uint32_t>(dev, 16 + 3 * 13 * 8, "enc.bctxMap"));
+    uint32_t numBlockCtxs = 15;
+    uint32_t numAcCtxsUsed = kNumAcContexts;
     SJXL_ASSIGN(auto nonZeros, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{3} * nblocks, "enc.nonZeros"));
 
     const std::vector<Uint4> acRects = groupRects(dim, codestream::kGroupDimBlocks, dim.xsizeGroups, dim.ysizeGroups);
@@ -368,7 +447,8 @@ Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, cons
     };
     const uint32_t numCodeRegions = numSets * kAcClusters;
     const uint64_t pixels = uint64_t{image.width} * image.height;
-    const uint32_t numBlobRegions = 2 + 2 * numDcGroups;
+    const uint32_t numBlobRegions = 2 + 2 * numDcGroups + 2;   // + the quant table stream and AcGlobal's second part
+    const uint32_t qtBlobRegion = 2 + 2 * numDcGroups, acPostRegion = qtBlobRegion + 1;
     SJXL_ASSIGN(auto hist, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{numCodeRegions} * kCodeStride, "enc.hist"));
     SJXL_ASSIGN(auto codes, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{numCodeRegions} * kCodeStride, "enc.codes"));
     SJXL_ASSIGN(auto blobs, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{numBlobRegions} * kBlobStrideWords, "enc.blobs"));
@@ -381,8 +461,10 @@ Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, cons
     SJXL_ASSIGN(auto ctxSingle, gpu::Buffer::ofType<uint32_t>(dev, kNumAcContexts, "enc.ctxSingle"));
     SJXL_ASSIGN(auto clusterInfo, gpu::Buffer::ofType<uint32_t>(dev, numSets, "enc.clusterInfo"));
     SJXL_ASSIGN(auto ctxMapMtf, gpu::Buffer::ofType<uint32_t>(dev, numContextsAll, "enc.ctxMapMtf"));
-    SJXL_ASSIGN(auto ansInfo, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{numCodeRegions + 1} * 256, "enc.ansInfo"));
-    SJXL_ASSIGN(auto ansReverse, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{numCodeRegions + 1} * 4096, "enc.ansReverse"));
+    SJXL_ASSIGN(auto ansInfo, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{numCodeRegions + 2} * 256, "enc.ansInfo"));
+    SJXL_ASSIGN(auto ansReverse, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{numCodeRegions + 2} * 4096, "enc.ansReverse"));
+    const std::array<uint32_t, kModTreeWords> qtTreeWords{0xFFFFFFFFu, 0, 0, 0, 0, kPredZero, 0, 0};   // one leaf, predictor Zero
+    SJXL_ASSIGN(auto qtTree, gpu::Buffer::fromSpan<uint32_t>(dev, qtTreeWords, "enc.qtTree"));
     // The DC group streams: libjxl's kWPFixedDC tree (weighted predictor) and kACMeta tree, the WP scratch, the tokens.
     uint32_t dcLeaves = 0, metaLeaves = 0;
     const std::vector<uint32_t> dcTreeWords = fixedTree(kModPropWp, kPredWeighted, uint64_t{3} * nblocks, dcLeaves);
@@ -422,7 +504,7 @@ Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, cons
 
     gpu::CommandBatch batch(dev);
 
-    rgbToXyb_.dispatch(batch, {dim.xsizePadded, dim.ysizePadded, 1}, [&](rhi::ShaderCursor c) {
+    if (jpeg == nullptr) rgbToXyb_.dispatch(batch, {dim.xsizePadded, dim.ysizePadded, 1}, [&](rhi::ShaderCursor c) {
         c["rgb8"].setBinding(rgb.rhi());
         c["xyb"].setBinding(xyb.rhi());
         c["params"]["width"].setData(image.width);
@@ -454,15 +536,15 @@ Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, cons
         c["params"]["scale"].setData(fieldScale);
     };
     if (options.adaptiveQuant) {
-        aqDiff_.dispatch(batch, {cellsX * cellsY, 1, 1}, bindAq);
+        if (jpeg == nullptr) aqDiff_.dispatch(batch, {cellsX * cellsY, 1, 1}, bindAq);
     }
-    aqMap_.dispatch(batch, {nblocks, 1, 1}, bindAq);
-    aqRawField_.dispatch(batch, {nblocks, 1, 1}, bindAq);
+    if (jpeg == nullptr) aqMap_.dispatch(batch, {nblocks, 1, 1}, bindAq);
+    if (jpeg == nullptr) aqRawField_.dispatch(batch, {nblocks, 1, 1}, bindAq);
 
     // Pre-sharpening for the decoder's Gaborish, then the DCT of every block.
     const gpu::Buffer& planes = frame.gaborish ? xybSharp : xyb;
     if (frame.gaborish) {
-        gaborishInverse_.dispatch(batch, {dim.xsizePadded, dim.ysizePadded, 1}, [&](rhi::ShaderCursor c) {
+        if (jpeg == nullptr) gaborishInverse_.dispatch(batch, {dim.xsizePadded, dim.ysizePadded, 1}, [&](rhi::ShaderCursor c) {
             c["src"].setBinding(xyb.rhi());
             c["dst"].setBinding(xybSharp.rhi());
             c["params"]["paddedWidth"].setData(dim.xsizePadded);
@@ -483,7 +565,7 @@ Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, cons
     SJXL_ASSIGN(auto candNz, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{regionsX} * regionsY * 5, "enc.candNz"));
     uint32_t familyMask = 0x3FF;
     if (const std::string m = platform::env("SJXL_ACS_MASK"); !m.empty()) familyMask = static_cast<uint32_t>(std::strtoul(m.c_str(), nullptr, 0));
-    selectStrategies_.dispatchGroups(batch, {superblocksX * superblocksY, 1, 1}, [&](rhi::ShaderCursor c) {
+    if (jpeg == nullptr) selectStrategies_.dispatchGroups(batch, {superblocksX * superblocksY, 1, 1}, [&](rhi::ShaderCursor c) {
         c["xyb"].setBinding(planes.rhi());
         c["rawQf"].setBinding(rawQf.rhi());
         c["dequant"].setBinding(dequantAll_.rhi());
@@ -527,12 +609,12 @@ Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, cons
             c["params"]["distance"].setData(options.distance);
             c["params"]["largeMask"].setData(familyMask >> 7);
         };
-        largeQf_.dispatch(batch, {regionsX * regionsY * 5, 1, 1}, [&](rhi::ShaderCursor c) { bindLarge(c, 0); });
+        if (jpeg == nullptr) largeQf_.dispatch(batch, {regionsX * regionsY * 5, 1, 1}, [&](rhi::ShaderCursor c) { bindLarge(c, 0); });
         for (uint32_t family = 0; family < 3; ++family) {
-            largeRows_.dispatch(batch, {static_cast<uint32_t>(planePixels), 1, 1}, [&](rhi::ShaderCursor c) { bindLarge(c, family); });
-            largeCols_.dispatch(batch, {static_cast<uint32_t>(planePixels), 1, 1}, [&](rhi::ShaderCursor c) { bindLarge(c, family); });
+            if (jpeg == nullptr) largeRows_.dispatch(batch, {static_cast<uint32_t>(planePixels), 1, 1}, [&](rhi::ShaderCursor c) { bindLarge(c, family); });
+            if (jpeg == nullptr) largeCols_.dispatch(batch, {static_cast<uint32_t>(planePixels), 1, 1}, [&](rhi::ShaderCursor c) { bindLarge(c, family); });
         }
-        mergeLarge_.dispatch(batch, {regionsX * regionsY, 1, 1}, [&](rhi::ShaderCursor c) { bindLarge(c, 0); });
+        if (jpeg == nullptr) mergeLarge_.dispatch(batch, {regionsX * regionsY, 1, 1}, [&](rhi::ShaderCursor c) { bindLarge(c, 0); });
     }
     const auto bindTransform = [&](rhi::ShaderCursor c) {
         c["xyb"].setBinding(planes.rhi());
@@ -550,6 +632,10 @@ Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, cons
         c["nzCtx"].setBinding(nzCtx.rhi());
         c["passNonZeros"].setBinding(passNonZeros.rhi());
         c["ctxHist"].setBinding(ctxHist.rhi());
+        c["bctxMap"].setBinding(bctxMap.rhi());
+        c["dcQuant"].setBinding(dcQuant.rhi());
+        c["params"]["numBlockCtxs"].setData(numBlockCtxs);
+        c["params"]["jpegCtx"].setData(uint32_t{jpeg != nullptr ? 1u : 0u});
         c["params"]["paddedWidth"].setData(dim.xsizePadded);
         c["params"]["paddedHeight"].setData(dim.ysizePadded);
         c["params"]["blocksX"].setData(dim.xsizeBlocks);
@@ -569,8 +655,10 @@ Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, cons
         c["params"]["ncoeffs"].setData(passes[p].ncoeffs);
         c["params"]["prevNcoeffs"].setData(prevExact);
         c["params"]["ctxBase"].setData(p * kNumAcContexts);
+        c["params"]["hshift"].setData(hshift);
+        c["params"]["vshift"].setData(vshift);
     };
-    adjustQuantField_.dispatch(batch, {nblocks, 1, 1}, bindTransform);
+    if (jpeg == nullptr) adjustQuantField_.dispatch(batch, {nblocks, 1, 1}, bindTransform);
     // Oracle experiment: another encoder's quant field and strategy map (as the
     // decoder's SJXL_DEBUG_MAPS dumps them) replace ours.
     const std::string oracleMaps = platform::env("SJXL_ENC_MAPS");
@@ -597,12 +685,12 @@ Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, cons
         batch.copy(oracleAcs, 0, acs, 0, uint64_t{nblocks} * 4);
         batch.copy(oracleFirst, 0, firstBlock, 0, uint64_t{nblocks} * 4);
     }
-    dctRows_.dispatch(batch, {static_cast<uint32_t>(3 * planePixels), 1, 1}, bindTransform);
-    dctCols_.dispatch(batch, {static_cast<uint32_t>(3 * planePixels), 1, 1}, bindTransform);
-    specialTransform_.dispatch(batch, {3 * nblocks, 1, 1}, bindTransform);
-    dcFromLlf_.dispatch(batch, {3 * nblocks, 1, 1}, bindTransform);
+    if (jpeg == nullptr) dctRows_.dispatch(batch, {static_cast<uint32_t>(3 * planePixels), 1, 1}, bindTransform);
+    if (jpeg == nullptr) dctCols_.dispatch(batch, {static_cast<uint32_t>(3 * planePixels), 1, 1}, bindTransform);
+    if (jpeg == nullptr) specialTransform_.dispatch(batch, {3 * nblocks, 1, 1}, bindTransform);
+    if (jpeg == nullptr) dcFromLlf_.dispatch(batch, {3 * nblocks, 1, 1}, bindTransform);
     if (options.chromaFromLuma) {
-        cflTile_.dispatch(batch, {tilesX * tilesY, 1, 1}, [&](rhi::ShaderCursor c) {
+        if (jpeg == nullptr) cflTile_.dispatch(batch, {tilesX * tilesY, 1, 1}, [&](rhi::ShaderCursor c) {
             c["coeffs"].setBinding(coeffs.rhi());
             c["dequant"].setBinding(dequantAll_.rhi());
             c["acs"].setBinding(acs.rhi());
@@ -616,7 +704,7 @@ Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, cons
             c["params"]["tilesY"].setData(tilesY);
         });
     }
-    quantize_.dispatch(batch, {nblocks, 1, 1}, [&](rhi::ShaderCursor c) {
+    if (jpeg == nullptr) quantize_.dispatch(batch, {nblocks, 1, 1}, [&](rhi::ShaderCursor c) {
         c["coeffs"].setBinding(coeffs.rhi());
         c["dcValue"].setBinding(dcValue.rhi());
         c["dequant"].setBinding(dequantAll_.rhi());
@@ -637,6 +725,118 @@ Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, cons
         c["params"]["bQmMultiplier"].setData(static_cast<float>(std::pow(1.25, static_cast<int>(frame.bQmScale) - 2)));
         c["params"]["noAdjust"].setData(uint32_t{platform::env("SJXL_ENC_NO_ADJUST").empty() ? 0u : 1u});
     });
+    if (jpeg != nullptr) {
+        // The JPEG's Huffman scans decoded on the device, then its coefficients laid out as the frame's.
+        std::vector<uint32_t> fileWords((jpeg->data.size() + 3) / 4, 0);
+        std::memcpy(fileWords.data(), jpeg->data.data(), jpeg->data.size());
+        SJXL_ASSIGN(auto jpegData, gpu::Buffer::fromSpan<uint32_t>(dev, fileWords, "enc.jpegData"));
+        // Huffman tables: limit (largest code + 1) and value offset per length, then the values.
+        constexpr uint32_t kHuffWords = 18 + 18 + 256;
+        std::vector<uint32_t> huff(8 * kHuffWords, 0);
+        for (uint32_t t = 0; t < 8; ++t) {
+            const image::JpegHuffmanTable& table = t < 4 ? jpeg->dcTables[t] : jpeg->acTables[t - 4];
+            if (!table.present) continue;
+            uint32_t code = 0, index = 0;
+            for (uint32_t len = 1; len <= 16; ++len) {
+                const uint32_t n = table.counts[len];
+                huff[t * kHuffWords + len] = n ? code + n : 0;                                   // limit
+                huff[t * kHuffWords + 18 + len] = n ? static_cast<uint32_t>(index - code) : 0;   // value index = offset + code (mod 256)
+                code += n;
+                index += n;
+                code <<= 1;
+            }
+            for (uint32_t i = 0; i < table.values.size() && i < 256; ++i) huff[t * kHuffWords + 36 + i] = table.values[i];
+        }
+        SJXL_ASSIGN(auto huffman, gpu::Buffer::fromSpan<uint32_t>(dev, huff, "enc.jpegHuffman"));
+        std::array<uint32_t, 4> compH{1, 1, 1, 1}, compV{1, 1, 1, 1}, compBlocksX{}, compBlocksY{}, compOffset{}, compScanBlocksX{}, compScanBlocksY{};
+        uint32_t totalCoeffs = 0;
+        uint32_t hmax = 1, vmax = 1;
+        for (const image::JpegComponent& comp : jpeg->components) { hmax = std::max(hmax, comp.hSamp); vmax = std::max(vmax, comp.vSamp); }
+        for (uint32_t c = 0; c < jpeg->components.size(); ++c) {
+            const image::JpegComponent& comp = jpeg->components[c];
+            compH[c] = comp.hSamp;
+            compV[c] = comp.vSamp;
+            compBlocksX[c] = comp.blocksX;
+            compBlocksY[c] = comp.blocksY;
+            compOffset[c] = totalCoeffs;
+            const uint32_t cw = (jpeg->width * comp.hSamp + hmax - 1) / hmax, ch = (jpeg->height * comp.vSamp + vmax - 1) / vmax;
+            compScanBlocksX[c] = (cw + 7) / 8;
+            compScanBlocksY[c] = (ch + 7) / 8;
+            totalCoeffs += comp.blocksX * comp.blocksY * 64;
+        }
+        SJXL_ASSIGN(auto coeffs, gpu::Buffer::ofType<int32_t>(dev, totalCoeffs, "enc.jpegCoeffs"));
+        SJXL_ASSIGN(auto rawQuantBuf, gpu::Buffer::fromSpan<int32_t>(dev, rawQuant, "enc.rawQuant"));
+        rawQuantDev = std::move(rawQuantBuf);
+        const auto bindJpeg = [&](rhi::ShaderCursor c, const gpu::Buffer& intervals, const image::JpegScan* scan) {
+            c["data"].setBinding(jpegData.rhi());
+            c["intervalStart"].setBinding(intervals.rhi());
+            c["huffman"].setBinding(huffman.rhi());
+            c["coeffs"].setBinding(coeffs.rhi());
+            c["acQuant"].setBinding(acQuant.rhi());
+            c["dcQuant"].setBinding(dcQuant.rhi());
+            c["nonZeros"].setBinding(nonZeros.rhi());
+            c["acs"].setBinding(acs.rhi());
+            c["firstBlock"].setBinding(firstBlock.rhi());
+            c["rawQf"].setBinding(rawQf.rhi());
+            c["cmapX"].setBinding(cmapX.rhi());
+            c["cmapB"].setBinding(cmapB.rhi());
+            c["status"].setBinding(dummy_.rhi());
+            c["rawQuant"].setBinding(rawQuantDev.rhi());
+            c["blockCtx"].setBinding(bctxMap.rhi());
+            c["params"]["numComponents"].setData(static_cast<uint32_t>(jpeg->components.size()));
+            c["params"]["mcusX"].setData(jpeg->mcusX);
+            c["params"]["mcusY"].setData(jpeg->mcusY);
+            c["params"]["restartInterval"].setData(jpeg->restartInterval);
+            std::array<uint32_t, 4> idx{}, dct{}, act{};
+            uint32_t numIntervals = 1, scanComponents = 0, dataOffset = 0, dataSize = 0;
+            if (scan != nullptr) {
+                for (uint32_t i = 0; i < scan->components.size() && i < 4; ++i) {
+                    idx[i] = scan->components[i].index;
+                    dct[i] = scan->components[i].dcTable;
+                    act[i] = scan->components[i].acTable;
+                }
+                numIntervals = static_cast<uint32_t>(scan->restartOffsets.size());
+                scanComponents = static_cast<uint32_t>(scan->components.size());
+                dataOffset = static_cast<uint32_t>(scan->dataOffset);
+                dataSize = static_cast<uint32_t>(scan->dataSize);
+            }
+            c["params"]["numIntervals"].setData(numIntervals);
+            c["params"]["scanComponents"].setData(scanComponents);
+            c["params"]["dataOffset"].setData(dataOffset);
+            c["params"]["dataSize"].setData(dataSize);
+            c["params"]["compIndex"].setData(idx);
+            c["params"]["compDcTable"].setData(dct);
+            c["params"]["compAcTable"].setData(act);
+            c["params"]["compH"].setData(compH);
+            c["params"]["compV"].setData(compV);
+            c["params"]["compBlocksX"].setData(compBlocksX);
+            c["params"]["compBlocksY"].setData(compBlocksY);
+            c["params"]["compOffset"].setData(compOffset);
+            c["params"]["compScanBlocksX"].setData(compScanBlocksX);
+            c["params"]["compScanBlocksY"].setData(compScanBlocksY);
+            c["params"]["blocksX"].setData(dim.xsizeBlocks);
+            c["params"]["blocksY"].setData(dim.ysizeBlocks);
+            c["params"]["hshift"].setData(hshift);
+            c["params"]["vshift"].setData(vshift);
+            c["params"]["jpegOf"].setData(jpegOf);
+            c["params"]["dcOffset"].setData(dcOffsetJpeg);
+            c["params"]["grayscale"].setData(uint32_t{grayJpeg ? 1u : 0u});
+        };
+        std::vector<gpu::Buffer> intervalBuffers;
+        for (const image::JpegScan& scan : jpeg->scans) {
+            SJXL_ASSIGN(auto intervals, gpu::Buffer::fromSpan<uint32_t>(dev, scan.restartOffsets, "enc.jpegIntervals"));
+            intervalBuffers.push_back(std::move(intervals));
+            jpegDecodeScan_.dispatch(batch, {static_cast<uint32_t>(scan.restartOffsets.size()), 1, 1},
+                                     [&](rhi::ShaderCursor c) { bindJpeg(c, intervalBuffers.back(), &scan); });
+        }
+        jpegToCoeffs_.dispatch(batch, {3 * nblocks, 1, 1}, [&](rhi::ShaderCursor c) { bindJpeg(c, intervalBuffers.back(), nullptr); });
+        jpegBlockCtx_.dispatchGroups(batch, {1, 1, 1}, [&](rhi::ShaderCursor c) { bindJpeg(c, intervalBuffers.back(), nullptr); });
+        SJXL_TRY(batch.submit(true));
+        SJXL_ASSIGN(const auto bctxHead, bctxMap.readRange<uint32_t>(dev, 0, 2));
+        numBlockCtxs = bctxHead[1];
+        numAcCtxsUsed = numBlockCtxs * (37 + 458);
+        if (!platform::env("SJXL_DEBUG").empty()) log::info("enc debug: jpeg block contexts: {} DC buckets, {} contexts", bctxHead[0], numBlockCtxs);
+    }
     // The DC frame: the DC image as a Modular XYB frame at 1/8 size, scaled by the
     // frame's DC steps (F16 in its DcGlobal); the VarDCT frame then codes no DC.
     std::vector<uint8_t> dcFrameBytes;
@@ -713,6 +913,8 @@ Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, cons
         c["params"]["wpWordsPerGroup"].setData(wpWordsPerGroup);
         c["params"]["numAcSets"].setData(numPasses);
         c["params"]["useDcFrame"].setData(uint32_t{frame.useDcFrame ? 1u : 0u});
+        c["params"]["hshift"].setData(hshift);
+        c["params"]["vshift"].setData(vshift);
     };
     if (!frame.useDcFrame) dcTokenize_.dispatch(batch, {numDcGroups, 1, 1}, [&](rhi::ShaderCursor c) { bindDc(c, 0, dummy_); });
     metaTokenize_.dispatch(batch, {metaItems, 1, 1}, [&](rhi::ShaderCursor c) { bindDc(c, 0, dummy_); });
@@ -856,6 +1058,8 @@ Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, cons
         c["params"]["height"].setData(image.height);
         c["params"]["groupDim"].setData(dim.groupDim);
         c["params"]["numPasses"].setData(numPasses);
+        c["params"]["hshift"].setData(hshift);
+        c["params"]["vshift"].setData(vshift);
     };
     // The ANS sections (one thread per AC group, one per DC group) measured in mode 1 and emitted in mode 2.
     const auto sectionPasses = [&](uint32_t mode, const gpu::Buffer& body) {
@@ -880,7 +1084,7 @@ Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, cons
         c["params"]["regionBase"].setData(set * kAcClusters);
     };
     for (uint32_t set = 0; set < numSets; ++set) {
-        const uint32_t numContexts = set < numPasses ? kNumAcContexts : kSetContexts;
+        const uint32_t numContexts = set < numPasses ? numAcCtxsUsed : kSetContexts;
         clusterContexts_.dispatchGroups(batch, {1, 1, 1}, [&](rhi::ShaderCursor c) { bindCluster(c, set, numContexts); });
         accumulateClusters_.dispatch(batch, {numContexts, 1, 1}, [&](rhi::ShaderCursor c) { bindCluster(c, set, numContexts); });
     }
@@ -892,6 +1096,8 @@ Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, cons
         c["quantizer"].setBinding(quantizer.rhi());
         c["ctxMap"].setBinding(ctxMap.rhi());
         c["clusterInfo"].setBinding(clusterInfo.rhi());
+        c["bctxMap"].setBinding(bctxMap.rhi());
+        c["params"]["numAcCtxsUsed"].setData(numAcCtxsUsed);
         c["ctxMapMtf"].setBinding(ctxMapMtf.rhi());
         c["groupRct"].setBinding(dummy_.rhi());
         c["chanTable"].setBinding(alphaChanTable.valid() ? alphaChanTable.rhi() : dummy_.rhi());
@@ -905,6 +1111,17 @@ Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, cons
         c["params"]["lz77Modular"].setData(0u);
         c["params"]["modLogAlpha"].setData(uint32_t{image.bitDepth > 8 ? 7u : 6u});
         c["params"]["histogramTries"].setData(7u);
+        c["rawQuant"].setBinding(rawQuantDev.valid() ? rawQuantDev.rhi() : dummyInt_.rhi());
+        c["qtTree"].setBinding(qtTree.rhi());
+        c["params"]["jpeg"].setData(uint32_t{jpeg != nullptr ? 1u : 0u});
+        c["params"]["qtRegion"].setData(numCodeRegions + 1);
+        c["params"]["qtCount"].setData(192u);
+        c["params"]["numQuantKinds"].setData(17u);
+        c["params"]["qtBlobRegion"].setData(qtBlobRegion);
+        c["params"]["acPostRegion"].setData(acPostRegion);
+        c["params"]["dcQuantJpegX"].setData(dcQuantJpeg[0]);
+        c["params"]["dcQuantJpegY"].setData(dcQuantJpeg[1]);
+        c["params"]["dcQuantJpegB"].setData(dcQuantJpeg[2]);
         c["params"]["rctBeginC"].setData(0u);
         c["ansInfo"].setBinding(ansInfo.rhi());
         c["ansReverse"].setBinding(ansReverse.rhi());
@@ -945,6 +1162,7 @@ Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, cons
     };
     dcGroupBlobs_.dispatchGroups(batch, {numDcGroups, 1, 1}, bindCodes);
     globalBlobs_.dispatchGroups(batch, {1, 1, 1}, bindCodes);
+    if (jpeg != nullptr) quantTableBlob_.dispatchGroups(batch, {1, 1, 1}, bindCodes);
 
     sectionPasses(1, dummy_);   // bit counts
 
@@ -964,6 +1182,9 @@ Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, cons
         c["params"]["numDcGroups"].setData(numDcGroups);
         c["params"]["packed"].setData(uint32_t{singleSection ? 1u : 0u});
         c["params"]["numPasses"].setData(numPasses);
+        c["params"]["qtBlobRegion"].setData(qtBlobRegion);
+        c["params"]["acPostRegion"].setData(acPostRegion);
+        c["params"]["numBlobRegions"].setData(numBlobRegions);
     };
     layout_.dispatch(batch, {1, 1, 1}, [&](rhi::ShaderCursor c) { bindLayout(c, dummy_); });
     SJXL_TRY(batch.submit(true));
@@ -1004,7 +1225,8 @@ Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, cons
         SJXL_ASSIGN(const auto sizesHost, sectionBytes.readAll<uint32_t>(dev));
         std::string sections;
         for (uint32_t b : sizesHost) sections += std::format("{} ", b);
-        log::info("enc debug: blob bits DcGlobal {} AcGlobal {}; section bytes {}", blobBitsHost[0], blobBitsHost[1], sections);
+        log::info("enc debug: blob bits DcGlobal {} AcGlobal {}; section bytes {}", blobBitsHost[0],
+                  blobBitsHost[1] + blobBitsHost[qtBlobRegion] + blobBitsHost[acPostRegion], sections);
         SJXL_ASSIGN(const auto passNzHost, passNonZeros.readAll<uint32_t>(dev));
         SJXL_ASSIGN(const auto numTokensHost, numTokens.readAll<uint32_t>(dev));
         SJXL_ASSIGN(const auto acOnlyHost, acOnlyBits.readAll<uint32_t>(dev));
@@ -1859,6 +2081,17 @@ Result<std::vector<uint8_t>> Encoder::encodeModularFrame(const ModularSpec& spec
         c["params"]["lz77Modular"].setData(uint32_t{lz77 ? 1u : 0u});
         c["params"]["modLogAlpha"].setData(logAlpha);
         c["params"]["histogramTries"].setData(7u);
+        c["rawQuant"].setBinding(dummyInt_.rhi());
+        c["qtTree"].setBinding(dummy_.rhi());
+        c["params"]["jpeg"].setData(0u);
+        c["params"]["qtRegion"].setData(0u);
+        c["params"]["qtCount"].setData(0u);
+        c["params"]["numQuantKinds"].setData(17u);
+        c["params"]["qtBlobRegion"].setData(0u);
+        c["params"]["acPostRegion"].setData(0u);
+        c["params"]["dcQuantJpegX"].setData(0.0f);
+        c["params"]["dcQuantJpegY"].setData(0.0f);
+        c["params"]["dcQuantJpegB"].setData(0.0f);
         c["params"]["dcTreeNodes"].setData(0u);
         c["params"]["dcLeaves"].setData(0u);
         c["params"]["metaTreeNodes"].setData(0u);
@@ -1919,6 +2152,9 @@ Result<std::vector<uint8_t>> Encoder::encodeModularFrame(const ModularSpec& spec
         c["params"]["numGroups"].setData(numGroups);
         c["params"]["numDcGroups"].setData(0u);
         c["params"]["packed"].setData(0u);
+        c["params"]["qtBlobRegion"].setData(0xFFFFFFFFu);
+        c["params"]["acPostRegion"].setData(0xFFFFFFFFu);
+        c["params"]["numBlobRegions"].setData(1u);
     });
     if (!fitsGroup) {
         modGroupSections_.dispatch(batch, {numGroups, 1, 1}, [&](rhi::ShaderCursor c) { bindSections(c, 2, groupStart, body); });

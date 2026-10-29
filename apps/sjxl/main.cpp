@@ -15,6 +15,7 @@
 #include "sjxl/encoder/Encoder.h"
 #include "sjxl/gpu/Device.h"
 #include "sjxl/image/Image.h"
+#include "sjxl/image/Jpeg.h"
 #include "sjxl/metrics/Compare.h"
 
 namespace {
@@ -27,6 +28,7 @@ int usage() {
                  "                                              [--progressive | --qprogressive]  AC in 3 frequency passes, or 2 precision passes\n"
                  "                                              [--progressive-dc]  a 1/8-size DC frame first (cjxl -p is --progressive --progressive-dc)\n"
                  "                                              [--fixed-tree]  lossless: libjxl's fixed trees instead of a learned MA tree\n"
+                 "                                              a .jpg input is recompressed losslessly (its DCT coefficients kept); --pixels encodes its pixels instead\n"
                  "                                              lossy VarDCT (default distance 1.0)\n"
                  "  sjxl animate out.jxl [--fps n] [--loops n] [--lossless] [-d d] frame1.png frame2.png ...\n"
                  "  sjxl decode in.jxl out.png                  any frame type; animations write out_000.png, out_001.png, ...\n"
@@ -108,6 +110,7 @@ int info(int argc, char** argv) {
 int encode(int argc, char** argv) {
     if (argc < 4) return usage();
     sjxl::enc::Options options;
+    bool pixels = false;
     for (int i = 4; i < argc; ++i) {
         const std::string_view arg = argv[i];
         if ((arg == "--distance" || arg == "-d") && i + 1 < argc) {
@@ -132,6 +135,8 @@ int encode(int argc, char** argv) {
             options.progressiveDc = true;
         } else if (arg == "--fixed-tree") {
             options.learnedTree = false;
+        } else if (arg == "--pixels") {
+            pixels = true;
         } else if (arg == "--lambda" && i + 1 < argc) {
             options.acsLambda = std::strtof(argv[++i], nullptr);
         } else if (arg == "--clusters" && i + 1 < argc) {
@@ -139,6 +144,26 @@ int encode(int argc, char** argv) {
         } else {
             return usage();
         }
+    }
+    // A JPEG input is recompressed (its coefficients kept) unless --pixels asks for the pixel paths.
+    const std::string_view inPath = argv[2];
+    const bool jpegInput = !pixels && inPath.size() > 4 && (inPath.ends_with(".jpg") || inPath.ends_with(".jpeg") || inPath.ends_with(".JPG") || inPath.ends_with(".JPEG"));
+    if (jpegInput) {
+        auto jpeg = sjxl::image::readJpeg(argv[2]);
+        if (!jpeg) return fail(jpeg.error());
+        auto device = sjxl::gpu::Device::create();
+        if (!device) return fail(device.error());
+        auto library = std::make_shared<sjxl::gpu::ShaderLibrary>(*device);
+        auto encoder = sjxl::enc::Encoder::create(library);
+        if (!encoder) return fail(encoder.error());
+        const auto start = std::chrono::steady_clock::now();
+        auto bytes = (*encoder)->encodeJpeg(*jpeg, options);
+        if (!bytes) return fail(bytes.error());
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+        if (auto written = sjxl::image::writeFile(argv[3], *bytes); !written) return fail(written.error());
+        std::printf("JPEG %ux%u, %zu bytes -> %zu bytes (%.1f%%) in %.1f ms\n", jpeg->width, jpeg->height, jpeg->data.size(), bytes->size(),
+                    100.0 * static_cast<double>(bytes->size()) / static_cast<double>(jpeg->data.size()), ms);
+        return 0;
     }
     // Alpha and 16-bit samples are kept in both modes.
     auto image = sjxl::image::readImage(argv[2]);

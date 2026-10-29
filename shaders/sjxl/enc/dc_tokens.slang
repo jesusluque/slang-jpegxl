@@ -43,7 +43,11 @@ struct DcTokenParams {
     uint numAcSets;         // the AC passes' sets precede the DC groups' sets
     uint useDcFrame;        // kUseDcFrame: no DC stream in the DC group sections
     uint pad2;
+    uint4 hshift;           // chroma subsampling per channel (X, Y, B): a channel's DC grid is the group's >> shift
+    uint4 vshift;
 };
+
+uint shiftOf(uint4 v, uint c) { return c == 0 ? v.x : c == 1 ? v.y : v.z; }
 
 StructuredBuffer<uint4>    dcGroups;      // bx0, by0, w, h (blocks)
 StructuredBuffer<int>      dcQuant;       // [c][block]
@@ -109,16 +113,21 @@ void dcTokenize(uint3 tid: SV_DispatchThreadID) {
     for (uint ci = 0; ci < 3; ++ci) {
         const uint c = physical[ci];
         const uint plane = c * params.nblocks;
-        WpState wp = wpInit(wpScratch, g * params.wpWordsPerGroup, rect.z);
-        for (uint y = 0; y < rect.w; ++y) {
-            for (uint x = 0; x < rect.z; ++x) {
-                const uint block = (rect.y + y) * params.blocksX + rect.x + x;
+        // The channel's DC grid in this group: the group's blocks >> its shifts; a
+        // subsampled channel's value sits at the co-located full-grid block.
+        const uint hs = shiftOf(params.hshift, c), vs = shiftOf(params.vshift, c);
+        const uint w = rect.z >> hs, h = rect.w >> vs;
+        const uint strideX = 1u << hs, strideY = params.blocksX << vs;
+        WpState wp = wpInit(wpScratch, g * params.wpWordsPerGroup, w);
+        for (uint y = 0; y < h; ++y) {
+            for (uint x = 0; x < w; ++x) {
+                const uint block = (rect.y + (y << vs)) * params.blocksX + rect.x + (x << hs);
                 const int v = dcQuant[plane + block];
-                const int left = x > 0 ? dcQuant[plane + block - 1] : (y > 0 ? dcQuant[plane + block - params.blocksX] : 0);
-                const int top = y > 0 ? dcQuant[plane + block - params.blocksX] : left;
-                const int topleft = (x > 0 && y > 0) ? dcQuant[plane + block - params.blocksX - 1] : left;
-                const int topright = (x + 1 < rect.z && y > 0) ? dcQuant[plane + block - params.blocksX + 1] : top;
-                const int toptop = y > 1 ? dcQuant[plane + block - 2 * params.blocksX] : top;
+                const int left = x > 0 ? dcQuant[plane + block - strideX] : (y > 0 ? dcQuant[plane + block - strideY] : 0);
+                const int top = y > 0 ? dcQuant[plane + block - strideY] : left;
+                const int topleft = (x > 0 && y > 0) ? dcQuant[plane + block - strideY - strideX] : left;
+                const int topright = (x + 1 < w && y > 0) ? dcQuant[plane + block - strideY + strideX] : top;
+                const int toptop = y > 1 ? dcQuant[plane + block - 2 * strideY] : top;
                 int wpProp;
                 const int64_t pred = wpPredict(wpScratch, wp, x, y, int64_t(top), int64_t(left), int64_t(topright), int64_t(topleft), int64_t(toptop), wpProp);
                 uint predictor;
@@ -267,10 +276,13 @@ void dcGroupSections(uint3 tid: SV_DispatchThreadID) {
     const uint physical[3] = {1, 0, 2};
     if (params.useDcFrame == 0) {
         for (int ci = 2; ci >= 0; --ci) {
-            const uint plane = physical[ci] * params.nblocks;
-            for (int y = int(rect.w) - 1; y >= 0; --y) {
-                for (int x = int(rect.z) - 1; x >= 0; --x) {
-                    const uint t = dcTokens[plane + (rect.y + uint(y)) * params.blocksX + rect.x + uint(x)];
+            const uint c = physical[ci];
+            const uint plane = c * params.nblocks;
+            const uint hs = shiftOf(params.hshift, c), vs = shiftOf(params.vshift, c);
+            const uint w = rect.z >> hs, h = rect.w >> vs;
+            for (int y = int(h) - 1; y >= 0; --y) {
+                for (int x = int(w) - 1; x >= 0; --x) {
+                    const uint t = dcTokens[plane + (rect.y + (uint(y) << vs)) * params.blocksX + rect.x + (uint(x) << hs)];
                     put(aw, t >> 18, t & 0x3FFFFu);
                 }
             }

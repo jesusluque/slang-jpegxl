@@ -19,6 +19,7 @@ cmake --build build/macos-arm64-debug --target sjxl_gpu_tests   # one binary
 build/macos-arm64-debug/bin/sjxl info [in.jxl]              # device info, or a file's headers and frame list
 build/macos-arm64-debug/bin/sjxl encode in.png out.jxl --distance 1.0 [--no-aq] [--no-cfl] [--no-filters] [--no-acs] [--lambda x] [--clusters n] [--progressive | --qprogressive] [--progressive-dc] [--fixed-tree]
 build/macos-arm64-debug/bin/sjxl encode in.png out.jxl --lossless   # Modular frame, bit-exact; RGB/RGBA, 8/16-bit
+build/macos-arm64-debug/bin/sjxl encode in.jpg out.jxl              # JPEG recompression: Huffman decode + transcode on the GPU
 build/macos-arm64-debug/bin/sjxl animate out.jxl --fps 10 [--loops n] [--lossless] [-d d] f1.png f2.png ...   # animation, one tick per frame
 build/macos-arm64-debug/bin/sjxl decode in.jxl out.png                  # every stage on the GPU; animations write out_000.png, ...
 build/macos-arm64-debug/bin/sjxl compare a.png b.png                    # PSNR + largest diff, on the GPU
@@ -87,6 +88,9 @@ cjxl in.png ref.jxl -d 1 -e 5 ; djxl out.jxl check.png      # Homebrew oracle (/
   run-length coded widths); single-thread kernels keep 256-entry scratch in
   groupshared arrays, never private ones (Metal's compiler hangs). Context maps over many
   contexts are MTF + ANS streams; the headers' MA trees use prefix codes.
+- **Metal buffers have no bounds checks**: a kernel writing past a buffer
+  (e.g. a per-tile buffer indexed per block) corrupts whichever buffer the
+  heap placed next, silently. Size and index every write by the same unit.
 - **One Slang and one slang-rhi** per process, the pinned ones.
 - **`docs/decisions.md`** records each subsystem's design, what was measured
   and what is not done. Update it with the change.
@@ -166,6 +170,13 @@ stream; cjxl's `-p` is `--progressive --progressive-dc`.
 `Encoder::encodeAnimation` writes the animation metadata and one frame per
 image through the same `encodeFrame` (full canvas, kReplace, duration in
 ticks, `is_last` on the final frame).
+A JPEG input (`image::readJpeg`, markers only) is transcoded (`encodeJpeg`):
+`enc/jpeg.slang` decodes the Huffman scans one thread per restart interval,
+moves the blocks to libjxl's layout on the padded frame grid and builds
+cjxl's luma-DC block context map; the frame is YCbCr with the JPEG's chroma
+modes, RAW DCT8 tables (`buildQuantTableBlob`, own blob region), DC smoothing
+skipped, and the AC histogram set has `block contexts × 495` entries (count
+read back as a counter). No CfL, no custom orders, no jbrd box.
 Both paths take RGB or RGBA at 8 or 16 bits (`image::readImage`). In a lossy
 frame the alpha channel is the extra channel: a one-channel modular image
 tokenised like the lossless one, its global part at the end of DcGlobal

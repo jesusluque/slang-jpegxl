@@ -258,16 +258,24 @@ void writeFrameHeader(BitWriter& w, const FrameParams& params, uint32_t numExtra
     w.writeBool(false);                                            // all_default
     writeU32(w, U32Enc{{Val(0), Val(1), Val(2), Val(3)}}, 0);      // frame_type = kRegularFrame
     w.writeBool(false);                                            // encoding = kVarDCT
-    writeU64(w, params.useDcFrame ? 32u : 0u);                     // flags: kUseDcFrame
-    // xyb_encoded forces color_transform = kXYB: nothing written.
+    writeU64(w, (params.useDcFrame ? 32u : 0u) | (params.skipDcSmoothing ? 128u : 0u));   // flags: kUseDcFrame, kSkipAdaptiveDCSmoothing
+    // xyb_encoded forces color_transform = kXYB: nothing written; else do_YCbCr and its subsampling.
+    if (!params.xyb) {
+        w.writeBool(params.ycbcr);
+        if (params.ycbcr && !params.useDcFrame) {
+            for (uint32_t mode : params.chromaMode) w.write(2, mode);
+        }
+    }
     if (!params.useDcFrame) {
         writeU32(w, U32Enc{{Val(1), Val(2), Val(4), Val(8)}}, 1);      // upsampling = 1
         for (uint32_t i = 0; i < numExtraChannels; ++i) {
             writeU32(w, U32Enc{{Val(1), Val(2), Val(4), Val(8)}}, 1);  // ec_upsampling = 1
         }
     }
-    w.write(3, params.xQmScale);                                   // x_qm_scale
-    w.write(3, params.bQmScale);                                   // b_qm_scale
+    if (params.xyb) {
+        w.write(3, params.xQmScale);                               // x_qm_scale (XYB only)
+        w.write(3, params.bQmScale);                               // b_qm_scale
+    }
     // Passes (frame_header.cc Passes::VisitFields).
     writeU32(w, U32Enc{{Val(1), Val(2), Val(3), BitsOffset(3, 4)}}, params.numPasses);
     if (params.numPasses != 1) {

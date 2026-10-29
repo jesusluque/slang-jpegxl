@@ -150,7 +150,10 @@ void clusterContexts(uint3 gtid: SV_GroupThreadID) {
         float best = -1.0f;
         uint bestIdx = 0xFFFFFFFFu;
         for (uint ctx = tid; ctx < n; ctx += kThreads) {
-            if (ctxTotal[ctx] > best) { best = ctxTotal[ctx]; bestIdx = ctx; }
+            // A one-symbol context ranks below every other: as a seed its distance to
+            // everything is its whole count, which hides the differences between the rest.
+            const float score = ctxSingle[ctx] != 0 ? ctxTotal[ctx] * 1e-6f : ctxTotal[ctx];
+            if (score > best) { best = score; bestIdx = ctx; }
         }
         argmaxReduce(tid, best, bestIdx);
     }

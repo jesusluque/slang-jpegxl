@@ -34,8 +34,13 @@ struct TransformParams {
     uint  ncoeffs;     // side of the coefficient square this pass covers per 8x8 block (2, 3, 8)
     uint  prevNcoeffs; // side completed by earlier exact passes (1: nothing)
     uint  ctxBase;     // this pass's histogram set in ctxHist
-    uint  pad0, pad1;
+    uint  numBlockCtxs; // block contexts of the BlockCtxMap (15 default; a JPEG transcode's from bctxMap)
+    uint  jpegCtx;      // 1: the block context comes from bctxMap and the block's luma DC
+    uint4 hshift;      // chroma subsampling per channel (X, Y, B): a subsampled channel codes one block per 2x2 (JPEG recompression)
+    uint4 vshift;
 };
+
+uint shiftOf(uint4 v, uint c) { return c == 0 ? v.x : c == 1 ? v.y : v.z; }
 
 StructuredBuffer<float>    xyb;           // 3 planes (after the inverse Gaborish)
 StructuredBuffer<uint>     acs;           // per block: strategy << 1 | first
@@ -52,6 +57,8 @@ RWStructuredBuffer<uint>   numTokens;     // [pass][c][block]: coefficient token
 RWStructuredBuffer<uint>   nzCtx;         // [pass][c][block]: the non-zero count's context
 RWStructuredBuffer<uint>   passNonZeros;  // [pass][c][block]: non-zero coded coefficients of the pass
 RWStructuredBuffer<uint>   ctxHist;       // numPasses * kNumAcContexts * kHistBins
+StructuredBuffer<uint>     bctxMap;       // jpegBlockCtx's map: [0] DC contexts, [2..9) luma DC thresholds, [16..) contexts
+StructuredBuffer<int>      dcQuant;       // [c][block]: the quantised DC (the luma one picks the DC context)
 ConstantBuffer<TransformParams> params;
 
 static const uint kHistBins = 128;
@@ -215,6 +222,8 @@ void passNonZeroCount(uint3 tid: SV_DispatchThreadID) {
     const uint block = tid.x % nb;
     if ((acs[block] & 1) == 0) return;
     const Varblock vb = varblockOf(block, acs[block] >> 1, params.blocksX);
+    const uint hs = shiftOf(params.hshift, c), vs = shiftOf(params.vshift, c);
+    if (((vb.fbx >> hs) << hs) != vb.fbx || ((vb.fby >> vs) << vs) != vb.fby) return;   // not this channel's block
     uint nz = 0;
     for (uint m = 0; m < vb.size; ++m) {
         if (isLlf(vb, m)) continue;
@@ -232,15 +241,29 @@ void acTokenize(uint3 tid: SV_DispatchThreadID) {
     const uint block = tid.x % nb;
     if ((acs[block] & 1) == 0) return;
     const Varblock vb = varblockOf(block, acs[block] >> 1, params.blocksX);
-    const uint blockCtx = blockContextFor(c, vb.strategy);
+    const uint hs = shiftOf(params.hshift, c), vs = shiftOf(params.vshift, c);
+    if (((vb.fbx >> hs) << hs) != vb.fbx || ((vb.fby >> vs) << vs) != vb.fby) return;   // not this channel's block
+    uint blockCtx = blockContextFor(c, vb.strategy);
+    if (params.jpegCtx != 0) {
+        // BlockCtxMap::Context with luma DC thresholds only (order 0: every block is DCT8).
+        const uint numDc = bctxMap[0];
+        const int qy = dcQuant[nb + block];
+        uint dcIdx = 0;
+        for (uint t = 0; t + 1 < numDc; ++t) {
+            if (qy > int(bctxMap[2 + t])) ++dcIdx;
+        }
+        blockCtx = bctxMap[16 + (c < 2 ? (c ^ 1) : 2) * 13 * numDc + dcIdx];
+    }
+    const uint nbc = params.numBlockCtxs;
     const uint pb = params.pass * 3 * nb;
     uint nz = passNonZeros[pb + c * nb + block];
-    // The non-zero count's context from the pass's group-local grid (groups are 32 blocks).
-    const uint gx = vb.fbx % 32, gy = vb.fby % 32;
-    const uint left = gx > 0 ? gridValueAt(block - 1, acs, firstBlock, passNonZeros, pb + c * nb) : 0;
-    const uint top = gy > 0 ? gridValueAt(block - params.blocksX, acs, firstBlock, passNonZeros, pb + c * nb) : 0;
+    // The non-zero count's context from the pass's group-local grid at the channel's
+    // resolution (groups are 32 blocks; a subsampled channel's neighbours are 1 << shift away).
+    const uint gx = (vb.fbx >> hs) % (32u >> hs), gy = (vb.fby >> vs) % (32u >> vs);
+    const uint left = gx > 0 ? gridValueAt(block - (1u << hs), acs, firstBlock, passNonZeros, pb + c * nb) : 0;
+    const uint top = gy > 0 ? gridValueAt(block - (params.blocksX << vs), acs, firstBlock, passNonZeros, pb + c * nb) : 0;
     const uint predicted = predictNonZeros(gx > 0, gy > 0, left, top);
-    const uint nzc = nonZeroBucket(predicted) * kDefaultNumBlockCtxs + blockCtx;
+    const uint nzc = nonZeroBucket(predicted) * nbc + blockCtx;
     nzCtx[pb + c * nb + block] = nzc;
     {
         uint tok, nbits, raw;
@@ -248,7 +271,7 @@ void acTokenize(uint3 tid: SV_DispatchThreadID) {
         uint before;
         InterlockedAdd(ctxHist[(params.ctxBase + nzc) * kHistBins + min(tok, kHistBins - 1)], 1u, before);
     }
-    const uint histoOffset = kDefaultNumBlockCtxs * kNonZeroBuckets + kZeroDensityContextCount * blockCtx;
+    const uint histoOffset = nbc * kNonZeroBuckets + kZeroDensityContextCount * blockCtx;
     const uint ord = orderOffset(kStrategyOrder[vb.strategy]);
     uint prev = nz > vb.size / 16 ? 0 : 1;
     uint k = vb.covered;

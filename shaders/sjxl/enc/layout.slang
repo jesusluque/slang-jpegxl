@@ -15,6 +15,10 @@ struct LayoutParams {
     uint numDcGroups;
     uint packed;    // 1: single section
     uint numPasses; // AC sections: numGroups per pass
+    uint qtBlobRegion;   // AcGlobal = region 1 + the quant table stream's region + the post region
+    uint acPostRegion;
+    uint numBlobRegions;
+    uint pad0;
 };
 
 StructuredBuffer<uint>      blobBits;
@@ -59,7 +63,7 @@ void layoutSections(uint3 tid: SV_DispatchThreadID) {
         dcPartStart[g * 4 + 2] = start + pre + dcT;
         dcPartStart[g * 4 + 3] = start + pre + dcT + mid;
     }
-    place(s++, blobBits[1], pos, start);
+    place(s++, blobBits[1] + blobBits[params.qtBlobRegion] + blobBits[params.acPostRegion], pos, start);
     for (uint g = 0; g < params.numGroups * params.numPasses; ++g) {
         place(s++, acSectionBits[g], pos, start);
     }
@@ -72,7 +76,7 @@ void layoutSections(uint3 tid: SV_DispatchThreadID) {
 [numthreads(1, 1, 1)]
 void blobEmit(uint3 tid: SV_DispatchThreadID) {
     const uint r = tid.x;
-    if (r >= 2 + 2 * params.numDcGroups) {
+    if (r >= params.numBlobRegions) {
         return;
     }
     uint dest;
@@ -80,6 +84,10 @@ void blobEmit(uint3 tid: SV_DispatchThreadID) {
         dest = sectionStart[0];
     } else if (r == 1) {
         dest = sectionStart[1 + params.numDcGroups];
+    } else if (r == params.qtBlobRegion) {
+        dest = sectionStart[1 + params.numDcGroups] + blobBits[1];
+    } else if (r == params.acPostRegion) {
+        dest = sectionStart[1 + params.numDcGroups] + blobBits[1] + blobBits[params.qtBlobRegion];
     } else {
         const uint g = (r - 2) / 2;
         dest = dcPartStart[g * 4 + (((r - 2) % 2 == 0) ? 0 : 2)];
