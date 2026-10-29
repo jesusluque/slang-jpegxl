@@ -21,7 +21,11 @@ module enc_strategy;
 static const uint kThreads = 256;
 static const uint kNumCandidates = 41;
 static const float kCostScale = 256.0f;   // fixed point of the shared accumulators
-static const float kZeroBits = 0.3f;
+// libjxl's EstimateEntropy: cost_delta * sqrt|q| per coefficient (zeros free),
+// zeros_mul * (log2 bits of the non-zero count) per block-channel, a multiplier
+// per transform against ringing, and the distortion weight.
+static const float kCostDelta = 10.833273317067883f;
+static const float kZerosMul = 9.3089059022677905f;
 
 struct StrategyParams {
     uint  blocksX;
@@ -43,6 +47,7 @@ StructuredBuffer<float>    dequant;      // every kind's tables
 StructuredBuffer<uint>     quantizer;    // [3] globalScaleFloat as bits
 RWStructuredBuffer<uint>   acs;          // per block: strategy << 1 | first
 RWStructuredBuffer<uint>   firstBlock;   // per block
+RWStructuredBuffer<float>  sbCost;       // per superblock: the cost of the chosen layout (for the 64-pixel families)
 ConstantBuffer<StrategyParams> params;
 
 groupshared float gY[1024];
@@ -50,8 +55,9 @@ groupshared float gTmp[1024];
 groupshared float gB8[64];
 groupshared float gB16[256];
 groupshared float gB32[1024];
-groupshared uint  gBits[kNumCandidates];
+groupshared uint  gBits[kNumCandidates];   // the entropy term, fixed point
 groupshared uint  gDist[kNumCandidates];
+groupshared uint  gNz[kNumCandidates];
 groupshared float gQf[kNumCandidates];
 groupshared uint  gValid[kNumCandidates];
 groupshared uint  gBest8[16];          // the 8x8 strategy of every block (DCT8 or a special one)
@@ -83,10 +89,47 @@ void candidateGeometry(uint cand, out uint fam, out uint vbx, out uint vby, out 
     vby = vb / nvx;
 }
 
-float bitsOf(float q) {
+float entropyOf(float q) {
     const float a = abs(q);
-    if (a == 0.0f) return kZeroBits;
-    return 3.0f + 2.0f * log2(a);
+    return a == 0.0f ? 0.0f : kCostDelta * sqrt(a);
+}
+
+/// The non-zero count's share: #bits of the count and #bits of that (EstimateEntropy).
+float nzCost(uint nz) {
+    const uint nbits = ceilLog2Nonzero(nz + 1) + 1;
+    return kZerosMul * float(ceilLog2Nonzero(nbits + 17) + nbits);
+}
+
+/// EstimateEntropy's entropy_mul of a strategy, relative to DCT8's 0.8, with the
+/// distance adjustments of the 8x8 search (favour DCT2X2/IDENTITY at high
+/// quality, avoid the other specials at low quality).
+float entropyMul(uint strategy, float distance) {
+    float m = 1.0f;
+    switch (strategy) {
+    case 1: m = 1.0427542510634957f / 0.8f; break;
+    case 2: m = 0.95f / 0.8f; break;
+    case 3: m = 1.08f / 0.8f; break;
+    case 12: case 13: m = 0.85931637428340035f / 0.8f; break;
+    case 14: case 15: case 16: case 17: m = 0.81779489591359944f / 0.8f; break;
+    case 6: case 7: m = 1.21f; break;
+    case 4: m = 1.34f; break;
+    case 10: case 11: m = 1.49f; break;
+    case 5: m = 1.48f; break;
+    case 18: case 19: case 20: m = 2.25f; break;
+    default: m = 1.0f;
+    }
+    if ((strategy == 1 || strategy == 2) && distance < 5.0f) {
+        const float w = (5.0f - distance) / 5.0f;
+        m -= 0.4f * w * w;
+    }
+    if (strategy == 3 || (strategy >= 12 && strategy <= 17)) {
+        if (distance > 4.0f) m += 0.5f * (distance < 12.0f ? 8.0f / (distance - 4.0f) : 1.0f);
+    }
+    return m;
+}
+
+float candidateCost(float ent, float dist, uint nz, uint strategy, float lambda, float distance) {
+    return entropyMul(strategy, distance) * (ent + nzCost(nz)) + lambda * dist;
 }
 
 [shader("compute")]
@@ -100,6 +143,7 @@ void selectStrategies(uint3 gid: SV_GroupID, uint3 gtid: SV_GroupThreadID) {
     const uint nblocks = params.blocksX * params.blocksY;
 
     if (params.enabled == 0) {
+        if (tid == 0) sbCost[gid.x] = 0.0f;
         for (uint i = tid; i < 16; i += kThreads) {
             const uint bx = bx0 + i % 4, by = by0 + i / 4;
             if (bx < params.blocksX && by < params.blocksY) {
@@ -144,6 +188,7 @@ void selectStrategies(uint3 gid: SV_GroupID, uint3 gtid: SV_GroupThreadID) {
         gQf[tid] = cx * cy >= 4 ? mx * mixer + (1.0f - mixer) * mean : mx;
         gBits[tid] = 0;
         gDist[tid] = 0;
+        gNz[tid] = 0;
     }
     GroupMemoryBarrierWithGroupSync();
 
@@ -182,8 +227,9 @@ void selectStrategies(uint3 gid: SV_GroupID, uint3 gtid: SV_GroupThreadID) {
             const float q = abs(val) < threshold ? 0.0f : round(val);
             const float err = val - q;
             uint before;
-            InterlockedAdd(gBits[cand], uint(bitsOf(q) * kCostScale), before);
+            InterlockedAdd(gBits[cand], uint(entropyOf(q) * kCostScale), before);
             InterlockedAdd(gDist[cand], uint(min(err * err, 64.0f) * kCostScale), before);
+            if (q != 0.0f) InterlockedAdd(gNz[cand], 1u, before);
         }
         GroupMemoryBarrierWithGroupSync();
     }
@@ -193,7 +239,9 @@ void selectStrategies(uint3 gid: SV_GroupID, uint3 gtid: SV_GroupThreadID) {
     if (tid < 16) {
         const uint b = tid;
         gBest8[b] = 0;
-        gBest8Cost[b] = gValid[25 + b] != 0 ? (float(gBits[25 + b]) + params.lambda * float(gDist[25 + b])) / kCostScale : 0.0f;
+        gBest8Cost[b] = gValid[25 + b] != 0
+                            ? candidateCost(float(gBits[25 + b]) / kCostScale, float(gDist[25 + b]) / kCostScale, gNz[25 + b], 0, params.lambda, params.distance)
+                            : 0.0f;
         if (params.specials != 0 && gValid[25 + b] != 0) {
             const uint kSpecials[9] = {1, 2, 3, 12, 13, 14, 15, 16, 17};
             const uint x0 = (b % 4) * 8, y0 = (b / 4) * 8;
@@ -205,16 +253,18 @@ void selectStrategies(uint3 gid: SV_GroupID, uint3 gtid: SV_GroupThreadID) {
                 float coef[64];
                 forwardSpecial(strategy, pix, coef);
                 const uint tableBase = kTableBase[kStrategyToTable[strategy]];
-                float bits = 0.0f, dist = 0.0f;
+                float ent = 0.0f, dist = 0.0f;
+                uint nz = 0;
                 for (uint m = 1; m < 64; ++m) {
                     const float val = coef[m] * quantMul / dequant[tableBase + 1 * 64 + m];
                     const float threshold = ((m / 8) < 4 && (m % 8) < 4) ? 0.56f : 0.62f;
                     const float q = abs(val) < threshold ? 0.0f : round(val);
                     const float err = val - q;
-                    bits += bitsOf(q);
+                    ent += entropyOf(q);
                     dist += min(err * err, 64.0f);
+                    if (q != 0.0f) ++nz;
                 }
-                const float cost = bits + params.lambda * dist;
+                const float cost = candidateCost(ent, dist, nz, strategy, params.lambda, params.distance);
                 if (cost < gBest8Cost[b]) {
                     gBest8Cost[b] = cost;
                     gBest8[b] = strategy;
@@ -230,7 +280,11 @@ void selectStrategies(uint3 gid: SV_GroupID, uint3 gtid: SV_GroupThreadID) {
     const float kInvalid = 1.0e30f;
     float cost[kNumCandidates];
     for (uint c = 0; c < kNumCandidates; ++c) {
-        cost[c] = gValid[c] != 0 ? (float(gBits[c]) + params.lambda * float(gDist[c])) / kCostScale : (c >= 25 ? 0.0f : kInvalid);
+        uint fam, vbx, vby, nx, ny;
+        candidateGeometry(c, fam, vbx, vby, nx, ny);
+        cost[c] = gValid[c] != 0 ? candidateCost(float(gBits[c]) / kCostScale, float(gDist[c]) / kCostScale, gNz[c], kFamStrategy[fam],
+                                                 params.lambda, params.distance)
+                                 : (c >= 25 ? 0.0f : kInvalid);
     }
     for (uint b = 0; b < 16; ++b) {
         if (gValid[25 + b] != 0) cost[25 + b] = gBest8Cost[b];   // the block's best 8x8 transform
@@ -260,6 +314,7 @@ void selectStrategies(uint3 gid: SV_GroupID, uint3 gtid: SV_GroupThreadID) {
     if (c32 < best) { whole = 1; best = c32; }
     if (cLR < best) { whole = 2; best = cLR; }
     if (cTB < best) { whole = 3; best = cTB; }
+    sbCost[gid.x] = best;
 
     // Write the layout: a varblock of strategy s with first block (fbx, fby).
     const uint strategies[4] = {0, 4, 6, 7};

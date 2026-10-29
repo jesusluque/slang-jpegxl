@@ -104,7 +104,7 @@ Modules are static libraries `sjxl_<name>` aliased `sjxl::<name>`
 | codestream | CPU-side syntax only: `BitWriter`, U32/U64/F16 field coders, SizeHeader, ImageMetadata, FrameHeader, LoopFilter, TOC (`Headers.h`); `Tables.h`: quantizer params from a distance, DCT8 dequant weights, natural order, computed from libjxl formulas |
 | image | file I/O only: PNG/PPM/JPEG via stb (`readRgb8` 8-bit RGB, `readImage8` keeps alpha, `readImage` keeps alpha and 16-bit depth; `Rgb8` has `channels` 3/4 and `bitDepth` 8/16; `writePng` writes 16-bit PNGs itself; `readFile`, `writeFile`) |
 | metrics | `metrics::compare`: PSNR, largest difference and where, measured by `shaders/sjxl/metrics/compare.slang`; what tests and `sjxl compare` use |
-| encoder | `enc::Encoder::encode(Rgb8, Options{lossless, distance, adaptiveQuant, chromaFromLuma, loopFilter, acClusters})`: lossless → `encodeLossless` (modular: rctYCoCg → modHist → cluster → buildModularGlobalBlob (tree, histograms, RCT header, the stream when the image fits a group) → modGroupSections (ANS per group)); lossy → the VarDCT pipeline (`shaders/sjxl/enc/`): xyb → aq (quant field) → gaborish (inverse) → cfl (dct, per-tile least squares) → quantize (AdjustQuantBlockAC, dead zones) → strategy (transform selection per 32×32 superblock) → transform (adjustQuantField, dctRows/dctCols for any varblock, dcFromLlf, acTokenize) → cfl → quantize (per varblock) → items (DC/AcMetadata: modes 0 histogram, 1 count, 2 emit) → cluster → codes (ANS histograms + context map for AC, Huffman + headers per DC group) → ac_sections (ANS per group) → prefix sums → layout → emit |
+| encoder | `enc::Encoder::encode(Rgb8, Options{lossless, distance, adaptiveQuant, chromaFromLuma, loopFilter, acClusters})`: lossless → `encodeLossless` (modular: rctYCoCg → modHist → cluster → buildModularGlobalBlob (tree, histograms, RCT header, the stream when the image fits a group) → modGroupSections (ANS per group)); lossy → the VarDCT pipeline (`shaders/sjxl/enc/`): xyb → aq (quant field) → gaborish (inverse) → cfl (dct, per-tile least squares) → quantize (AdjustQuantBlockAC, dead zones) → strategy + large (transform selection per 32×32 superblock, then the 64-pixel families per 64×64 region) → transform (adjustQuantField, dctRows/dctCols for any varblock, dcFromLlf, acTokenize) → cfl → quantize (per varblock) → items (DC/AcMetadata: modes 0 histogram, 1 count, 2 emit) → cluster → codes (ANS histograms + context map for AC, Huffman + headers per DC group) → ac_sections (ANS per group) → prefix sums → layout → emit |
 | decoder | `dec::Decoder::decode(bytes)`: `codestream::parse` on the CPU, then `shaders/sjxl/dec/`: sections (one thread per section: globals, DC groups, AC groups; libraries entropy/modular/frame/modframe .slangh over one `arena` buffer) → VarDCT: tables → dc_finalize → transforms; Modular: finalise (inverse transforms) → modular_out (channels to planes) → filters → output |
 | decoder (M2) | `dec::Decoder`: the GPU decode pipeline |
 
@@ -117,8 +117,10 @@ pixel → adaptive quant field (libjxl's masking model per 4×4 cell and block,
 `aq.slang`; the quantizer's global scale is 0.39/distance as libjxl's hare
 tier) → inverse Gaborish → transform selection per 32×32 superblock
 (`strategy.slang`: DCT8 and the 8×8 specials IDENTITY/DCT2x2/DCT4x4/DCT4x8/
-DCT8x4/AFV, 8×16, 16×8, 16×16, 16×32, 32×16, 32×32 by a rate-distortion
-proxy, λ = 8) → separable forward DCT of every varblock
+DCT8x4/AFV, 8×16, 16×8, 16×16, 16×32, 32×16, 32×32; `large.slang`: 64×64,
+64×32, 32×64 per 64×64 region through the rowPass buffer; libjxl's
+EstimateEntropy model, sqrt|q| per non-zero and entropy_mul per transform,
+plus λ = 128 times the squared rounding error) → separable forward DCT of every varblock
 (`transform.slang`, libjxl's coefficient memory; `common/transform_basis.slangh`
 holds the bases and strategy tables) → DC from the lowest frequencies →
 chroma-from-luma per 64 px tile (least squares on the scaled coefficients) →

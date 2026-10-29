@@ -14,10 +14,11 @@ Gaborish and EPF, noise, upsampling, patches, progressive passes and DC frames,
 permuted TOCs, extra channels with alpha, 16-bit output, ICC-tagged images,
 JPEG recompression and animation with blending. Pixels match within one 8-bit
 step (lossless bit-exact); the conformance tests in `tests/decoder` are the
-record. The encoder is VarDCT with transforms from 8×8 to 32×32 chosen per
-superblock, libjxl's adaptive quant field, chroma-from-luma, Gaborish + EPF,
-and ANS with clustered coefficient contexts for the AC groups: at the file
-size `cjxl -e 5` produces it scores one to three SSIMULACRA2 points below it. `--lossless` writes a Modular frame
+record. The encoder is VarDCT with transforms from 8×8 to 64×64 chosen by
+libjxl's entropy model, libjxl's adaptive quant field, chroma-from-luma,
+Gaborish + EPF, and ANS with clustered coefficient contexts for the AC
+groups: at the file size `cjxl -e 5` produces it scores within about one
+SSIMULACRA2 point of it on 4K photos (−0.4 to −1.3). `--lossless` writes a Modular frame
 (YCoCg, Gradient predictor, fixed tree, ANS; RGB or RGBA, 8 or 16 bits)
 8–26 % larger than `cjxl -d 0`. M3 continues with DC coding, the strategy
 and quant-field heuristics, and better lossless trees.

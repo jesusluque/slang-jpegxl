@@ -82,6 +82,10 @@ Result<std::unique_ptr<Encoder>> Encoder::create(std::shared_ptr<gpu::ShaderLibr
     SJXL_ASSIGN(enc->tables_, gpu::ComputeKernel::create(lib, "sjxl/dec/tables", "computeDequantTable"));
     SJXL_ASSIGN(enc->buildOrders_, gpu::ComputeKernel::create(lib, "sjxl/enc/transform", "buildOrders"));
     SJXL_ASSIGN(enc->selectStrategies_, gpu::ComputeKernel::create(lib, "sjxl/enc/strategy", "selectStrategies"));
+    SJXL_ASSIGN(enc->largeQf_, gpu::ComputeKernel::create(lib, "sjxl/enc/large", "largeQf"));
+    SJXL_ASSIGN(enc->largeRows_, gpu::ComputeKernel::create(lib, "sjxl/enc/large", "largeRows"));
+    SJXL_ASSIGN(enc->largeCols_, gpu::ComputeKernel::create(lib, "sjxl/enc/large", "largeCols"));
+    SJXL_ASSIGN(enc->mergeLarge_, gpu::ComputeKernel::create(lib, "sjxl/enc/large", "mergeLarge"));
     SJXL_ASSIGN(enc->adjustQuantField_, gpu::ComputeKernel::create(lib, "sjxl/enc/transform", "adjustQuantField"));
     SJXL_ASSIGN(enc->dctRows_, gpu::ComputeKernel::create(lib, "sjxl/enc/transform", "dctRows"));
     SJXL_ASSIGN(enc->dctCols_, gpu::ComputeKernel::create(lib, "sjxl/enc/transform", "dctCols"));
@@ -297,6 +301,15 @@ Result<std::vector<uint8_t>> Encoder::encode(const image::Rgb8& image, const Opt
     // with their context histograms.
     const uint32_t superblocksX = (dim.xsizeBlocks + 3) / 4;
     const uint32_t superblocksY = (dim.ysizeBlocks + 3) / 4;
+    const uint32_t regionsX = (dim.xsizeBlocks + 7) / 8;
+    const uint32_t regionsY = (dim.ysizeBlocks + 7) / 8;
+    SJXL_ASSIGN(auto sbCost, gpu::Buffer::ofType<float>(dev, uint64_t{superblocksX} * superblocksY, "enc.sbCost"));
+    SJXL_ASSIGN(auto candQf, gpu::Buffer::ofType<float>(dev, uint64_t{regionsX} * regionsY * 5, "enc.candQf"));
+    SJXL_ASSIGN(auto candBits, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{regionsX} * regionsY * 5, "enc.candBits"));
+    SJXL_ASSIGN(auto candDist, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{regionsX} * regionsY * 5, "enc.candDist"));
+    SJXL_ASSIGN(auto candNz, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{regionsX} * regionsY * 5, "enc.candNz"));
+    uint32_t familyMask = 0x3FF;
+    if (const std::string m = platform::env("SJXL_ACS_MASK"); !m.empty()) familyMask = static_cast<uint32_t>(std::strtoul(m.c_str(), nullptr, 0));
     selectStrategies_.dispatchGroups(batch, {superblocksX * superblocksY, 1, 1}, [&](rhi::ShaderCursor c) {
         c["xyb"].setBinding(planes.rhi());
         c["rawQf"].setBinding(rawQf.rhi());
@@ -304,6 +317,7 @@ Result<std::vector<uint8_t>> Encoder::encode(const image::Rgb8& image, const Opt
         c["quantizer"].setBinding(quantizer.rhi());
         c["acs"].setBinding(acs.rhi());
         c["firstBlock"].setBinding(firstBlock.rhi());
+        c["sbCost"].setBinding(sbCost.rhi());
         c["params"]["blocksX"].setData(dim.xsizeBlocks);
         c["params"]["blocksY"].setData(dim.ysizeBlocks);
         c["params"]["paddedWidth"].setData(dim.xsizePadded);
@@ -312,11 +326,41 @@ Result<std::vector<uint8_t>> Encoder::encode(const image::Rgb8& image, const Opt
         c["params"]["lambda"].setData(options.acsLambda);
         c["params"]["distance"].setData(options.distance);
         c["params"]["enabled"].setData(uint32_t{options.acStrategy ? 1u : 0u});
-        uint32_t familyMask = 0x7F;
-        if (const std::string m = platform::env("SJXL_ACS_MASK"); !m.empty()) familyMask = static_cast<uint32_t>(std::strtoul(m.c_str(), nullptr, 0));
-        c["params"]["familyMask"].setData(familyMask);
+        c["params"]["familyMask"].setData(familyMask & 0x7Fu);
         c["params"]["specials"].setData(uint32_t{options.acsSpecials ? 1u : 0u});
     });
+    // The 64-pixel families against the superblocks' layouts.
+    if (options.acStrategy && (familyMask >> 7) != 0) {
+        const auto bindLarge = [&](rhi::ShaderCursor c, uint32_t family) {
+            c["xyb"].setBinding(planes.rhi());
+            c["rawQf"].setBinding(rawQf.rhi());
+            c["dequant"].setBinding(dequantAll_.rhi());
+            c["quantizer"].setBinding(quantizer.rhi());
+            c["sbCost"].setBinding(sbCost.rhi());
+            c["rowPass"].setBinding(rowPass.rhi());
+            c["candQf"].setBinding(candQf.rhi());
+            c["candBits"].setBinding(candBits.rhi());
+            c["candDist"].setBinding(candDist.rhi());
+            c["candNz"].setBinding(candNz.rhi());
+            c["acs"].setBinding(acs.rhi());
+            c["firstBlock"].setBinding(firstBlock.rhi());
+            c["params"]["blocksX"].setData(dim.xsizeBlocks);
+            c["params"]["blocksY"].setData(dim.ysizeBlocks);
+            c["params"]["paddedWidth"].setData(dim.xsizePadded);
+            c["params"]["paddedHeight"].setData(dim.ysizePadded);
+            c["params"]["regionsX"].setData(regionsX);
+            c["params"]["family"].setData(family);
+            c["params"]["lambda"].setData(options.acsLambda);
+            c["params"]["distance"].setData(options.distance);
+            c["params"]["largeMask"].setData(familyMask >> 7);
+        };
+        largeQf_.dispatch(batch, {regionsX * regionsY * 5, 1, 1}, [&](rhi::ShaderCursor c) { bindLarge(c, 0); });
+        for (uint32_t family = 0; family < 3; ++family) {
+            largeRows_.dispatch(batch, {static_cast<uint32_t>(planePixels), 1, 1}, [&](rhi::ShaderCursor c) { bindLarge(c, family); });
+            largeCols_.dispatch(batch, {static_cast<uint32_t>(planePixels), 1, 1}, [&](rhi::ShaderCursor c) { bindLarge(c, family); });
+        }
+        mergeLarge_.dispatch(batch, {regionsX * regionsY, 1, 1}, [&](rhi::ShaderCursor c) { bindLarge(c, 0); });
+    }
     const auto bindTransform = [&](rhi::ShaderCursor c) {
         c["xyb"].setBinding(planes.rhi());
         c["acs"].setBinding(acs.rhi());

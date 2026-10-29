@@ -56,10 +56,10 @@ per subsystem or milestone, appended to as the work goes. Dates are absolute.
   libjxl chooses it, EPF sharpness 4, CfL per tile, adaptive quant field,
   AdjustQuantBlockAC; ANS for the AC groups with clustered coefficient
   contexts; lossless Modular encoding of RGB and RGBA at 8 and 16 bits;
-  transform selection DCT8..32x32 per superblock.) Next: DC and AcMetadata
-  coding (ANS, better trees), the quant field and strategy heuristics against
-  cjxl's maps, a learned or WP-based tree and transforms for lossless, alpha
-  and 16-bit in the lossy path.
+  transform selection DCT8..64x64 with libjxl's entropy model and the 8x8
+  specials; PNG colour chunks.) Next: DC and AcMetadata coding (ANS, better
+  trees), three-channel strategy costs, a learned or WP-based tree and
+  transforms for lossless, alpha and 16-bit in the lossy path.
 - **M4 decoder completeness**: splines, grey JPEG transcodes, loop filters
   on YCbCr frames, extra channel blending in patches, writing the ICC
   profile into the output file, float samples. (16-bit output, animation
@@ -344,6 +344,49 @@ cjxl at the same distance. The cost model is the obvious lever left (it
 prefers the rectangular shapes and rarely picks 16×16 or 32×32 on the small
 images; cjxl's maps use them in smooth areas), together with checking our
 quant field and strategy maps against cjxl's on the same image.
+
+## The 64-pixel families and libjxl's entropy model (2026-10-29)
+
+cjxl's map of berlin_central at d = 3 is 38 % DCT64X64, and our selection
+stopped at 32×32 with a cost model that charged 0.3 bits per zero
+coefficient, which no coder pays (coefficients after the last non-zero are
+not coded at all) and which punished exactly the large smooth blocks. Two
+changes:
+
+- **The 64-pixel families** (`enc/large.slang`): DCT64X64, two DCT64X32 (32
+  wide, 64 tall) and two DCT32X64 per 64×64 region. Too large for one
+  thread-group's memory, they run through the plane-sized rowPass buffer:
+  `largeQf` per candidate (validity, AdjustQuantField), `largeRows` and
+  `largeCols` per pixel (the separable DCT, quantisation with the kind's
+  table, the cost by atomics into per-candidate accumulators), `mergeLarge`
+  per region against the sum of the four superblocks' chosen costs, which
+  `selectStrategies` now exports (`sbCost`); a win rewrites the region's map.
+  The rest of the pipeline already handled any covered size (the oracle run
+  with cjxl's 4K map decoded correctly before this).
+- **libjxl's `EstimateEntropy` as the proxy**: `cost_delta · sqrt|q|` per
+  non-zero coefficient and nothing for zeros, `zeros_mul · (bits of the
+  non-zero count and bits of that)` per block, the per-transform
+  `entropy_mul` (DCT8 1, 16×8 1.21, 16×16 1.34, 16×32 1.49, 32×32 1.48, the
+  64-pixel ones 2.25, DCT4X4 1.35, DCT2X2 1.19, IDENTITY 1.30, DCT4X8 1.07,
+  AFV 1.02, with the distance adjustments that favour DCT2X2/IDENTITY at
+  high quality and avoid the other specials above distance 4), plus λ times
+  the squared rounding error in quant steps (libjxl uses an L8 norm of the
+  pixel-domain error under its masking field; the L2 in coefficient space is
+  the cheap stand-in). λ re-tuned at matched size: 4K photos λ = 128 mean Δ
+  −0.78 (λ = 256 −1.0), small images λ = 128 −0.43 (λ = 256 −0.96).
+
+| image | d | cjxl bytes / SSIM2 | before (32×32 cap, bits proxy) | now (λ = 128) |
+|---|---|---|---|---|
+| berlin_central | 1 | 1 217 920 / 84.61 | 83.07 (−1.54) | 83.84 (−0.77) |
+| berlin_central | 3 | 558 710 / 66.69 | 63.54 (−3.14) | 66.02 (−0.67) |
+| sveti_stefan | 1 | 1 885 027 / 84.46 | 82.53 (−1.94) | 83.18 (−1.28) |
+| sveti_stefan | 3 | 751 307 / 56.71 | 54.15 (−2.55) | 56.32 (−0.39) |
+
+Our map of berlin_central at d = 3 now has 37 % of its blocks in 64×64
+varblocks. The small images: berlin_200 −1.56 / −1.67, sveti_crop +0.35 /
++1.87, sveti_stefan_320 −0.11 / −1.43 at d = 1 / 3. The oracle gap (cjxl's
+maps in our coder: +7 % bytes at its quality) is what the DC and AcMetadata
+streams and the three-channel cost (we score Y only) still leave.
 
 ## Colour chunks, the 8x8 special transforms and the oracle maps (2026-10-29)
 
