@@ -17,8 +17,10 @@ step (lossless bit-exact); the conformance tests in `tests/decoder` are the
 record. The encoder is VarDCT with DCT8, libjxl's adaptive quant field,
 chroma-from-luma, Gaborish + EPF, and ANS with clustered coefficient
 contexts for the AC groups: at the file size `cjxl -e 5` produces it scores
-within about one SSIMULACRA2 point of it (M3 in progress: larger transforms,
-DC coding, lossless). `docs/decisions.md`
+within about one SSIMULACRA2 point of it. `--lossless` writes a Modular frame
+(YCoCg, Gradient predictor, fixed tree, ANS) 8–13 % larger than `cjxl -d 0`.
+M3 continues with alpha and 16-bit input, larger transforms and DC coding.
+`docs/decisions.md`
 holds the design, what each milestone measured and the roadmap; `CLAUDE.md`
 the short version a build needs.
 

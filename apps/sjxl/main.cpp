@@ -23,7 +23,7 @@ int usage() {
     std::fprintf(stderr,
                  "usage:\n"
                  "  sjxl info [in.jxl]                          describe the GPU device, or a file's headers and frames\n"
-                 "  sjxl encode in.png out.jxl [--distance d] [--no-aq] [--no-cfl] [--no-filters] [--clusters n]\n"
+                 "  sjxl encode in.png out.jxl [--distance d] [--lossless] [--no-aq] [--no-cfl] [--no-filters] [--clusters n]\n"
                  "                                              lossy VarDCT (default distance 1.0)\n"
                  "  sjxl decode in.jxl out.png                  any frame type; animations write out_000.png, out_001.png, ...\n"
                  "  sjxl compare a.png b.png                    PSNR and largest difference, measured on the GPU\n"
@@ -68,6 +68,11 @@ int info(int argc, char** argv) {
                         h.frameType == 2 ? (h.saveBeforeColorTransform ? ", saved before the colour transform" : ", saved after the colour transform")
                                          : h.frameType == 1 ? ", DC frame" : (h.flags & sjxl::codestream::FrameHeader::kUseDcFrame) ? ", DC from a DC frame" : "",
                         h.loopFilter.gab ? 1 : 0, h.loopFilter.epfIters, h.isLast ? ", last" : "");
+            if (f.sections.size() > 1 && f.sections.size() <= 64) {
+                std::printf("    section bytes:");
+                for (const auto& sct : f.sections) std::printf(" %u", sct.byteSize);
+                std::printf("\n");
+            }
             if (h.duration != 0 || h.customSizeOrOrigin || h.blending.mode != 0) {
                 const char* modes[5] = {"replace", "add", "blend", "alpha-weighted add", "multiply"};
                 std::printf("          duration %u ticks, origin (%d,%d), blend %s from slot %u%s\n", h.duration, h.x0, h.y0,
@@ -99,6 +104,8 @@ int encode(int argc, char** argv) {
             options.chromaFromLuma = false;
         } else if (arg == "--no-filters") {
             options.loopFilter = false;
+        } else if (arg == "--lossless") {
+            options.lossless = true;
         } else if (arg == "--clusters" && i + 1 < argc) {
             options.acClusters = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 10));
         } else {

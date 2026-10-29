@@ -20,6 +20,9 @@
 namespace sjxl::enc {
 
 struct Options {
+    /// Lossless: a Modular frame (YCoCg RCT, Gradient predictor, fixed MA tree,
+    /// ANS); the distance and the VarDCT options are ignored.
+    bool lossless = false;
     /// Butteraugli distance: smaller is higher quality (1.0 ~ libjxl quality 90).
     float distance = 1.0f;
     /// Per-block quant field from libjxl's masking model; off: one value per frame.
@@ -54,17 +57,20 @@ public:
 
 private:
     Encoder() = default;
+    [[nodiscard]] Result<std::vector<uint8_t>> encodeLossless(const image::Rgb8& image, const Options& options);
 
     std::shared_ptr<gpu::ShaderLibrary> library_;
     gpu::Device*                        device_ = nullptr;
     gpu::ComputeKernel                  rgbToXyb_, aqDiff_, aqMap_, aqRawField_;
     gpu::ComputeKernel                  gaborishInverse_, dct_, cflTile_, quantize_;
     gpu::ComputeKernel                  acItems_, dcItems_, metaItems_, clusterContexts_, acSections_;
+    gpu::ComputeKernel                  rctYCoCg_, modHist_, modGroupSections_, modularGlobalBlob_;
     gpu::ComputeKernel                  dcGroupBlobs_, globalBlobs_, layout_, blobEmit_;
     gpu::PrefixSum                      prefixSum_;
     gpu::Buffer                         dequant_;   // 3 * 64 floats
     gpu::Buffer                         order_;     // 64 uints
     gpu::Buffer                         dummy_;     // bound where a pass has no body yet
+    gpu::Buffer                         dummyInt_;  // an int buffer for the same purpose
     Stats                               stats_;
 };
 

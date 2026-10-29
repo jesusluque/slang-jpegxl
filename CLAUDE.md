@@ -18,6 +18,7 @@ build/macos-arm64-debug/bin/sjxl_gpu_tests "prefix sum*"    # one Catch2 case by
 cmake --build build/macos-arm64-debug --target sjxl_gpu_tests   # one binary
 build/macos-arm64-debug/bin/sjxl info [in.jxl]              # device info, or a file's headers and frame list
 build/macos-arm64-debug/bin/sjxl encode in.png out.jxl --distance 1.0 [--no-aq] [--no-cfl] [--no-filters] [--clusters n]
+build/macos-arm64-debug/bin/sjxl encode in.png out.jxl --lossless   # Modular frame, bit-exact
 build/macos-arm64-debug/bin/sjxl decode in.jxl out.png                  # every stage on the GPU; animations write out_000.png, ...
 build/macos-arm64-debug/bin/sjxl compare a.png b.png                    # PSNR + largest diff, on the GPU
 build/macos-arm64-debug/bin/sjxl pixel a.png x y ; sjxl convert in.png out.png   # one pixel; re-save as RGB8
@@ -103,7 +104,7 @@ Modules are static libraries `sjxl_<name>` aliased `sjxl::<name>`
 | codestream | CPU-side syntax only: `BitWriter`, U32/U64/F16 field coders, SizeHeader, ImageMetadata, FrameHeader, LoopFilter, TOC (`Headers.h`); `Tables.h`: quantizer params from a distance, DCT8 dequant weights, natural order, computed from libjxl formulas |
 | image | file I/O only: PNG/PPM/JPEG via stb (`readRgb8` 8-bit RGB, `readImage8` keeps alpha, `readImage` keeps alpha and 16-bit depth; `Rgb8` has `channels` 3/4 and `bitDepth` 8/16; `writePng` writes 16-bit PNGs itself; `readFile`, `writeFile`) |
 | metrics | `metrics::compare`: PSNR, largest difference and where, measured by `shaders/sjxl/metrics/compare.slang`; what tests and `sjxl compare` use |
-| encoder | `enc::Encoder::encode(Rgb8, Options{distance, adaptiveQuant, chromaFromLuma, loopFilter})`: the GPU encode pipeline (`shaders/sjxl/enc/`): xyb → aq (quant field) → gaborish (inverse) → cfl (dct, per-tile least squares) → quantize (AdjustQuantBlockAC, dead zones) → items (mode 0 context histograms; DC/AcMetadata modes 1 count, 2 emit) → cluster → codes (ANS histograms + context map for AC, Huffman + headers per DC group) → ac_sections (ANS per group) → prefix sums → layout → emit |
+| encoder | `enc::Encoder::encode(Rgb8, Options{lossless, distance, adaptiveQuant, chromaFromLuma, loopFilter, acClusters})`: lossless → `encodeLossless` (modular: rctYCoCg → modHist → cluster → buildModularGlobalBlob (tree, histograms, RCT header, the stream when the image fits a group) → modGroupSections (ANS per group)); lossy → the VarDCT pipeline (`shaders/sjxl/enc/`): xyb → aq (quant field) → gaborish (inverse) → cfl (dct, per-tile least squares) → quantize (AdjustQuantBlockAC, dead zones) → items (mode 0 context histograms; DC/AcMetadata modes 1 count, 2 emit) → cluster → codes (ANS histograms + context map for AC, Huffman + headers per DC group) → ac_sections (ANS per group) → prefix sums → layout → emit |
 | decoder | `dec::Decoder::decode(bytes)`: `codestream::parse` on the CPU, then `shaders/sjxl/dec/`: sections (one thread per section: globals, DC groups, AC groups; libraries entropy/modular/frame/modframe .slangh over one `arena` buffer) → VarDCT: tables → dc_finalize → transforms; Modular: finalise (inverse transforms) → modular_out (channels to planes) → filters → output |
 | decoder (M2) | `dec::Decoder`: the GPU decode pipeline |
 
@@ -131,6 +132,14 @@ appends the body.
 `sjxl encode --no-aq --no-cfl --no-filters --clusters n` switch the stages off
 or limit the clusters for A/B runs; `SJXL_DEBUG=1` prints the quantizer,
 cluster count, blob bits and section bytes.
+
+Lossless (`--lossless`): a Modular frame, YCoCg RCT, Gradient predictor and
+libjxl's fixed gradient tree (built on the host from the pixel count, uploaded),
+residual tokens and contexts per pixel in parallel (`enc/modular.slangh`
+`modToken`, the decoder's group-local edge rules), clustered ANS histograms,
+the global section by one thread (`codes.slang buildModularGlobalBlob`; it
+carries the whole image when it fits a 256 px group), one thread per group
+otherwise; DC groups and AcGlobal are empty sections.
 
 Decoder stages: CPU parses signature/headers/TOC into a section table →
 one-thread kernels decode DcGlobal and AcGlobal (quantizer, block context

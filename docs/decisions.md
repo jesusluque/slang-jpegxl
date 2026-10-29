@@ -55,8 +55,9 @@ per subsystem or milestone, appended to as the work goes. Dates are absolute.
 - **M3 encoder quality**: (done 2026-10-29: inverse Gaborish + LoopFilter as
   libjxl chooses it, EPF sharpness 4, CfL per tile, adaptive quant field,
   AdjustQuantBlockAC; ANS for the AC groups with clustered coefficient
-  contexts.) Next: DCT16/32 strategy search, DC and AcMetadata coding (ANS,
-  better trees), Modular lossless encoding, alpha and 16-bit input.
+  contexts; lossless Modular encoding.) Next: alpha and 16-bit input (modular
+  extra channels and bit depth), DCT16/32 strategy search, DC and AcMetadata
+  coding (ANS, better trees), a learned or WP-based tree for lossless.
 - **M4 decoder completeness**: splines, grey JPEG transcodes, loop filters
   on YCbCr frames, extra channel blending in patches, writing the ICC
   profile into the output file, float samples. (16-bit output, animation
@@ -268,6 +269,61 @@ stream, and the larger transforms cjxl uses in smooth areas. Encode time
 rose from 17 to 44 ms (Debug build) on 320×180: the ANS chain is serial per
 group and runs twice; a 2-lane interleave or the count pass reused for the
 placement are M5 options.
+
+## Lossless Modular encoder (2026-10-29)
+
+`sjxl encode --lossless` writes a Modular frame: ImageMetadata not XYB
+(8-bit sRGB), FrameHeader encoding Modular with no colour transform, 256 px
+groups, LoopFilter off. The frame's global stream applies the YCoCg RCT
+(type 6) over the three channels; every pixel is predicted with the Gradient
+predictor and coded in the context of libjxl's `kGradientFixedDC` fixed tree
+(a balanced binary search over the gradient property W + N − NW with 33
+cutoffs, shallower for small images), with ANS histograms clustered as the AC
+ones. Everything numeric is a kernel (`enc/modular.slang`,
+`codes.slang buildModularGlobalBlob`):
+
+- `rctYCoCg` per pixel (enc_rct.cc `FwdRctRow<6>`): Y = tmp + (Cg >> 1), Co =
+  R − B, Cg = G − tmp with tmp = B + (Co >> 1).
+- `modToken` (`enc/modular.slangh`): a pixel's context and PackSigned
+  residual, with the decoder's edge rules inside the rectangle it is coded
+  in (a group, or the whole image when it fits a group): at the left edge the
+  "left" is the pixel above, at the top the "top" is the left. Lossless means
+  the predictor sees the original neighbours, so the residuals and contexts
+  of every pixel are independent: `modHist` counts them in parallel with
+  atomics, and only the ANS chain is serial.
+- The host builds the tree (`fixedGradientTree`, a port of `MakeFixedTree`:
+  the shape depends on the pixel count and bit depth, not on the pixels),
+  uploads it, and `buildModularGlobalBlob` serialises it as `DecodeTree`
+  reads it (breadth-first node order, one prefix code over the six token
+  contexts), then the clustered histogram set (`writeHistogramSet`, now
+  shared with the AC path: the context map is written with plain bits when
+  there are at most 8 clusters over at most 64 contexts, else as the MTF +
+  ANS stream), then the global GroupHeader with the RCT, and, when the image
+  fits a group, the whole image's tokens as one ANS stream placed backwards
+  inside the blob.
+- Larger images: each AC group is one thread (`modGroupSections`) coding its
+  rectangle of the three channels after a 4-bit GroupHeader (global tree,
+  default weighted header, no transforms), measured then placed as the AC
+  sections are. The DC groups and AcGlobal are empty sections; the layout is
+  host bookkeeping from the bit counts.
+
+Results (bit-exact through `djxl` and through our decoder; `cjxl -d 0 -e 5`
+for comparison, which learns a tree per image and uses the weighted predictor):
+
+| image | ours | cjxl -d 0 -e 5 |
+|---|---|---|
+| berlin_7x5 | 109 B | 108 B |
+| sveti_64 (64×36) | 3988 B | 3707 B |
+| berlin_200 (200×112) | 30014 B | 27684 B |
+| sveti_crop_257x129 | 46141 B | 40975 B |
+| sveti_stefan_320 | 84703 B | 78385 B |
+
+8–13 % larger than cjxl. Known headroom, in order: a tree with more
+properties (cjxl learns one from the image), the weighted predictor (needs a
+serial per-group pass for the residuals, as the error state propagates),
+Squeeze/palette choices for flat or few-colour images, and the LZ77 RLE cjxl
+uses at this effort. Encode time is dominated by the serial ANS chain (270 ms
+Debug for 320×180 as the two groups' threads each walk 29k tokens twice).
 
 ## M2 decoder, VarDCT (2026-10-29)
 

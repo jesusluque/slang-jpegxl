@@ -1,0 +1,47 @@
+// Copyright (c) 2026 jesus luque.
+//
+// The lossless Modular stream's tokens: a channel's pixels in raster order,
+// predicted with the Gradient predictor from the already coded neighbours and
+// put in the context the frame's fixed MA tree gives them (libjxl's
+// kGradientFixedDC shape: a binary search over the gradient property
+// W + N - NW). Edge rules are the decoder's (modular.slangh): at a group's
+// left edge the "left" is the pixel above, at the top the "top" is the left.
+// The tree nodes are 8 words: property (-1 for a leaf), split value, left and
+// right child, leaf id, predictor, offset, pad.
+#pragma once
+
+#include "sjxl/common/hybrid_uint.slangh"
+
+static const uint kModTreeWords = 8;
+static const uint kModPropGradient = 9;
+
+int modClampedGradient(int n, int w, int l) {
+    const int m = min(n, w);
+    const int M = max(n, w);
+    const int grad = int(uint(n) + uint(w) - uint(l));
+    const int gradClampM = (l < m) ? M : grad;
+    return (l > M) ? m : gradClampM;
+}
+
+/// Pixel (lx, ly) of the rectangle at (x0, y0) of channel c: its context (leaf
+/// id) and the PackSigned residual.
+void modToken(StructuredBuffer<int> planes, uint width, uint height, uint x0, uint y0, uint c, uint lx, uint ly,
+              StructuredBuffer<uint> tree, out uint ctx, out uint value) {
+    const uint plane = c * width * height;
+    const uint x = x0 + lx, y = y0 + ly;
+    const int v = planes[plane + y * width + x];
+    const int left = lx > 0 ? planes[plane + y * width + x - 1] : (ly > 0 ? planes[plane + (y - 1) * width + x] : 0);
+    const int top = ly > 0 ? planes[plane + (y - 1) * width + x] : left;
+    const int topleft = (lx > 0 && ly > 0) ? planes[plane + (y - 1) * width + x - 1] : left;
+    const int gradient = int(uint(left) + uint(top) - uint(topleft));
+    uint node = 0;
+    for (;;) {
+        const int prop = int(tree[node * kModTreeWords + 0]);
+        if (prop < 0) break;
+        const int pv = prop == int(kModPropGradient) ? gradient : 0;
+        node = pv > int(tree[node * kModTreeWords + 1]) ? tree[node * kModTreeWords + 2] : tree[node * kModTreeWords + 3];
+    }
+    ctx = tree[node * kModTreeWords + 4];
+    const int guess = int(tree[node * kModTreeWords + 6]) + modClampedGradient(left, top, topleft);
+    value = packSigned(v - guess);
+}

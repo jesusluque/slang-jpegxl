@@ -69,6 +69,36 @@ TEST_CASE("djxl decodes what the encoder writes", "[encoder][conformance]") {
     CHECK(metrics->psnr >= (distance <= 1.0f ? 30.0 : 24.0));
 }
 
+TEST_CASE("lossless encodes decode bit-exact", "[encoder][lossless][conformance]") {
+    const std::filesystem::path djxl = test::findTool("djxl");
+    if (djxl.empty()) {
+        SKIP("djxl (Homebrew jpeg-xl) is not installed");
+    }
+    const std::string name = GENERATE(std::string("berlin_7x5.png"), std::string("sveti_64.png"),
+                                      std::string("berlin_200.png"), std::string("sveti_crop_257x129.png"),
+                                      std::string("sveti_stefan_320.png"));
+    CAPTURE(name);
+    auto source = image::readRgb8(test::testData(name));
+    REQUIRE(source);
+    enc::Options options;
+    options.lossless = true;
+    auto encoded = encoder()->encode(*source, options);
+    REQUIRE(encoded);
+    const std::filesystem::path jxl = test::scratchDir() / std::format("{}_lossless.jxl", name);
+    const std::filesystem::path png = test::scratchDir() / std::format("{}_lossless.decoded.png", name);
+    REQUIRE(image::writeFile(jxl, *encoded));
+    std::filesystem::remove(png);
+    REQUIRE(test::run(std::format("\"{}\" \"{}\" \"{}\" >/dev/null 2>&1", djxl.string(), jxl.string(), png.string())));
+    auto decoded = image::readRgb8(png);
+    REQUIRE(decoded);
+    auto metrics = test::compare(*source, *decoded);
+    REQUIRE(metrics);
+    WARN(std::format("{} lossless: {} bytes ({:.2f} bpp), {} clusters", name, encoded->size(),
+                     8.0 * static_cast<double>(encoded->size()) / (static_cast<double>(source->width) * source->height),
+                     encoder()->stats().numAcClusters));
+    CHECK(metrics->maxAbsDiff == 0);
+}
+
 TEST_CASE("encoding is deterministic", "[encoder]") {
     auto source = image::readRgb8(test::testData("sveti_crop_257x129.png"));
     REQUIRE(source);
