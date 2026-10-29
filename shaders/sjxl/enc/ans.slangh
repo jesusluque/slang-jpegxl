@@ -1,0 +1,241 @@
+// Copyright (c) 2026 jesus luque.
+//
+// The encoder side of libjxl's ANS (enc_ans.cc): a histogram normalised to
+// 4096, its serialisation (ANSEncodingHistogram::Encode: the small form for
+// one or two symbols, else the general form with shift 13 so every count is
+// exact, no run-length coding), the alias table the decoder will build from
+// it inverted into a reverse map (ANSBuildInfoTable), and the symbol coder.
+// The decoder reads this with dec/entropy.slangh readAnsHistogram /
+// initAliasTable / readSymbol.
+//
+// Per code region r (256 symbols): ansInfo[r * 256 + s] = freq | start << 16
+// and ansReverse[r * 4096 + start + offset] = the 12-bit slot that decodes to
+// (s, offset).
+#pragma once
+
+#include "sjxl/common/bitio.slangh"
+
+static const uint kAnsLogTabSize = 12;
+static const uint kAnsTabSize = 1u << kAnsLogTabSize;
+static const uint kAnsSignature = 0x13;
+static const uint kAnsInfoStride = 256;
+static const uint kAnsReverseStride = kAnsTabSize;
+static const uint kAnsShift = 13;   // every count exact
+
+groupshared uint gAnsCounts[256];
+
+void storeVarLenUint8(RWStructuredBuffer<uint> buf, inout SerialWriter w, uint n) {
+    if (n == 0) {
+        serialWrite(buf, w, 1, 0);
+        return;
+    }
+    serialWrite(buf, w, 1, 1);
+    const uint nbits = firstbithigh(n);
+    serialWrite(buf, w, 3, nbits);
+    serialWrite(buf, w, nbits, n - (1u << nbits));
+}
+
+/// `n` <= 32 bits of `v` at absolute bit `pos` of the region at `base`, by its owner.
+void serialWriteAt(RWStructuredBuffer<uint> buf, uint base, uint pos, uint n, uint v) {
+    if (n == 0) {
+        return;
+    }
+    const uint wi = base + (pos >> 5);
+    const uint s = pos & 31;
+    if (n < 32) {
+        v &= (1u << n) - 1;
+    }
+    buf[wi] |= v << s;
+    if (s + n > 32) {
+        buf[wi + 1] |= v >> (32 - s);
+    }
+}
+
+/// gAnsCounts[0..length) scaled to sum to 4096, every present symbol at least 1.
+void ansNormalize(uint length) {
+    uint total = 0;
+    for (uint s = 0; s < length; ++s) total += gAnsCounts[s];
+    if (total == 0) {
+        gAnsCounts[0] = kAnsTabSize;
+        return;
+    }
+    uint sum = 0;
+    for (uint s = 0; s < length; ++s) {
+        const uint c = gAnsCounts[s];
+        if (c != 0) {
+            const uint v = max(1u, uint(round(float(c) * float(kAnsTabSize) / float(total))));
+            gAnsCounts[s] = v;
+            sum += v;
+        }
+    }
+    // Rounding left a difference of at most the number of symbols: the
+    // largest count absorbs it one step at a time (it stays above 1).
+    while (sum != kAnsTabSize) {
+        uint largest = 0;
+        for (uint s = 1; s < length; ++s) {
+            if (gAnsCounts[s] > gAnsCounts[largest]) largest = s;
+        }
+        if (sum > kAnsTabSize) {
+            --gAnsCounts[largest];
+            --sum;
+        } else {
+            ++gAnsCounts[largest];
+            ++sum;
+        }
+    }
+}
+
+// enc_ans.cc kBitWidthLengths / kBitWidthSymbols: the static code of count bit widths.
+static const uint kBitWidthLengths[14] = {5, 4, 4, 4, 4, 4, 3, 3, 3, 3, 3, 6, 7, 7};
+static const uint kBitWidthSymbols[14] = {17, 11, 15, 3, 9, 7, 4, 2, 5, 6, 0, 33, 1, 65};
+
+/// The serialised histogram gAnsCounts[0..length) (normalised).
+void ansWriteHistogram(RWStructuredBuffer<uint> buf, inout SerialWriter w, uint length) {
+    uint numSymbols = 0;
+    uint symbols[2] = {0, 0};
+    for (uint s = 0; s < length; ++s) {
+        if (gAnsCounts[s] != 0) {
+            if (numSymbols < 2) symbols[numSymbols] = s;
+            ++numSymbols;
+        }
+    }
+    if (numSymbols <= 2) {
+        serialWrite(buf, w, 1, 1);   // small
+        if (numSymbols == 0) {
+            serialWrite(buf, w, 1, 0);
+            storeVarLenUint8(buf, w, 0);
+            return;
+        }
+        serialWrite(buf, w, 1, numSymbols - 1);
+        for (uint i = 0; i < numSymbols; ++i) storeVarLenUint8(buf, w, symbols[i]);
+        if (numSymbols == 2) serialWrite(buf, w, kAnsLogTabSize, gAnsCounts[symbols[0]]);
+        return;
+    }
+    serialWrite(buf, w, 1, 0);   // not small
+    serialWrite(buf, w, 1, 0);   // not flat
+    // method = shift + 1 = 14: log 3 (the upper bound, so no terminating 0), then 14 & 7.
+    serialWrite(buf, w, 3, 7);
+    serialWrite(buf, w, 3, 6);
+    storeVarLenUint8(buf, w, length - 3);
+    uint omitPos = 0;
+    for (uint s = 1; s < length; ++s) {
+        if (gAnsCounts[s] > gAnsCounts[omitPos]) omitPos = s;
+    }
+    uint bitWidth[256];
+    uint omitWidth = 10;
+    for (uint s = 0; s < length; ++s) {
+        bitWidth[s] = 0;
+        if (s != omitPos && gAnsCounts[s] > 0) {
+            bitWidth[s] = firstbithigh(gAnsCounts[s]) + 1;
+            omitWidth = max(omitWidth, bitWidth[s] + (s < omitPos ? 1u : 0u));
+        }
+    }
+    bitWidth[omitPos] = omitWidth;
+    for (uint s = 0; s < length; ++s) {
+        serialWrite(buf, w, kBitWidthLengths[bitWidth[s]], kBitWidthSymbols[bitWidth[s]]);
+    }
+    for (uint s = 0; s < length; ++s) {
+        if (bitWidth[s] > 1 && s != omitPos) {
+            const uint bitcount = bitWidth[s] - 1;   // shift 13: every bit of the count
+            serialWrite(buf, w, bitcount, gAnsCounts[s] - (1u << bitcount));
+        }
+    }
+}
+
+/// The alias table of gAnsCounts[0..length) with 1 << logAlpha buckets
+/// (ans_common.cc InitAliasTable), inverted into region r of info / reverse.
+void ansBuildTables(RWStructuredBuffer<uint> info, RWStructuredBuffer<uint> reverse, uint r, uint length, uint logAlpha) {
+    const uint tableSize = 1u << logAlpha;
+    const uint logEntrySize = kAnsLogTabSize - logAlpha;
+    const uint entrySize = 1u << logEntrySize;
+    uint cutoffs[64], under[64], over[64], rightv[64], offs1[64];
+    for (uint i = 0; i < 64; ++i) {
+        cutoffs[i] = 0;
+        rightv[i] = i;
+        offs1[i] = 0;
+    }
+    int single = -1;
+    for (uint s = 0; s < length; ++s) {
+        if (gAnsCounts[s] == kAnsTabSize) single = int(s);
+    }
+    if (single < 0) {
+        uint nUnder = 0, nOver = 0;
+        for (uint i = 0; i < tableSize; ++i) {
+            cutoffs[i] = i < length ? gAnsCounts[i] : 0;
+            rightv[i] = i;
+            offs1[i] = 0;
+            if (cutoffs[i] > entrySize) over[nOver++] = i;
+            else if (cutoffs[i] < entrySize) under[nUnder++] = i;
+        }
+        while (nOver > 0) {
+            const uint overI = over[--nOver];
+            const uint underI = under[--nUnder];
+            const uint underBy = entrySize - cutoffs[underI];
+            cutoffs[overI] -= underBy;
+            rightv[underI] = overI;
+            offs1[underI] = cutoffs[overI];
+            if (cutoffs[overI] < entrySize) under[nUnder++] = overI;
+            else if (cutoffs[overI] > entrySize) over[nOver++] = overI;
+        }
+        for (uint i = 0; i < tableSize; ++i) {
+            if (cutoffs[i] == entrySize) {
+                rightv[i] = i;
+                offs1[i] = 0;
+                cutoffs[i] = 0;
+            } else {
+                offs1[i] -= cutoffs[i];
+            }
+        }
+    }
+    // Symbol starts, then every slot's (symbol, offset) inverted.
+    uint start = 0;
+    uint starts[256];
+    for (uint s = 0; s < 256; ++s) {
+        const uint freq = s < length ? gAnsCounts[s] : 0;
+        starts[s] = start;
+        info[r * kAnsInfoStride + s] = freq | (start << 16);
+        start += freq;
+    }
+    for (uint i = 0; i < kAnsTabSize; ++i) {
+        uint sym, offset;
+        if (single >= 0) {
+            sym = uint(single);
+            offset = i;
+        } else {
+            const uint b = i >> logEntrySize;
+            const uint pos = i & (entrySize - 1);
+            if (pos >= cutoffs[b]) {
+                sym = rightv[b];
+                offset = offs1[b] + pos;
+            } else {
+                sym = b;
+                offset = pos;
+            }
+        }
+        reverse[r * kAnsReverseStride + starts[sym] + offset] = i;
+    }
+}
+
+/// ANSCoder::PutSymbol: the renormalisation bits (16 or none) this symbol
+/// emits; `reverse` is the code region's reverse map (slot per symbol offset).
+void ansPut(inout uint state, uint freq, uint start, StructuredBuffer<uint> reverse, uint reverseBase, out uint nbits, out uint bits) {
+    nbits = 0;
+    bits = 0;
+    if ((state >> (32 - kAnsLogTabSize)) >= freq) {
+        bits = state & 0xFFFFu;
+        nbits = 16;
+        state >>= 16;
+    }
+    state = ((state / freq) << kAnsLogTabSize) + reverse[reverseBase + start + state % freq];
+}
+
+void ansPut(inout uint state, uint freq, uint start, RWStructuredBuffer<uint> reverse, uint reverseBase, out uint nbits, out uint bits) {
+    nbits = 0;
+    bits = 0;
+    if ((state >> (32 - kAnsLogTabSize)) >= freq) {
+        bits = state & 0xFFFFu;
+        nbits = 16;
+        state >>= 16;
+    }
+    state = ((state / freq) << kAnsLogTabSize) + reverse[reverseBase + start + state % freq];
+}

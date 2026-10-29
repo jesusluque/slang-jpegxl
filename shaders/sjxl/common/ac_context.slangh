@@ -1,0 +1,46 @@
+// Copyright (c) 2026 jesus luque.
+//
+// The AC coefficient contexts of libjxl's entropy coder (ac_context.h): a
+// block's non-zero count is coded in a context from its predicted count and
+// its block context; each coefficient in one from the non-zeros left, its
+// position in the order and whether the previous coefficient was non-zero.
+// The encoder uses the default BlockCtxMap (15 block contexts; DCT8 blocks
+// of Y fall in context 0, X and B in 7).
+#pragma once
+
+static const uint kNonZeroBuckets = 37;
+static const uint kZeroDensityContextCount = 458;
+static const uint kDefaultNumBlockCtxs = 15;
+static const uint kNumAcContexts = kDefaultNumBlockCtxs * (kNonZeroBuckets + kZeroDensityContextCount);   // 7425
+static const uint kAcAlphabet = 64;   // hybrid-uint tokens of int16-range values stay below 64
+
+static const uint kCoeffFreqContext[64] = {
+    0xBAD, 0,  1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15, 15, 16, 16, 17, 17,
+    18,    18, 19, 19, 20, 20, 21, 21, 22, 22, 23, 23, 23, 23, 24, 24, 24, 24, 25, 25, 25, 25,
+    26,    26, 26, 26, 27, 27, 27, 27, 28, 28, 28, 28, 29, 29, 29, 29, 30, 30, 30, 30};
+static const uint kCoeffNumNonzeroContext[64] = {
+    0xBAD, 0,   31,  62,  62,  93,  93,  93,  93,  123, 123, 123, 123, 152, 152, 152,
+    152,   152, 152, 152, 152, 180, 180, 180, 180, 180, 180, 180, 180, 180, 180, 180,
+    180,   206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206,
+    206,   206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206, 206};
+
+/// ZeroDensityContext for an 8x8 block (one covered block).
+uint zeroDensityContext8(uint nonzerosLeft, uint k, uint prev) {
+    return (kCoeffNumNonzeroContext[nonzerosLeft] + kCoeffFreqContext[k]) * 2 + prev;
+}
+
+/// BlockCtxMap::NonZeroContext's bucket of a predicted non-zero count.
+uint nonZeroBucket(uint nonZeros) {
+    if (nonZeros >= 64) nonZeros = 64;
+    return nonZeros < 8 ? nonZeros : 4 + nonZeros / 2;
+}
+
+/// The default BlockCtxMap's context of a DCT8 block of physical channel c (X, Y, B).
+uint defaultBlockContext(uint c) { return c == 1 ? 0 : 7; }
+
+/// PredictFromTopAndLeft over a group-local grid, default 32 at the group's corner.
+uint predictNonZeros(bool hasLeft, bool hasTop, uint left, uint top) {
+    if (!hasLeft) return hasTop ? top : 32;
+    if (!hasTop) return left;
+    return (top + left + 1) / 2;
+}

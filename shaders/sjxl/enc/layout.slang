@@ -8,10 +8,9 @@ module enc_layout;
 
 #include "sjxl/common/bitio.slangh"
 
-static const uint kAcItemsPerGroup = 32 * 32 * 3;
 static const uint kDcItemsPerGroup = 256 * 256 * 3;
 static const uint kMetaItemsPerGroup = 2 * 32 * 32 + 2 * 256 * 256;
-static const uint kBlobStrideWords = 2048;
+static const uint kBlobStrideWords = 8192;
 
 struct LayoutParams {
     uint numGroups;
@@ -21,7 +20,7 @@ struct LayoutParams {
 };
 
 StructuredBuffer<uint>      blobBits;
-StructuredBuffer<uint>      acPrefix;
+StructuredBuffer<uint>      acSectionBits;   // bits of each AC group section (ANS)
 StructuredBuffer<uint>      dcPrefix;
 StructuredBuffer<uint>      metaPrefix;
 StructuredBuffer<uint>      blobs;
@@ -64,7 +63,7 @@ void layoutSections(uint3 tid: SV_DispatchThreadID) {
     }
     place(s++, blobBits[1], pos, start);
     for (uint g = 0; g < params.numGroups; ++g) {
-        place(s++, acPrefix[(g + 1) * kAcItemsPerGroup] - acPrefix[g * kAcItemsPerGroup], pos, start);
+        place(s++, acSectionBits[g], pos, start);
     }
     totals[1] = pos;
     totals[0] = (pos + 7) / 8;

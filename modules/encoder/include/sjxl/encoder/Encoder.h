@@ -29,6 +29,8 @@ struct Options {
     /// Gaborish + EPF as libjxl chooses them for the distance, with the inverse
     /// Gaborish applied before the DCT; off: LoopFilter disabled.
     bool loopFilter = true;
+    /// Most AC histogram clusters (1..32); 1 codes every context with one histogram.
+    uint32_t acClusters = 32;
 };
 
 /// What the last encode measured, for tests and the CLI.
@@ -36,7 +38,8 @@ struct Stats {
     uint32_t              headBytes = 0;
     uint32_t              bodyBytes = 0;
     std::vector<uint32_t> sectionBytes;
-    uint32_t              globalScale = 0;   ///< the quantizer the device chose
+    uint32_t              numAcClusters = 0; ///< AC histogram clusters the device chose
+    uint32_t              globalScale = 0;   ///< the quantizer
     uint32_t              quantDc = 0;
     bool                  gaborish = false;
     uint32_t              epfIters = 0;
@@ -56,7 +59,7 @@ private:
     gpu::Device*                        device_ = nullptr;
     gpu::ComputeKernel                  rgbToXyb_, aqDiff_, aqMap_, aqRawField_;
     gpu::ComputeKernel                  gaborishInverse_, dct_, cflTile_, quantize_;
-    gpu::ComputeKernel                  acItems_, dcItems_, metaItems_;
+    gpu::ComputeKernel                  acItems_, dcItems_, metaItems_, clusterContexts_, acSections_;
     gpu::ComputeKernel                  dcGroupBlobs_, globalBlobs_, layout_, blobEmit_;
     gpu::PrefixSum                      prefixSum_;
     gpu::Buffer                         dequant_;   // 3 * 64 floats

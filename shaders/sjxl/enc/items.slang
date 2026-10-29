@@ -6,6 +6,11 @@
 // offset the prefix sum of those lengths gave the item. The three passes walk
 // the same tokens, so the layout is decided once, here.
 //
+// AC tokens are coded in libjxl's contexts (ac_context.slangh): mode 0 counts
+// them per context into ctxHist; the clustering kernel maps the contexts to
+// clusters, and ac_sections.slang codes the AC groups with ANS (the DC and
+// AcMetadata streams stay prefix coded here, modes 1 and 2).
+//
 // Items are laid out regularly, padded to the largest group, so an item index
 // says where it belongs without a table: AC items are g * 3072 + (by * 32 +
 // bx) * 3 + ci (ci: Y, X, B); DC items g * 196608 + ci * 65536 + by * 256 + bx;
@@ -17,6 +22,7 @@ module enc_items;
 
 #include "sjxl/common/hybrid_uint.slangh"
 #include "sjxl/common/bitio.slangh"
+#include "sjxl/common/ac_context.slangh"
 
 static const uint kAcItemsPerGroup = 32 * 32 * 3;
 static const uint kDcItemsPerGroup = 256 * 256 * 3;
@@ -24,6 +30,7 @@ static const uint kMetaTiles = 32 * 32;
 static const uint kMetaBlocks = 256 * 256;
 static const uint kMetaItemsPerGroup = 2 * kMetaTiles + 2 * kMetaBlocks;
 static const uint kCodeStride = 256;
+static const uint kAcClusters = 32;   // code regions 0..31 are the AC clusters
 
 struct ItemParams {
     uint nblocks;
@@ -47,6 +54,8 @@ StructuredBuffer<int>      cmapX;         // [tile]: YtoX
 StructuredBuffer<int>      cmapB;         // [tile]: YtoB
 StructuredBuffer<uint>     codes;         // depth << 16 | bits; region r at r * 256
 RWStructuredBuffer<uint>   hist;          // same regions as codes
+RWStructuredBuffer<uint>   ctxHist;       // mode 0: AC context histograms, kNumAcContexts * kAcAlphabet
+StructuredBuffer<uint>     ctxMap;        // AC context -> cluster (code region)
 RWStructuredBuffer<uint>   itemBits;      // mode 1 output
 StructuredBuffer<uint>     prefix;        // mode 2: exclusive prefix of itemBits
 StructuredBuffer<uint>     sectionStart;  // mode 2: bit offset of each section
@@ -54,9 +63,9 @@ StructuredBuffer<uint>     dcPartStart;   // mode 2: per DC group: pre, dc items
 RWStructuredBuffer<uint>   body;          // mode 2 output
 ConstantBuffer<ItemParams> params;
 
-/// Code regions: AC 0; DC group g: 1 + 2g (DC), 2 + 2g (AcMetadata).
-uint dcCodeRegion(uint g) { return 1 + 2 * g; }
-uint metaCodeRegion(uint g) { return 2 + 2 * g; }
+/// Code regions: AC clusters 0..31; DC group g: 32 + 2g (DC), 33 + 2g (AcMetadata).
+uint dcCodeRegion(uint g) { return kAcClusters + 2 * g; }
+uint metaCodeRegion(uint g) { return kAcClusters + 1 + 2 * g; }
 
 struct Cursor {
     uint mode;
@@ -64,7 +73,18 @@ struct Cursor {
     uint pos;        // bits so far (mode 1 and 2); absolute in mode 2
 };
 
-/// One hybrid-uint value: its token and raw bits.
+/// The token's code bits and raw bits, measured or emitted.
+void codeToken(inout Cursor cur, uint codeBase, uint tok, uint nbits, uint raw) {
+    const uint entry = codes[codeBase + tok];
+    const uint depth = codeDepth(entry);
+    if (cur.mode == 2) {
+        emitAtomic(body, cur.pos, depth, codeBits(entry));
+        emitAtomic(body, cur.pos + depth, nbits, raw);
+    }
+    cur.pos += depth + nbits;
+}
+
+/// One hybrid-uint value of a stream with one code (the cursor's region).
 void token(inout Cursor cur, uint value) {
     uint tok, nbits, raw;
     hybridEncode(value, tok, nbits, raw);
@@ -73,13 +93,16 @@ void token(inout Cursor cur, uint value) {
         InterlockedAdd(hist[cur.codeBase + tok], 1u, before);
         return;
     }
-    const uint entry = codes[cur.codeBase + tok];
-    const uint depth = codeDepth(entry);
-    if (cur.mode == 2) {
-        emitAtomic(body, cur.pos, depth, codeBits(entry));
-        emitAtomic(body, cur.pos + depth, nbits, raw);
-    }
-    cur.pos += depth + nbits;
+    codeToken(cur, cur.codeBase, tok, nbits, raw);
+}
+
+/// One hybrid-uint value of the AC stream in context `ctx`, counted per
+/// context (mode 0 only: the AC sections are ANS coded by ac_sections.slang).
+void acToken(inout Cursor cur, uint ctx, uint value) {
+    uint tok, nbits, raw;
+    hybridEncode(value, tok, nbits, raw);
+    uint before;
+    InterlockedAdd(ctxHist[ctx * kAcAlphabet + min(tok, kAcAlphabet - 1)], 1u, before);
 }
 
 uint physicalChannel(uint ci) { return ci == 0 ? 1 : (ci == 1 ? 0 : 2); }
@@ -108,12 +131,21 @@ void acItems(uint3 tid: SV_DispatchThreadID) {
         const uint c = physicalChannel(ci);
         const uint block = (rect.y + by) * params.blocksX + rect.x + bx;
         const uint base = (c * params.nblocks + block) * 64;
-        uint nz = nonZeros[c * params.nblocks + block];
-        token(cur, nz);
+        const uint nzPlane = c * params.nblocks;
+        uint nz = nonZeros[nzPlane + block];
+        // The non-zero count's context: predicted from the top and left
+        // blocks of the group (default 32 at its corner) and the block context.
+        const uint predicted = predictNonZeros(bx > 0, by > 0, bx > 0 ? nonZeros[nzPlane + block - 1] : 0,
+                                               by > 0 ? nonZeros[nzPlane + block - params.blocksX] : 0);
+        const uint blockCtx = defaultBlockContext(c);
+        acToken(cur, nonZeroBucket(predicted) * kDefaultNumBlockCtxs + blockCtx, nz);
+        const uint histoOffset = kDefaultNumBlockCtxs * kNonZeroBuckets + kZeroDensityContextCount * blockCtx;
+        uint prev = nz > 4 ? 0 : 1;   // size / 16
         for (uint k = 1; k < 64 && nz != 0; ++k) {
             const int v = acQuant[base + order[k]];
-            token(cur, packSigned(v));
-            if (v != 0) --nz;
+            acToken(cur, histoOffset + zeroDensityContext8(nz, k, prev), packSigned(v));
+            prev = v != 0 ? 1 : 0;
+            nz -= prev;
         }
     }
     if (params.mode == 1) {

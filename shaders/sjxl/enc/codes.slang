@@ -8,23 +8,26 @@
 // the modular GroupHeader + MA tree + histogram description of the DC and
 // AcMetadata streams.
 //
-// Regions: histograms and codes share one indexing (256 entries each): AC is
-// region 0, DC group g has its DC code at 1 + 2g and its AcMetadata code at
-// 2 + 2g. Blobs (serialised headers) are 2048-word regions: DcGlobal 0,
-// AcGlobal 1, DC group g "pre" (extra_precision + DC modular header) at
-// 2 + 2g and "mid" (count + AcMetadata modular header) at 3 + 2g.
+// Regions: histograms and codes share one indexing (256 entries each): the AC
+// clusters are regions 0..31, DC group g has its DC code at 32 + 2g and its
+// AcMetadata code at 33 + 2g. Blobs (serialised headers) are 8192-word
+// regions: DcGlobal 0, AcGlobal 1 (the clustered AC histogram set with its
+// coded context map), DC group g "pre" (extra_precision + DC modular header)
+// at 2 + 2g and "mid" (count + AcMetadata modular header) at 3 + 2g.
 module enc_codes;
 
 #include "sjxl/common/hybrid_uint.slangh"
 #include "sjxl/common/bitio.slangh"
+#include "sjxl/common/ac_context.slangh"
+#include "sjxl/enc/ans.slangh"
 
 static const uint kMaxAlphabet = 256;
 static const uint kCodeLengthCodes = 18;
 static const uint kNumTreeContexts = 6;
 static const uint kPrefixMaxBits = 15;
 static const uint kCodeStride = 256;
-static const uint kBlobStrideWords = 2048;
-static const uint kNumAcContexts = 15 * (37 + 458);   // default BlockCtxMap
+static const uint kBlobStrideWords = 8192;
+static const uint kAcClusters = 32;
 static const int kPredictorZero = 0;
 static const int kPredictorGradient = 5;
 static const int kEpfSharpness = 4;   // what libjxl writes at every speed up to wombat
@@ -39,6 +42,11 @@ struct CodeParams {
 StructuredBuffer<uint4>    dcGroups;   // bx0, by0, w, h in blocks
 StructuredBuffer<uint>     hist;
 StructuredBuffer<uint>     quantizer;  // [0] global_scale, [1] quant_dc
+StructuredBuffer<uint>     ctxMap;     // AC context -> cluster
+StructuredBuffer<uint>     clusterInfo;   // [0] number of AC clusters
+RWStructuredBuffer<uint>   ctxMapMtf;  // scratch: the context map after the move-to-front transform
+RWStructuredBuffer<uint>   ansInfo;    // ANS symbol info per code region (the context map's code is region kAcClusters)
+RWStructuredBuffer<uint>   ansReverse; // ANS reverse maps per code region
 RWStructuredBuffer<uint>   codes;      // depth << 16 | bits
 RWStructuredBuffer<uint>   blobs;
 RWStructuredBuffer<uint>   blobBits;
@@ -390,6 +398,95 @@ void writePrefixHistograms(RWStructuredBuffer<uint> buf, inout SerialWriter w, u
     }
 }
 
+static const uint kAcLogAlpha = 6;    // 64-symbol ANS alphabet for the AC clusters
+static const uint kMapLogAlpha = 5;   // the context map's values are below 32
+static const uint kMapRegion = kAcClusters;
+
+/// The context map as a one-context ANS stream after the move-to-front
+/// transform (EncodeContextMap with use_mtf): its histogram set, then the
+/// tokens coded backwards and placed from the end as WriteTokens does.
+void writeContextMapStream(RWStructuredBuffer<uint> buf, inout SerialWriter w, uint numClusters) {
+    uint mtf[kAcClusters];
+    for (uint i = 0; i < kAcClusters; ++i) mtf[i] = i;
+    for (uint i = 0; i < kMaxAlphabet; ++i) gAnsCounts[i] = 0;
+    uint length = 1;
+    for (uint ctx = 0; ctx < kNumAcContexts; ++ctx) {
+        const uint v = ctxMap[ctx];
+        uint index = 0;
+        while (mtf[index] != v) ++index;
+        for (uint j = index; j > 0; --j) mtf[j] = mtf[j - 1];
+        mtf[0] = v;
+        ctxMapMtf[ctx] = index;
+        uint tok, nbits, raw;
+        hybridEncode(index, tok, nbits, raw);
+        ++gAnsCounts[tok];
+        length = max(length, tok + 1);
+    }
+    // The nested histogram set: LZ77 off, one context, ANS, one config, the histogram.
+    serialWrite(buf, w, 1, 0);
+    serialWrite(buf, w, 1, 0);                     // use_prefix_code = 0
+    serialWrite(buf, w, 2, kMapLogAlpha - 5);
+    encodeUintConfig(buf, w, kMapLogAlpha);
+    ansNormalize(length);
+    ansWriteHistogram(buf, w, length);
+    ansBuildTables(ansInfo, ansReverse, kMapRegion, length, kMapLogAlpha);
+    // Two passes over the tokens backwards: the size, then the placement.
+    uint total = 32;
+    for (uint pass = 1; pass <= 2; ++pass) {
+        uint state = kAnsSignature << 16;
+        uint pos = w.pos + total;
+        for (int ctx = int(kNumAcContexts) - 1; ctx >= 0; --ctx) {
+            uint tok, nbits, raw;
+            hybridEncode(ctxMapMtf[uint(ctx)], tok, nbits, raw);
+            const uint e = ansInfo[kMapRegion * kAnsInfoStride + tok];
+            if (pass == 2) {
+                pos -= nbits;
+                serialWriteAt(buf, w.base, pos, nbits, raw);
+            }
+            uint ansBits, ansN;
+            ansPut(state, e & 0xFFFFu, e >> 16, ansReverse, kMapRegion * kAnsReverseStride, ansN, ansBits);
+            if (pass == 2) {
+                pos -= ansN;
+                serialWriteAt(buf, w.base, pos, ansN, ansBits);
+            } else {
+                total += nbits + ansN;
+            }
+        }
+        if (pass == 2) {
+            serialWriteAt(buf, w.base, w.pos, 32, state);
+        }
+    }
+    w.pos += total;
+}
+
+/// The AC histogram set (DecodeHistograms): LZ77 off, the context map (simple
+/// for one cluster, else coded through writeContextMapStream), ANS with a
+/// 64-symbol alphabet, then every cluster's hybrid-uint config and its
+/// normalised histogram, whose alias table is inverted for the section kernel.
+void writeAcHistogramSet(RWStructuredBuffer<uint> buf, inout SerialWriter w, uint numClusters) {
+    serialWrite(buf, w, 1, 0);   // lz77.enabled
+    if (numClusters == 1) {
+        serialWrite(buf, w, 1, 1);   // is_simple
+        serialWrite(buf, w, 2, 0);   // bits_per_entry = 0
+    } else {
+        serialWrite(buf, w, 1, 0);   // is_simple
+        serialWrite(buf, w, 1, 1);   // use_mtf
+        writeContextMapStream(buf, w, numClusters);
+    }
+    serialWrite(buf, w, 1, 0);       // use_prefix_code = 0
+    serialWrite(buf, w, 2, kAcLogAlpha - 5);
+    for (uint c = 0; c < numClusters; ++c) {
+        encodeUintConfig(buf, w, kAcLogAlpha);
+    }
+    for (uint c = 0; c < numClusters; ++c) {
+        const uint length = loadHistogram(c * kCodeStride);
+        for (uint i = 0; i < kMaxAlphabet; ++i) gAnsCounts[i] = gHist[i];
+        ansNormalize(length);
+        ansWriteHistogram(buf, w, length);
+        ansBuildTables(ansInfo, ansReverse, c, length, kAcLogAlpha);
+    }
+}
+
 /// Last used symbol + 1 of the histogram region at histBase (at least 1), and
 /// the histogram copied into gHist.
 uint loadHistogram(uint histBase) {
@@ -451,8 +548,9 @@ void buildDcGroupBlobs(uint3 gid: SV_GroupID) {
     uint count = 0;
     appendLeaf(tokens, count, kPredictorGradient, 0);
     writeModularTree(blobs, pre, tokens, count);
-    const uint dcLen = loadHistogram((1 + 2 * g) * kCodeStride);
-    writePrefixHistograms(blobs, pre, dcLen, 1, (1 + 2 * g) * kCodeStride);
+    const uint dcRegion = kAcClusters + 2 * g;
+    const uint dcLen = loadHistogram(dcRegion * kCodeStride);
+    writePrefixHistograms(blobs, pre, dcLen, 1, dcRegion * kCodeStride);
     blobBits[2 + 2 * g] = pre.pos;
 
     // "mid": count - 1, AcMetadata modular header. The tree's root splits on
@@ -470,7 +568,8 @@ void buildDcGroupBlobs(uint3 gid: SV_GroupID) {
     appendLeaf(tokens, count, kPredictorZero, kEpfSharpness);
     appendLeaf(tokens, count, kPredictorZero, 0);
     writeModularTree(blobs, mid, tokens, count);
-    const uint metaLen = loadHistogram((2 + 2 * g) * kCodeStride);
+    const uint metaRegion = kAcClusters + 1 + 2 * g;
+    const uint metaLen = loadHistogram(metaRegion * kCodeStride);
     serialWrite(blobs, mid, 1, 0);       // lz77.enabled
     serialWrite(blobs, mid, 1, 1);       // simple context map
     serialWrite(blobs, mid, 2, 1);       // 1 bit per entry
@@ -482,9 +581,9 @@ void buildDcGroupBlobs(uint3 gid: SV_GroupID) {
     storeVarLenUint16(blobs, mid, 0);           // cluster 0: alphabet 1, no code
     storeVarLenUint16(blobs, mid, metaLen - 1);
     if (metaLen > 1) {
-        buildAndStoreCode(blobs, mid, metaLen, (2 + 2 * g) * kCodeStride);
+        buildAndStoreCode(blobs, mid, metaLen, metaRegion * kCodeStride);
     } else {
-        codes[(2 + 2 * g) * kCodeStride] = 0;
+        codes[metaRegion * kCodeStride] = 0;
     }
     blobBits[3 + 2 * g] = mid.pos;
 }
@@ -511,14 +610,13 @@ void buildGlobalBlobs(uint3 gid: SV_GroupID) {
     blobBits[0] = dc.pos;
 
     // AcGlobal: dequant matrices default, one histogram set, natural orders,
-    // then the AC prefix histogram shared by every context.
+    // then the clustered AC histogram set.
     SerialWriter ac;
     ac.base = kBlobStrideWords;
     ac.pos = 0;
     serialWrite(blobs, ac, 1, 1);
     serialWrite(blobs, ac, ceilLog2Nonzero(params.numGroups), 0);
     serialWrite(blobs, ac, 2, 2);   // used_orders: Val(0) is the third distribution
-    const uint acLen = loadHistogram(0);
-    writePrefixHistograms(blobs, ac, acLen, kNumAcContexts, 0);
+    writeAcHistogramSet(blobs, ac, clusterInfo[0]);
     blobBits[1] = ac.pos;
 }

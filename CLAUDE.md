@@ -17,7 +17,7 @@ ctest --test-dir build/macos-arm64-debug -R prefix          # tests matching a n
 build/macos-arm64-debug/bin/sjxl_gpu_tests "prefix sum*"    # one Catch2 case by name (or a [tag])
 cmake --build build/macos-arm64-debug --target sjxl_gpu_tests   # one binary
 build/macos-arm64-debug/bin/sjxl info [in.jxl]              # device info, or a file's headers and frame list
-build/macos-arm64-debug/bin/sjxl encode in.png out.jxl --distance 1.0 [--no-aq] [--no-cfl] [--no-filters]
+build/macos-arm64-debug/bin/sjxl encode in.png out.jxl --distance 1.0 [--no-aq] [--no-cfl] [--no-filters] [--clusters n]
 build/macos-arm64-debug/bin/sjxl decode in.jxl out.png                  # every stage on the GPU; animations write out_000.png, ...
 build/macos-arm64-debug/bin/sjxl compare a.png b.png                    # PSNR + largest diff, on the GPU
 build/macos-arm64-debug/bin/sjxl pixel a.png x y ; sjxl convert in.png out.png   # one pixel; re-save as RGB8
@@ -72,9 +72,13 @@ cjxl in.png ref.jxl -d 1 -e 5 ; djxl out.jxl check.png      # Homebrew oracle (/
   Numeric tables (quant weights, opsin matrices, EPF/Gaborish constants) are
   computed from libjxl's formulas at init and checked by tests against the
   extracted copies in `cujpegxl/src/*.h`.
-- **Prefix codes for every encoder stream until M3**; the decoder supports
-  prefix and ANS. Keeping token lengths table-driven is what makes bit
-  emission a prefix sum instead of a serial chain.
+- **Encoder entropy coding**: the AC groups are ANS streams in libjxl's
+  coefficient contexts (`common/ac_context.slangh`), clustered on the device
+  (`enc/cluster.slang`, ≤ 32 clusters) and coded one thread per group
+  backwards (`enc/ac_sections.slang`, two passes: size, then placement from
+  the section's end); the context map is an MTF + ANS stream. DC and
+  AcMetadata stay prefix coded, one thread per token with lengths from the
+  code table and offsets from prefix sums. The decoder reads both.
 - **One Slang and one slang-rhi** per process, the pinned ones.
 - **`docs/decisions.md`** records each subsystem's design, what was measured
   and what is not done. Update it with the change.
@@ -99,7 +103,7 @@ Modules are static libraries `sjxl_<name>` aliased `sjxl::<name>`
 | codestream | CPU-side syntax only: `BitWriter`, U32/U64/F16 field coders, SizeHeader, ImageMetadata, FrameHeader, LoopFilter, TOC (`Headers.h`); `Tables.h`: quantizer params from a distance, DCT8 dequant weights, natural order, computed from libjxl formulas |
 | image | file I/O only: PNG/PPM/JPEG via stb (`readRgb8` 8-bit RGB, `readImage8` keeps alpha, `readImage` keeps alpha and 16-bit depth; `Rgb8` has `channels` 3/4 and `bitDepth` 8/16; `writePng` writes 16-bit PNGs itself; `readFile`, `writeFile`) |
 | metrics | `metrics::compare`: PSNR, largest difference and where, measured by `shaders/sjxl/metrics/compare.slang`; what tests and `sjxl compare` use |
-| encoder | `enc::Encoder::encode(Rgb8, Options{distance, adaptiveQuant, chromaFromLuma, loopFilter})`: the GPU encode pipeline (`shaders/sjxl/enc/`): xyb → aq (quant field) → gaborish (inverse) → cfl (dct, per-tile least squares) → quantize (AdjustQuantBlockAC, dead zones) → items (mode 0 histogram, 1 count, 2 emit) → codes (Huffman + headers per DC group, globals) → prefix sums → layout → emit |
+| encoder | `enc::Encoder::encode(Rgb8, Options{distance, adaptiveQuant, chromaFromLuma, loopFilter})`: the GPU encode pipeline (`shaders/sjxl/enc/`): xyb → aq (quant field) → gaborish (inverse) → cfl (dct, per-tile least squares) → quantize (AdjustQuantBlockAC, dead zones) → items (mode 0 context histograms; DC/AcMetadata modes 1 count, 2 emit) → cluster → codes (ANS histograms + context map for AC, Huffman + headers per DC group) → ac_sections (ANS per group) → prefix sums → layout → emit |
 | decoder | `dec::Decoder::decode(bytes)`: `codestream::parse` on the CPU, then `shaders/sjxl/dec/`: sections (one thread per section: globals, DC groups, AC groups; libraries entropy/modular/frame/modframe .slangh over one `arena` buffer) → VarDCT: tables → dc_finalize → transforms; Modular: finalise (inverse transforms) → modular_out (channels to planes) → filters → output |
 | decoder (M2) | `dec::Decoder`: the GPU decode pipeline |
 
@@ -114,13 +118,19 @@ tier) → inverse Gaborish → DCT8 per block (float coefficients) →
 chroma-from-luma per 64 px tile (least squares on the scaled coefficients) →
 quantise per block (AdjustQuantBlockAC per channel, Y dead zones, CfL
 residuals, x_qm_scale) → DC gradient residual and AcMetadata tokens (YtoX,
-YtoB, strategy, qf, sharpness 4) → histograms (atomics) → 15-bit
-length-limited prefix codes + Brotli-style code-length serialisation per
-histogram → token bit lengths → prefix sums (section bit offsets, section
-byte sizes) → bit emission by `InterlockedOr` into a zeroed body buffer →
-readback of sizes and body; CPU writes headers (LoopFilter: Gaborish above
-d 0.5, EPF iterations by distance) + TOC and appends the body.
-`sjxl encode --no-aq --no-cfl --no-filters` switch the stages off for A/B runs.
+YtoB, strategy, qf, sharpness 4) → histograms (atomics; AC per coefficient
+context) → AC context clustering (one thread-group) → ANS histograms,
+alias/reverse tables and the context map stream for AC, 15-bit
+length-limited prefix codes + Brotli-style code-length serialisation for DC
+and AcMetadata → AC section sizes (ANS chain per group) and token bit
+lengths → prefix sums (section bit offsets, section byte sizes) → bit
+emission by `InterlockedOr` into a zeroed body buffer (ANS sections placed
+backwards by their thread) → readback of sizes and body; CPU writes headers
+(LoopFilter: Gaborish above d 0.5, EPF iterations by distance) + TOC and
+appends the body.
+`sjxl encode --no-aq --no-cfl --no-filters --clusters n` switch the stages off
+or limit the clusters for A/B runs; `SJXL_DEBUG=1` prints the quantizer,
+cluster count, blob bits and section bytes.
 
 Decoder stages: CPU parses signature/headers/TOC into a section table →
 one-thread kernels decode DcGlobal and AcGlobal (quantizer, block context

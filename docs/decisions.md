@@ -16,12 +16,13 @@ per subsystem or milestone, appended to as the work goes. Dates are absolute.
   renderer is not something an embedder wants.
 - **Conformance oracle** is Homebrew `cjxl`/`djxl`. libjxl is not linked, so
   the build has no second copy of the format's logic to disagree with.
-- **Encoder uses prefix codes everywhere until M3.** Every token's bit length
-  is then a table lookup, section offsets are prefix sums and emission is one
-  thread per token with `InterlockedOr`. ANS (serial state per section) is a
-  compression gain of a few percent to be added later without changing the
-  pipeline. `cujpegxl` chooses prefix over ANS below 100 tokens; libjxl's
-  decoder accepts either for any stream.
+- **Encoder entropy coding.** The DC and AcMetadata streams use prefix
+  codes: every token's bit length is a table lookup, section offsets are
+  prefix sums and emission is one thread per token with `InterlockedOr`. The
+  AC groups use ANS with clustered coefficient contexts (M3): the chain is
+  serial per section, one thread per group, run twice (size, then placement
+  backwards from the section's end). ANS alone gains little; the context
+  modelling it makes affordable gains 12 % (see "AC entropy coding").
 
 ## Build (M0, 2026-10-28)
 
@@ -53,9 +54,9 @@ per subsystem or milestone, appended to as the work goes. Dates are absolute.
   with all predictors, RCT/Palette/Squeeze, Gaborish + EPF, custom orders.
 - **M3 encoder quality**: (done 2026-10-29: inverse Gaborish + LoopFilter as
   libjxl chooses it, EPF sharpness 4, CfL per tile, adaptive quant field,
-  AdjustQuantBlockAC.) Next: ANS for AC with context clustering (≤ 32 clusters,
-  fixed-point costs as cujpegxl), DCT16/32 strategy search, Modular lossless
-  encoding, alpha and 16-bit input.
+  AdjustQuantBlockAC; ANS for the AC groups with clustered coefficient
+  contexts.) Next: DCT16/32 strategy search, DC and AcMetadata coding (ANS,
+  better trees), Modular lossless encoding, alpha and 16-bit input.
 - **M4 decoder completeness**: splines, grey JPEG transcodes, loop filters
   on YCbCr frames, extra channel blending in patches, writing the ICC
   profile into the output file, float samples. (16-bit output, animation
@@ -193,6 +194,80 @@ field range and the first tiles' cmap; `SJXL_DEBUG=1 SJXL_DEBUG_QF=1 sjxl
 decode` dumps any file's quant field per block (used to check the field's
 shape against cjxl's: same pattern, cjxl's one step higher where its
 AdjustQuantBlockAC raised it).
+
+## M3 encoder: AC entropy coding with contexts, clustering and ANS (2026-10-29)
+
+With the quantisation level with cjxl's, the remaining gap was coding
+efficiency: one prefix code for every AC token against cjxl's ANS over
+clustered coefficient contexts. Measured on sveti_stefan_320 at d = 1 (same
+tokens throughout):
+
+| AC coding | AcGlobal | AC sections | file |
+|---|---|---|---|
+| one prefix code, trivial context map | 21 B | 15 771 B | 18 164 B |
+| prefix codes, 9 clusters, coded context map (prefix) | 1 941 B | 13 922 B | 18 236 B |
+| ANS, one cluster | 31 B | 15 713 B | 18 116 B |
+| ANS, 9 clusters, MTF + ANS context map | 567 B | 12 963 B | 15 902 B |
+
+So the gain is the context modelling (−12 % on the sections), and ANS is
+what makes its context map affordable: a prefix code costs at least one bit
+per entry, 7425 entries, 1.9 KB on a 16 KB file; MTF + ANS brings it to 567
+bytes. The pieces, all kernels:
+
+- **Contexts** (`common/ac_context.slangh`): libjxl's `NonZeroContext`
+  (predicted count from the top and left blocks of the group, default 32 at
+  the corner, times the 15 block contexts of the default BlockCtxMap: DCT8
+  blocks of Y in context 0, X and B in 7) and `ZeroDensityContext` (non-zeros
+  left, position, previous coefficient non-zero), 7425 contexts, 64-symbol
+  alphabet (tokens of values below 2^16). `acItems` in mode 0 counts tokens
+  per context with atomics into a 7425 × 64 histogram.
+- **Clustering** (`enc/cluster.slang`): libjxl's `FastClusterHistograms` as
+  one thread-group of 256: per-context entropy and totals, farthest-first
+  seeding by `ClusterDistance` (the bits a merge costs, with the prefix-code
+  correction for single-symbol histograms) until the farthest context is
+  within 48 bits of a seed or there are 32 seeds, then every context to its
+  nearest seed (libjxl assigns sequentially against the growing clusters; the
+  parallel form assigns against the fixed seeds), clusters renumbered by
+  first appearance and contexts without tokens taking their predecessor's
+  cluster. `--clusters n` caps the count (1 reproduces the trivial map).
+- **ANS histograms** (`enc/ans.slangh`): counts normalised to 4096 (every
+  present symbol ≥ 1, the largest absorbing the rounding), serialised as
+  libjxl's `ANSEncodingHistogram::Encode` with the small form for one or two
+  symbols and the general form with shift 13 (every count exact, no RLE);
+  the decoder's alias table built the same way and inverted into a reverse
+  map (slot per symbol offset), 4096 entries per cluster. The AC alphabet
+  uses log_alpha 6, the context map 5.
+- **Sections** (`enc/ac_sections.slang`): one thread per AC group walks the
+  group's tokens backwards (blocks in reverse raster, channels B, X, Y, each
+  block-channel's token list reversed) through `ANSCoder::PutSymbol`, in mode
+  1 to size the section (32 bits of state, raw bits, 16 per
+  renormalisation), in mode 2 to place the bits from the end down: in the
+  stream a token is [renormalisation bits][raw bits], tokens forward after
+  the state, as libjxl's `WriteTokens` produces. The layout reads the AC
+  sizes from this kernel; DC and AcMetadata keep the prefix-sum path.
+- **Context map** (`codes.slang writeContextMapStream`): the globals thread
+  applies the move-to-front transform, builds the one-context ANS histogram
+  of the result, writes the nested histogram set and the 7425 tokens
+  backwards with the same two-pass trick inside the blob.
+
+Matched-size comparison against cjxl `-e 5` (as in the previous section):
+
+| image | d | cjxl bytes / SSIM2 | ours, same d | ours at cjxl's size | Δ at size |
+|---|---|---|---|---|---|
+| berlin_200 | 1 | 5762 / 59.77 | 5624 / 59.84 | 5774 / 61.85 | +2.08 |
+| berlin_200 | 3 | 2654 / 48.84 | 2780 / 48.56 | 2649 / 47.46 | −1.39 |
+| sveti_crop_257x129 | 1 | 9780 / 88.55 | 9173 / 86.20 | 9785 / 86.98 | −1.57 |
+| sveti_crop_257x129 | 3 | 5079 / 76.95 | 4721 / 74.96 | 5086 / 77.04 | +0.09 |
+| sveti_stefan_320 | 1 | 16527 / 86.79 | 15902 / 84.40 | 16549 / 85.02 | −1.77 |
+| sveti_stefan_320 | 3 | 7641 / 72.75 | 7629 / 69.96 | 7638 / 69.98 | −2.77 |
+
+Mean Δ at matched size −0.9 (was −3.1 before this slice, −3.8 with the M1
+profile). What remains: the DC section (2348 B of the 15.9 KB here: a single
+Gradient leaf, prefix coded) against cjxl's modular DC, the AcMetadata
+stream, and the larger transforms cjxl uses in smooth areas. Encode time
+rose from 17 to 44 ms (Debug build) on 320×180: the ANS chain is serial per
+group and runs twice; a 2-lane interleave or the count pass reused for the
+placement are M5 options.
 
 ## M2 decoder, VarDCT (2026-10-29)
 

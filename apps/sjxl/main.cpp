@@ -23,7 +23,7 @@ int usage() {
     std::fprintf(stderr,
                  "usage:\n"
                  "  sjxl info [in.jxl]                          describe the GPU device, or a file's headers and frames\n"
-                 "  sjxl encode in.png out.jxl [--distance d] [--no-aq] [--no-cfl] [--no-filters]\n"
+                 "  sjxl encode in.png out.jxl [--distance d] [--no-aq] [--no-cfl] [--no-filters] [--clusters n]\n"
                  "                                              lossy VarDCT (default distance 1.0)\n"
                  "  sjxl decode in.jxl out.png                  any frame type; animations write out_000.png, out_001.png, ...\n"
                  "  sjxl compare a.png b.png                    PSNR and largest difference, measured on the GPU\n"
@@ -99,6 +99,8 @@ int encode(int argc, char** argv) {
             options.chromaFromLuma = false;
         } else if (arg == "--no-filters") {
             options.loopFilter = false;
+        } else if (arg == "--clusters" && i + 1 < argc) {
+            options.acClusters = static_cast<uint32_t>(std::strtoul(argv[++i], nullptr, 10));
         } else {
             return usage();
         }

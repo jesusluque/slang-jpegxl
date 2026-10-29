@@ -15,10 +15,10 @@ permuted TOCs, extra channels with alpha, 16-bit output, ICC-tagged images,
 JPEG recompression and animation with blending. Pixels match within one 8-bit
 step (lossless bit-exact); the conformance tests in `tests/decoder` are the
 record. The encoder is VarDCT with DCT8, libjxl's adaptive quant field,
-chroma-from-luma, Gaborish + EPF and prefix codes: at the same distance its
-quality matches `cjxl -e 5` within a few SSIMULACRA2 points, its files are up
-to 12 % larger (M3 in progress: ANS, context clustering, larger transforms).
-`docs/decisions.md`
+chroma-from-luma, Gaborish + EPF, and ANS with clustered coefficient
+contexts for the AC groups: at the file size `cjxl -e 5` produces it scores
+within about one SSIMULACRA2 point of it (M3 in progress: larger transforms,
+DC coding, lossless). `docs/decisions.md`
 holds the design, what each milestone measured and the roadmap; `CLAUDE.md`
 the short version a build needs.
 

@@ -24,7 +24,10 @@ constexpr uint32_t kAcItemsPerGroup = 32 * 32 * 3;
 constexpr uint32_t kDcItemsPerGroup = 256 * 256 * 3;
 constexpr uint32_t kMetaItemsPerGroup = 2 * 32 * 32 + 2 * 256 * 256;
 constexpr uint32_t kCodeStride = 256;
-constexpr uint32_t kBlobStrideWords = 2048;
+constexpr uint32_t kBlobStrideWords = 8192;
+constexpr uint32_t kAcClusters = 32;
+constexpr uint32_t kNumAcContexts = 15 * (37 + 458);
+constexpr uint32_t kAcAlphabet = 64;
 
 struct Uint4 {
     uint32_t x, y, z, w;
@@ -81,6 +84,8 @@ Result<std::unique_ptr<Encoder>> Encoder::create(std::shared_ptr<gpu::ShaderLibr
     SJXL_ASSIGN(enc->acItems_, gpu::ComputeKernel::create(lib, "sjxl/enc/items", "acItems"));
     SJXL_ASSIGN(enc->dcItems_, gpu::ComputeKernel::create(lib, "sjxl/enc/items", "dcItems"));
     SJXL_ASSIGN(enc->metaItems_, gpu::ComputeKernel::create(lib, "sjxl/enc/items", "metaItems"));
+    SJXL_ASSIGN(enc->clusterContexts_, gpu::ComputeKernel::create(lib, "sjxl/enc/cluster", "clusterContexts"));
+    SJXL_ASSIGN(enc->acSections_, gpu::ComputeKernel::create(lib, "sjxl/enc/ac_sections", "acSections"));
     SJXL_ASSIGN(enc->dcGroupBlobs_, gpu::ComputeKernel::create(lib, "sjxl/enc/codes", "buildDcGroupBlobs"));
     SJXL_ASSIGN(enc->globalBlobs_, gpu::ComputeKernel::create(lib, "sjxl/enc/codes", "buildGlobalBlobs"));
     SJXL_ASSIGN(enc->layout_, gpu::ComputeKernel::create(lib, "sjxl/enc/layout", "layoutSections"));
@@ -148,20 +153,29 @@ Result<std::vector<uint8_t>> Encoder::encode(const image::Rgb8& image, const Opt
     SJXL_ASSIGN(auto groups, gpu::Buffer::fromSpan<Uint4>(dev, acRects, "enc.groups"));
     SJXL_ASSIGN(auto dcGroups, gpu::Buffer::fromSpan<Uint4>(dev, dcRects, "enc.dcGroups"));
 
-    const uint32_t numCodeRegions = 1 + 2 * numDcGroups;
+    const uint32_t numCodeRegions = kAcClusters + 2 * numDcGroups;
     const uint32_t numBlobRegions = 2 + 2 * numDcGroups;
     SJXL_ASSIGN(auto hist, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{numCodeRegions} * kCodeStride, "enc.hist"));
     SJXL_ASSIGN(auto codes, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{numCodeRegions} * kCodeStride, "enc.codes"));
     SJXL_ASSIGN(auto blobs, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{numBlobRegions} * kBlobStrideWords, "enc.blobs"));
     SJXL_ASSIGN(auto blobBits, gpu::Buffer::ofType<uint32_t>(dev, numBlobRegions, "enc.blobBits"));
+    SJXL_ASSIGN(auto ctxHist, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{kNumAcContexts} * kAcAlphabet, "enc.ctxHist"));
+    SJXL_ASSIGN(auto ctxMap, gpu::Buffer::ofType<uint32_t>(dev, kNumAcContexts, "enc.ctxMap"));
+    SJXL_ASSIGN(auto ctxTotal, gpu::Buffer::ofType<float>(dev, kNumAcContexts, "enc.ctxTotal"));
+    SJXL_ASSIGN(auto ctxEntropy, gpu::Buffer::ofType<float>(dev, kNumAcContexts, "enc.ctxEntropy"));
+    SJXL_ASSIGN(auto ctxDist, gpu::Buffer::ofType<float>(dev, kNumAcContexts, "enc.ctxDist"));
+    SJXL_ASSIGN(auto ctxSingle, gpu::Buffer::ofType<uint32_t>(dev, kNumAcContexts, "enc.ctxSingle"));
+    SJXL_ASSIGN(auto clusterInfo, gpu::Buffer::ofType<uint32_t>(dev, 4, "enc.clusterInfo"));
+    SJXL_ASSIGN(auto ctxMapMtf, gpu::Buffer::ofType<uint32_t>(dev, kNumAcContexts, "enc.ctxMapMtf"));
+    SJXL_ASSIGN(auto ansInfo, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{kAcClusters + 1} * 256, "enc.ansInfo"));
+    SJXL_ASSIGN(auto ansReverse, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{kAcClusters + 1} * 4096, "enc.ansReverse"));
+    SJXL_ASSIGN(auto acSectionBits, gpu::Buffer::ofType<uint32_t>(dev, numGroups, "enc.acSectionBits"));
 
     const uint32_t acItems = numGroups * kAcItemsPerGroup;
     const uint32_t dcItems = numDcGroups * kDcItemsPerGroup;
     const uint32_t metaItems = numDcGroups * kMetaItemsPerGroup;
-    SJXL_ASSIGN(auto acBits, gpu::Buffer::ofType<uint32_t>(dev, acItems + 1, "enc.acBits"));
     SJXL_ASSIGN(auto dcBits, gpu::Buffer::ofType<uint32_t>(dev, dcItems + 1, "enc.dcBits"));
     SJXL_ASSIGN(auto metaBits, gpu::Buffer::ofType<uint32_t>(dev, metaItems + 1, "enc.metaBits"));
-    SJXL_ASSIGN(auto acPrefix, gpu::Buffer::ofType<uint32_t>(dev, acItems + 1, "enc.acPrefix"));
     SJXL_ASSIGN(auto dcPrefix, gpu::Buffer::ofType<uint32_t>(dev, dcItems + 1, "enc.dcPrefix"));
     SJXL_ASSIGN(auto metaPrefix, gpu::Buffer::ofType<uint32_t>(dev, metaItems + 1, "enc.metaPrefix"));
     SJXL_ASSIGN(auto scanTotals, gpu::Buffer::ofType<uint32_t>(dev, 3, "enc.scanTotals"));
@@ -266,6 +280,8 @@ Result<std::vector<uint8_t>> Encoder::encode(const image::Rgb8& image, const Opt
         c["cmapB"].setBinding(cmapB.rhi());
         c["codes"].setBinding(codes.rhi());
         c["hist"].setBinding(hist.rhi());
+        c["ctxHist"].setBinding(ctxHist.rhi());
+        c["ctxMap"].setBinding(ctxMap.rhi());
         c["itemBits"].setBinding(bits.rhi());
         c["prefix"].setBinding(prefix.rhi());
         c["sectionStart"].setBinding(sectionStart.rhi());
@@ -279,8 +295,32 @@ Result<std::vector<uint8_t>> Encoder::encode(const image::Rgb8& image, const Opt
         c["params"]["mode"].setData(mode);
         c["params"]["tilesX"].setData(tilesX);
     };
+    const auto bindSections = [&](rhi::ShaderCursor c, uint32_t mode, const gpu::Buffer& body) {
+        c["groups"].setBinding(groups.rhi());
+        c["acQuant"].setBinding(acQuant.rhi());
+        c["nonZeros"].setBinding(nonZeros.rhi());
+        c["order"].setBinding(order_.rhi());
+        c["ctxMap"].setBinding(ctxMap.rhi());
+        c["ansInfo"].setBinding(ansInfo.rhi());
+        c["ansReverse"].setBinding(ansReverse.rhi());
+        c["sectionStart"].setBinding(sectionStart.rhi());
+        c["acSectionBits"].setBinding(acSectionBits.rhi());
+        c["body"].setBinding(body.rhi());
+        c["params"]["nblocks"].setData(nblocks);
+        c["params"]["blocksX"].setData(dim.xsizeBlocks);
+        c["params"]["blocksY"].setData(dim.ysizeBlocks);
+        c["params"]["numGroups"].setData(numGroups);
+        c["params"]["numDcGroups"].setData(numDcGroups);
+        c["params"]["mode"].setData(mode);
+    };
+    // The AC groups: context histograms in mode 0 (items), then the ANS
+    // sections (one thread per group) measured in mode 1 and emitted in mode 2.
     const auto itemPasses = [&](uint32_t mode, const gpu::Buffer& body) {
-        acItems_.dispatch(batch, {acItems, 1, 1}, [&](rhi::ShaderCursor c) { bindItems(c, mode, acBits, acPrefix, body); });
+        if (mode == 0) {
+            acItems_.dispatch(batch, {acItems, 1, 1}, [&](rhi::ShaderCursor c) { bindItems(c, mode, dcBits, dcPrefix, body); });
+        } else {
+            acSections_.dispatch(batch, {numGroups, 1, 1}, [&](rhi::ShaderCursor c) { bindSections(c, mode, body); });
+        }
         dcItems_.dispatch(batch, {dcItems, 1, 1}, [&](rhi::ShaderCursor c) { bindItems(c, mode, dcBits, dcPrefix, body); });
         metaItems_.dispatch(batch, {metaItems, 1, 1},
                             [&](rhi::ShaderCursor c) { bindItems(c, mode, metaBits, metaPrefix, body); });
@@ -288,10 +328,29 @@ Result<std::vector<uint8_t>> Encoder::encode(const image::Rgb8& image, const Opt
 
     itemPasses(0, dummy_);   // histograms
 
+    // The AC contexts' histograms clustered into the codes' histograms.
+    clusterContexts_.dispatchGroups(batch, {1, 1, 1}, [&](rhi::ShaderCursor c) {
+        c["ctxHist"].setBinding(ctxHist.rhi());
+        c["ctxTotal"].setBinding(ctxTotal.rhi());
+        c["ctxEntropy"].setBinding(ctxEntropy.rhi());
+        c["ctxDist"].setBinding(ctxDist.rhi());
+        c["ctxSingle"].setBinding(ctxSingle.rhi());
+        c["ctxMap"].setBinding(ctxMap.rhi());
+        c["hist"].setBinding(hist.rhi());
+        c["clusterInfo"].setBinding(clusterInfo.rhi());
+        c["params"]["numContexts"].setData(kNumAcContexts);
+        c["params"]["maxClusters"].setData(std::min<uint32_t>(options.acClusters, kAcClusters));
+    });
+
     const auto bindCodes = [&](rhi::ShaderCursor c) {
         c["dcGroups"].setBinding(dcGroups.rhi());
         c["hist"].setBinding(hist.rhi());
         c["quantizer"].setBinding(quantizer.rhi());
+        c["ctxMap"].setBinding(ctxMap.rhi());
+        c["clusterInfo"].setBinding(clusterInfo.rhi());
+        c["ctxMapMtf"].setBinding(ctxMapMtf.rhi());
+        c["ansInfo"].setBinding(ansInfo.rhi());
+        c["ansReverse"].setBinding(ansReverse.rhi());
         c["codes"].setBinding(codes.rhi());
         c["blobs"].setBinding(blobs.rhi());
         c["blobBits"].setBinding(blobBits.rhi());
@@ -305,13 +364,12 @@ Result<std::vector<uint8_t>> Encoder::encode(const image::Rgb8& image, const Opt
 
     itemPasses(1, dummy_);   // bit counts
 
-    SJXL_TRY(prefixSum_.apply(batch, acBits, acPrefix, scanTotals, acItems + 1));
     SJXL_TRY(prefixSum_.apply(batch, dcBits, dcPrefix, scanTotals, dcItems + 1));
     SJXL_TRY(prefixSum_.apply(batch, metaBits, metaPrefix, scanTotals, metaItems + 1));
 
     const auto bindLayout = [&](rhi::ShaderCursor c, const gpu::Buffer& body) {
         c["blobBits"].setBinding(blobBits.rhi());
-        c["acPrefix"].setBinding(acPrefix.rhi());
+        c["acSectionBits"].setBinding(acSectionBits.rhi());
         c["dcPrefix"].setBinding(dcPrefix.rhi());
         c["metaPrefix"].setBinding(metaPrefix.rhi());
         c["blobs"].setBinding(blobs.rhi());
@@ -327,6 +385,8 @@ Result<std::vector<uint8_t>> Encoder::encode(const image::Rgb8& image, const Opt
     };
     layout_.dispatch(batch, {1, 1, 1}, [&](rhi::ShaderCursor c) { bindLayout(c, dummy_); });
     SJXL_TRY(batch.submit(true));
+    SJXL_ASSIGN(const std::vector<uint32_t> clusterInfoHost, clusterInfo.readAll<uint32_t>(dev));
+    stats_.numAcClusters = clusterInfoHost[0];
     stats_.globalScale = qp.globalScale;
     stats_.quantDc = qp.quantDc;
     stats_.gaborish = frame.gaborish;
@@ -339,8 +399,13 @@ Result<std::vector<uint8_t>> Encoder::encode(const image::Rgb8& image, const Opt
         for (uint32_t v : rawQfHost) { qfMin = std::min(qfMin, v); qfMax = std::max(qfMax, v); }
         std::string cm;
         for (size_t i = 0; i < std::min<size_t>(cmapXHost.size(), 12); ++i) cm += std::format("({},{}) ", cmapXHost[i], cmapBHost[i]);
-        log::info("enc debug: global_scale {} quant_dc {} raw qf [{}, {}] gab {} epf {} xqm {} cmap(x,b) {}", qp.globalScale,
-                  qp.quantDc, qfMin, qfMax, frame.gaborish, frame.epfIters, frame.xQmScale, cm);
+        log::info("enc debug: global_scale {} quant_dc {} raw qf [{}, {}] gab {} epf {} xqm {} ac clusters {} cmap(x,b) {}", qp.globalScale,
+                  qp.quantDc, qfMin, qfMax, frame.gaborish, frame.epfIters, frame.xQmScale, clusterInfoHost[0], cm);
+        SJXL_ASSIGN(const auto blobBitsHost, blobBits.readAll<uint32_t>(dev));
+        SJXL_ASSIGN(const auto sizesHost, sectionBytes.readAll<uint32_t>(dev));
+        std::string sections;
+        for (uint32_t b : sizesHost) sections += std::format("{} ", b);
+        log::info("enc debug: blob bits DcGlobal {} AcGlobal {}; section bytes {}", blobBitsHost[0], blobBitsHost[1], sections);
     }
 
     SJXL_ASSIGN(const std::vector<uint32_t> totalsHost, totals.readAll<uint32_t>(dev));
