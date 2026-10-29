@@ -29,7 +29,7 @@ constexpr float    kInvSigmaNum = -1.1715728752538099024f;
 constexpr uint32_t kMaxPatchPositions = 1u << 16;     // frame.slangh kMaxPatchPositions
 constexpr uint32_t kLz77WindowWords = 1u << 20;
 constexpr uint32_t kDequantTableFloats = 394752;
-constexpr uint32_t kErrNone = 0, kErrCorrupt = 1, kErrUnsupported = 2, kErrArena = 3, kErrLz77Window = 4;
+constexpr uint32_t kErrNone = 0, kErrCorrupt = 1, kErrUnsupported = 2, kErrArena = 3, kErrLz77Window = 4, kErrAcNzeros = 5, kErrAcLeftover = 6, kErrAnsState = 7;
 
 struct Uint2 {
     uint32_t x, y;
@@ -41,6 +41,9 @@ const char* describe(uint32_t code) {
     case kErrUnsupported: return "a feature this decoder does not implement (modular Squeeze, RAW quant tables)";
     case kErrArena: return "the decoder ran out of scratch memory";
     case kErrLz77Window: return "LZ77 window";
+    case kErrAcNzeros: return "an AC block's non-zero count exceeds its coefficients";
+    case kErrAcLeftover: return "an AC block ended with non-zero coefficients outstanding";
+    case kErrAnsState: return "an ANS stream's final state is not the signature";
     default: return "unknown";
     }
 }
@@ -759,7 +762,9 @@ Result<Decoder::FrameOutput> Decoder::run(const codestream::Parsed& parsed, cons
         if (code == kErrLz77Window) {
             log::debug("decoder: thread {} needs an LZ77 window (stage {})", i, stage);
         } else {
-            log::debug("decoder: thread {} failed with code {} at stage {} (1 DcGlobal, 2 DC group, 3 AcGlobal, 4 AC group, 5 modular finalise)", i, code, stage);
+            if (!platform::env("SJXL_DEBUG").empty()) {
+                log::info("decoder: thread {} failed with code {} at stage {} (1 DcGlobal, 2 DC group, 3 AcGlobal, 4 AC group, 5 modular finalise)", i, code, stage);
+            }
         }
         const std::string where = i == 0 ? "the global sections" : i <= numDcGroups ? std::format("DC group {}", i - 1)
                                                                                     : std::format("AC group {}", i - 1 - numDcGroups);

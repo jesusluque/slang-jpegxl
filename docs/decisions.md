@@ -61,10 +61,11 @@ per subsystem or milestone, appended to as the work goes. Dates are absolute.
   specials; PNG colour chunks; DC and AcMetadata with the weighted predictor,
   libjxl's fixed trees and ANS; lossless with the weighted predictor and
   the per-channel predictor choice; alpha and 16-bit in the lossy path;
-  animations of full frames.)
-  Next: three-channel strategy costs, transforms (palette, Squeeze) and a
-  learned tree for lossless, progressive encoding, frames that reference the
-  previous one in animations, encoder speed (the serial ANS and WP passes).
+  animations of full frames; progressive AC passes.)
+  Next: DC frames (cjxl -p's 1/8 preview frame), three-channel strategy
+  costs, transforms (palette, Squeeze) and a learned tree for lossless, frames
+  that reference the previous one in animations, encoder speed (the serial
+  ANS and WP passes).
 - **M4 decoder completeness**: splines, grey JPEG transcodes, loop filters
   on YCbCr frames, extra channel blending in patches, writing the ICC
   profile into the output file, float samples. (16-bit output, animation
@@ -1049,3 +1050,44 @@ Not done: frames that code only what changed (a sub-rectangle blended over
 the previous frame, or a frame referencing a saved one through patches), which
 is where animation compression comes from; per-frame distances; APNG/GIF
 input (the CLI takes one PNG per frame).
+
+## Progressive AC passes in the encoder (2026-10-29)
+
+`Options::progressive` splits every varblock's quantised AC coefficients over
+several passes as libjxl's `ProgressiveSplitter::SplitACCoefficients` does:
+mode 1 is libjxl's qprogressive (two passes: every coefficient shifted right
+by one with rounding towards zero, then the remainder), mode 2 its progressive
+(three passes by frequency: the 2x2 lowest frequencies of each 8x8 block,
+scaled by the covered blocks, then 3x3, then everything). `passValue`
+(`transform.slang`) is the split: zero outside the pass's frequency square or
+inside what earlier exact passes covered, otherwise what the previous pass's
+shift left, at this pass's shift. The decoder adds `value << shift` per pass,
+so the sum reconstructs the single-pass coefficients exactly: the round-trip
+test checks our decode of a progressive file against our decode of the
+single-pass file at max diff 0, and against djxl at 1.
+
+Per pass the pipeline runs `passNonZeroCount` (the pass's non-zero count per
+varblock, the single-pass count is quantize's) and `acTokenize` (tokens and
+the non-zero context from the pass's own group-local grid, libjxl keeps one
+`num_nzeroes` grid per pass) into pass-indexed token buffers, and each pass
+has its own histogram set with its own clustering: the sets are now
+numbered passes first (`numAcSets` of 7425 contexts), then the DC groups' DC
+and AcMetadata sets and the alpha set (`setCtxBase` in `codes.slang`,
+`dc_tokens.slang` and the host agree). AcGlobal writes per pass
+`used_orders` (natural) and the pass's clustered histograms; the frame header
+carries `Passes` (shifts, the downsampling stops libjxl's `InitPasses`
+derives from each pass's `suitable_for_downsampling_of_at_least`); the TOC has
+one AC section per group and pass (`FrameDim::numSections(numPasses)`), and
+`acSections` runs one thread per (pass, group). An alpha channel's modular
+group goes with the last pass, whose downsampling bracket holds shift 0.
+
+Measured on sveti_stefan_320 at d 1: single pass 16488 B, three frequency
+passes 17397 B (+5.5 %), two precision passes 17562 B (+6.5 %); cjxl -e 5
+pays +4.4 % and +5.9 % for the same modes. The debugging hook `SJXL_PASSES=
+"ncoeffs:shift:downsample,..."` overrides the pass list, and the decoder's AC
+group failures now say which check failed (non-zero count, leftover
+non-zeros, ANS final state) with `SJXL_DEBUG=1` naming the thread.
+
+Not done: cjxl's `-p` also emits a DC frame (a Modular frame at 1/8 size
+whose planes become the main frame's DC); group reordering (`centerfirst`
+permuted TOC); choosing the passes per image.

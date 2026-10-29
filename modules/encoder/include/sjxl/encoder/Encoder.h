@@ -42,6 +42,10 @@ struct Options {
     float acsLambda = 128.0f;
     /// The 8x8 special transforms (IDENTITY, DCT2x2, DCT4x4, DCT4x8, DCT8x4, AFV) compete with DCT8.
     bool acsSpecials = true;
+    /// Progressive AC (lossy): 0 one pass; 1 libjxl's qprogressive (every
+    /// coefficient at half precision, then the rest: 2 passes); 2 libjxl's
+    /// progressive (the 2x2 lowest frequencies, then 3x3, then all: 3 passes).
+    uint32_t progressive = 0;
 };
 
 /// What the last encode measured, for tests and the CLI.
@@ -79,7 +83,7 @@ private:
     gpu::Device*                        device_ = nullptr;
     gpu::ComputeKernel                  rgbToXyb_, aqDiff_, aqMap_, aqRawField_;
     gpu::ComputeKernel                  gaborishInverse_, cflTile_, quantize_;
-    gpu::ComputeKernel                  tables_, buildOrders_, selectStrategies_, largeQf_, largeRows_, largeCols_, mergeLarge_, adjustQuantField_, dctRows_, dctCols_, dcFromLlf_, specialTransform_, acTokenize_;
+    gpu::ComputeKernel                  tables_, buildOrders_, selectStrategies_, largeQf_, largeRows_, largeCols_, mergeLarge_, adjustQuantField_, dctRows_, dctCols_, dcFromLlf_, specialTransform_, passNonZeroCount_, acTokenize_;
     gpu::ComputeKernel                  dcTokenize_, metaTokenize_, dcGroupSections_, clusterContexts_, accumulateClusters_, acSections_;
     gpu::ComputeKernel                  rctYCoCg_, modTokenize_, extractAlpha_, channelEntropy_, remapTokens_, modGroupSections_, modularGlobalBlob_;
     gpu::ComputeKernel                  dcGroupBlobs_, globalBlobs_, layout_, blobEmit_;

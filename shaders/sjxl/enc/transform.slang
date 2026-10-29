@@ -26,7 +26,15 @@ struct TransformParams {
     uint  blocksX;
     uint  blocksY;
     float distance;    // AdjustQuantField's mean/max mix
-    uint  pad0, pad1, pad2;
+    // Progressive passes (enc_progressive_split.cc SplitACCoefficients): this pass's
+    // definition and what the earlier passes already coded.
+    uint  pass;        // index: per-pass outputs live at pass * 3 * nblocks (tokens: * 64)
+    uint  shift;       // this pass's quantisation shift
+    uint  prevShift;   // the previous pass's shift (0: none, or it was exact)
+    uint  ncoeffs;     // side of the coefficient square this pass covers per 8x8 block (2, 3, 8)
+    uint  prevNcoeffs; // side completed by earlier exact passes (1: nothing)
+    uint  ctxBase;     // this pass's histogram set in ctxHist
+    uint  pad0, pad1;
 };
 
 StructuredBuffer<float>    xyb;           // 3 planes (after the inverse Gaborish)
@@ -39,10 +47,11 @@ RWStructuredBuffer<float>  dcValue;       // [c][block]
 RWStructuredBuffer<uint>   rawQf;         // per block; the varblock's value at its first block
 StructuredBuffer<int>      acQuant;       // [c][block][slot]
 StructuredBuffer<uint>     nonZeros;      // [c][block], at first blocks
-RWStructuredBuffer<uint>   acTokens;      // [c][block][slot]: ctx << 18 | value, at coefficient index k's slot
-RWStructuredBuffer<uint>   numTokens;     // [c][block]: coefficient tokens of the varblock (at its first block)
-RWStructuredBuffer<uint>   nzCtx;         // [c][block]: the non-zero count's context
-RWStructuredBuffer<uint>   ctxHist;       // kNumAcContexts * kHistBins
+RWStructuredBuffer<uint>   acTokens;      // [pass][c][block][slot]: ctx << 18 | value, at coefficient index k's slot
+RWStructuredBuffer<uint>   numTokens;     // [pass][c][block]: coefficient tokens of the varblock (at its first block)
+RWStructuredBuffer<uint>   nzCtx;         // [pass][c][block]: the non-zero count's context
+RWStructuredBuffer<uint>   passNonZeros;  // [pass][c][block]: non-zero coded coefficients of the pass
+RWStructuredBuffer<uint>   ctxHist;       // numPasses * kNumAcContexts * kHistBins
 ConstantBuffer<TransformParams> params;
 
 static const uint kHistBins = 128;
@@ -175,6 +184,45 @@ void dcFromLlf(uint3 tid: SV_DispatchThreadID) {
     dcValue[tid.x] = sum;
 }
 
+/// v >> shift rounding towards zero (SplitACCoefficients shift_right_round0).
+int shiftRound0(int v, uint shift) {
+    const int neg = v < 0 ? 1 : 0;
+    return (v + ((neg << shift) - neg)) >> shift;
+}
+
+/// The value this pass codes for the quantised coefficient v at memory index m
+/// of the varblock: zero outside the pass's frequency square (ncoeffs per 8x8
+/// block in each direction, scaled by the covered blocks) or inside what earlier
+/// exact passes covered; otherwise what the previous pass's shift left, at this
+/// pass's shift.
+int passValue(int v, uint m, Varblock vb) {
+    uint vf, uf;   // vertical and horizontal frequency
+    memFreq(m, vb.ny, vb.nx, vf, uf);
+    if (uf >= vb.cx * params.ncoeffs || vf >= vb.cy * params.ncoeffs) return 0;
+    if (uf < vb.cx * params.prevNcoeffs && vf < vb.cy * params.prevNcoeffs) return 0;
+    if (params.prevShift != 0) v -= shiftRound0(v, params.prevShift) << params.prevShift;
+    return shiftRound0(v, params.shift);
+}
+
+/// One thread per first block and channel: the pass's non-zero count of the
+/// varblock (nonZeros holds the single-pass count, which quantize measured).
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void passNonZeroCount(uint3 tid: SV_DispatchThreadID) {
+    const uint nb = nblocks();
+    if (tid.x >= 3 * nb) return;
+    const uint c = tid.x / nb;
+    const uint block = tid.x % nb;
+    if ((acs[block] & 1) == 0) return;
+    const Varblock vb = varblockOf(block, acs[block] >> 1, params.blocksX);
+    uint nz = 0;
+    for (uint m = 0; m < vb.size; ++m) {
+        if (isLlf(vb, m)) continue;
+        if (passValue(acQuant[coeffSlot(vb, c, nb, params.blocksX, m)], m, vb) != 0) ++nz;
+    }
+    passNonZeros[(params.pass * 3 + c) * nb + block] = nz;
+}
+
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void acTokenize(uint3 tid: SV_DispatchThreadID) {
@@ -185,19 +233,20 @@ void acTokenize(uint3 tid: SV_DispatchThreadID) {
     if ((acs[block] & 1) == 0) return;
     const Varblock vb = varblockOf(block, acs[block] >> 1, params.blocksX);
     const uint blockCtx = blockContextFor(c, vb.strategy);
-    uint nz = nonZeros[c * nb + block];
-    // The non-zero count's context from the group-local grid (groups are 32 blocks).
+    const uint pb = params.pass * 3 * nb;
+    uint nz = passNonZeros[pb + c * nb + block];
+    // The non-zero count's context from the pass's group-local grid (groups are 32 blocks).
     const uint gx = vb.fbx % 32, gy = vb.fby % 32;
-    const uint left = gx > 0 ? gridValue(block - 1, acs, firstBlock, nonZeros, c, nb) : 0;
-    const uint top = gy > 0 ? gridValue(block - params.blocksX, acs, firstBlock, nonZeros, c, nb) : 0;
+    const uint left = gx > 0 ? gridValueAt(block - 1, acs, firstBlock, passNonZeros, pb + c * nb) : 0;
+    const uint top = gy > 0 ? gridValueAt(block - params.blocksX, acs, firstBlock, passNonZeros, pb + c * nb) : 0;
     const uint predicted = predictNonZeros(gx > 0, gy > 0, left, top);
     const uint nzc = nonZeroBucket(predicted) * kDefaultNumBlockCtxs + blockCtx;
-    nzCtx[c * nb + block] = nzc;
+    nzCtx[pb + c * nb + block] = nzc;
     {
         uint tok, nbits, raw;
         hybridEncode(nz, tok, nbits, raw);
         uint before;
-        InterlockedAdd(ctxHist[nzc * kHistBins + min(tok, kHistBins - 1)], 1u, before);
+        InterlockedAdd(ctxHist[(params.ctxBase + nzc) * kHistBins + min(tok, kHistBins - 1)], 1u, before);
     }
     const uint histoOffset = kDefaultNumBlockCtxs * kNonZeroBuckets + kZeroDensityContextCount * blockCtx;
     const uint ord = orderOffset(kStrategyOrder[vb.strategy]);
@@ -205,16 +254,16 @@ void acTokenize(uint3 tid: SV_DispatchThreadID) {
     uint k = vb.covered;
     for (; k < vb.size && nz != 0; ++k) {
         const uint idx = orders[ord + k];
-        const int v = acQuant[coeffSlot(vb, c, nb, params.blocksX, idx)];
+        const int v = passValue(acQuant[coeffSlot(vb, c, nb, params.blocksX, idx)], idx, vb);
         const uint ctx = histoOffset + zeroDensityContextVar(nz, k, vb.covered, vb.log2Covered, prev);
         const uint value = packSigned(v);
-        acTokens[coeffSlot(vb, c, nb, params.blocksX, k)] = (ctx << 18) | value;
+        acTokens[pb * 64 + coeffSlot(vb, c, nb, params.blocksX, k)] = (ctx << 18) | value;
         uint tok, nbits, raw;
         hybridEncode(value, tok, nbits, raw);
         uint before;
-        InterlockedAdd(ctxHist[ctx * kHistBins + min(tok, kHistBins - 1)], 1u, before);
+        InterlockedAdd(ctxHist[(params.ctxBase + ctx) * kHistBins + min(tok, kHistBins - 1)], 1u, before);
         prev = v != 0 ? 1 : 0;
         nz -= prev;
     }
-    numTokens[c * nb + block] = k - vb.covered;
+    numTokens[pb + c * nb + block] = k - vb.covered;
 }

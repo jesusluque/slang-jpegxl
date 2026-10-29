@@ -24,6 +24,7 @@ int usage() {
                  "usage:\n"
                  "  sjxl info [in.jxl]                          describe the GPU device, or a file's headers and frames\n"
                  "  sjxl encode in.png out.jxl [--distance d] [--lossless] [--no-aq] [--no-cfl] [--no-filters] [--no-acs] [--no-specials] [--lambda x] [--clusters n]\n"
+                 "                                              [--progressive | --qprogressive]  AC in 3 frequency passes, or 2 precision passes\n"
                  "                                              lossy VarDCT (default distance 1.0)\n"
                  "  sjxl animate out.jxl [--fps n] [--loops n] [--lossless] [-d d] frame1.png frame2.png ...\n"
                  "  sjxl decode in.jxl out.png                  any frame type; animations write out_000.png, out_001.png, ...\n"
@@ -121,6 +122,10 @@ int encode(int argc, char** argv) {
             options.acStrategy = false;
         } else if (arg == "--no-specials") {
             options.acsSpecials = false;
+        } else if (arg == "--qprogressive") {
+            options.progressive = 1;
+        } else if (arg == "--progressive") {
+            options.progressive = 2;
         } else if (arg == "--lambda" && i + 1 < argc) {
             options.acsLambda = std::strtof(argv[++i], nullptr);
         } else if (arg == "--clusters" && i + 1 < argc) {

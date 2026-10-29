@@ -66,3 +66,11 @@ uint gridValue(uint block, StructuredBuffer<uint> acs, StructuredBuffer<uint> fi
     const uint covered = kCoveredX[strategy] * kCoveredY[strategy];
     return (nonZeros[c * nblocks + first] + covered - 1) >> kLog2Covered[strategy];
 }
+
+/// The same over a non-zero array whose channel (and pass) starts at `base`.
+uint gridValueAt(uint block, StructuredBuffer<uint> acs, StructuredBuffer<uint> firstBlock, RWStructuredBuffer<uint> nonZeros, uint base) {
+    const uint first = firstBlock[block];
+    const uint strategy = acs[first] >> 1;
+    const uint covered = kCoveredX[strategy] * kCoveredY[strategy];
+    return (nonZeros[base + first] + covered - 1) >> kLog2Covered[strategy];
+}

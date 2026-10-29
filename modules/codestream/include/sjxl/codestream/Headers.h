@@ -5,6 +5,7 @@
 // frame is emitted by kernels (shaders/sjxl/enc).
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <span>
 #include <vector>
@@ -55,6 +56,13 @@ struct FrameParams {
     uint32_t epfIters = 2;         ///< LoopFilter.epf_iters (0..3)
     uint32_t xQmScale = 2;         ///< neutral chroma quant-matrix scale
     uint32_t bQmScale = 2;
+    /// Passes (frame_header.cc Passes): the AC coefficients split over
+    /// `numPasses` sections per group; `shift[i]` quantisation shift of pass i
+    /// (0 for the last); `downsample[j]` the factor pass `lastPass[j]` completes.
+    uint32_t numPasses = 1;
+    std::array<uint32_t, 11> shift{};
+    uint32_t numDownsample = 0;
+    std::array<uint32_t, 4> downsample{}, lastPass{};
 };
 
 /// A single-pass, full-frame, last VarDCT frame in XYB. Not byte-aligned on exit.
@@ -76,9 +84,9 @@ struct FrameDim {
     [[nodiscard]] uint32_t numDcGroups() const { return xsizeDcGroups * ysizeDcGroups; }
     [[nodiscard]] uint32_t numBlocks() const { return xsizeBlocks * ysizeBlocks; }
     /// One TOC entry: the whole frame is one section, bit-packed.
-    [[nodiscard]] bool singleSection() const { return numGroups() == 1; }
-    /// Sections in codestream order: DcGlobal, DcGroups, AcGlobal, AcGroups.
-    [[nodiscard]] uint32_t numSections() const { return 2 + numDcGroups() + numGroups(); }
+    [[nodiscard]] bool singleSection(uint32_t numPasses = 1) const { return numGroups() == 1 && numPasses == 1; }
+    /// Sections in codestream order: DcGlobal, DcGroups, AcGlobal, AcGroups per pass.
+    [[nodiscard]] uint32_t numSections(uint32_t numPasses = 1) const { return 2 + numDcGroups() + numGroups() * numPasses; }
 };
 /// `groupSizeShift` is the frame header field (1 for 256 px groups).
 /// `maxHShift`/`maxVShift`: the largest chroma subsampling shifts (block counts round up to their multiples).

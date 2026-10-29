@@ -612,3 +612,44 @@ TEST_CASE("the encoder's animations round-trip and djxl reads them", "[encoder][
         else CHECK(metrics->psnr >= 30.0);
     }
 }
+
+TEST_CASE("the encoder's progressive passes decode like its single pass", "[encoder][decoder][conformance][progressive]") {
+    const std::filesystem::path djxl = test::findTool("djxl");
+    if (djxl.empty()) SKIP("djxl is not installed");
+    // 1: two precision passes (libjxl qprogressive); 2: three frequency passes (libjxl progressive).
+    const uint32_t progressive = GENERATE(1u, 2u);
+    const std::string name = GENERATE(std::string("berlin_200.png"), std::string("sveti_crop_257x129.png"));
+    CAPTURE(progressive, name);
+    auto source = image::readRgb8(test::testData(name));
+    REQUIRE(source);
+    enc::Options options;
+    options.distance = 1.0f;
+    auto single = encoder().encode(*source, options);
+    REQUIRE(single);
+    options.progressive = progressive;
+    auto encoded = encoder().encode(*source, options);
+    REQUIRE(encoded);
+    auto parsed = dec::Decoder::info(*encoded);
+    REQUIRE(parsed);
+    REQUIRE(parsed->frames.size() == 1);
+    CHECK(parsed->frames[0].header.numPasses == (progressive == 1 ? 2u : 3u));
+    const std::filesystem::path jxl = test::scratchDir() / std::format("enc_prog_{}_{}.jxl", progressive, name);
+    const std::filesystem::path out = test::scratchDir() / std::format("enc_prog_{}_{}.djxl.png", progressive, name);
+    REQUIRE(image::writeFile(jxl, *encoded));
+    REQUIRE(test::run(std::format("\"{}\" \"{}\" \"{}\" >/dev/null 2>&1", djxl.string(), jxl.string(), out.string())));
+    auto reference = image::readRgb8(out);
+    REQUIRE(reference);
+    // The passes add up to the single pass's coefficients: djxl's output equals its decode of the single-pass file.
+    auto singleDecoded = decoder().decode(*single);
+    REQUIRE(singleDecoded);
+    auto ours = decoder().decode(*encoded);
+    REQUIRE(ours);
+    auto vsDjxl = test::compare(*reference, *ours);
+    REQUIRE(vsDjxl);
+    auto vsSingle = test::compare(*singleDecoded, *ours);
+    REQUIRE(vsSingle);
+    WARN(std::format("progressive {} {}: {} bytes vs {} single pass; vs djxl max diff {}, vs single pass max diff {}", progressive, name,
+                     encoded->size(), single->size(), vsDjxl->maxAbsDiff, vsSingle->maxAbsDiff));
+    CHECK(vsDjxl->maxAbsDiff <= 1);
+    CHECK(vsSingle->maxAbsDiff == 0);
+}

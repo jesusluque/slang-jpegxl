@@ -28,21 +28,21 @@ struct AcSectionParams {
     uint width;         // image size in pixels (the alpha channel is not block-padded)
     uint height;
     uint groupDim;
-    uint pad0;
+    uint numPasses;     // AC sections: pass p of group g is section 2 + numDcGroups + p * numGroups + g
 };
 
 StructuredBuffer<uint4>    groups;         // AC groups: bx0, by0, w, h (blocks)
 StructuredBuffer<uint>     acs;
-StructuredBuffer<uint>     nonZeros;       // [c][block]
-StructuredBuffer<uint>     acTokens;       // [c][block][slot]: ctx << 18 | value at coefficient index k
-StructuredBuffer<uint>     numTokens;      // [c][block]
-StructuredBuffer<uint>     nzCtx;          // [c][block]
-StructuredBuffer<uint>     ctxMap;         // AC context -> cluster
+StructuredBuffer<uint>     nonZeros;       // [pass][c][block]
+StructuredBuffer<uint>     acTokens;       // [pass][c][block][slot]: ctx << 18 | value at coefficient index k
+StructuredBuffer<uint>     numTokens;      // [pass][c][block]
+StructuredBuffer<uint>     nzCtx;          // [pass][c][block]
+StructuredBuffer<uint>     ctxMap;         // AC context -> cluster; pass p's set at p * kNumAcContexts, code region p * 32
 StructuredBuffer<uint>     ansInfo;        // cluster c: freq | start << 16 per symbol at c * 256
 StructuredBuffer<uint>     ansReverse;     // cluster c: slots at c * 4096
 StructuredBuffer<uint>     sectionStart;   // mode 2: bit offset of each section
 StructuredBuffer<uint>     ecTokens;       // the alpha channel's tokens per pixel (ctx << 18 | value)
-RWStructuredBuffer<uint>   acSectionBits;  // mode 1 output: bits per group (AC stream + the alpha group)
+RWStructuredBuffer<uint>   acSectionBits;  // mode 1 output: bits per (pass, group) section (AC stream + the alpha group)
 RWStructuredBuffer<uint>   acOnlyBits;     // mode 1 output: the AC stream's bits alone
 RWStructuredBuffer<uint>   body;           // mode 2 output
 ConstantBuffer<AcSectionParams> params;
@@ -76,22 +76,25 @@ void putIn(inout AnsWriter aw, uint ctxBase, uint regionBase, uint ctx, uint val
     aw.bits += nbits + ansN;
 }
 
-void put(inout AnsWriter aw, uint ctx, uint value) { putIn(aw, 0, 0, ctx, value); }
-
 [shader("compute")]
 [numthreads(1, 1, 1)]
 void acSections(uint3 tid: SV_DispatchThreadID) {
-    const uint g = tid.x;
-    if (g >= params.numGroups) {
+    const uint s = tid.x;   // pass * numGroups + g
+    if (s >= params.numGroups * params.numPasses) {
         return;
     }
+    const uint pass = s / params.numGroups;
+    const uint g = s % params.numGroups;
     const uint4 rect = groups[g];
-    const uint section = 2 + params.numDcGroups + g;
+    const uint section = 2 + params.numDcGroups + s;
+    const uint pb = pass * 3 * params.nblocks;
+    const uint ctxBase = pass * kNumAcContexts;
+    const uint regionBase = pass * 32;
     AnsWriter aw;
     aw.mode = params.mode;
     aw.state = kAnsSignature << 16;
     aw.bits = 32;
-    aw.pos = aw.mode == 2 ? sectionStart[section] + acOnlyBits[g] : 0;
+    aw.pos = aw.mode == 2 ? sectionStart[section] + acOnlyBits[s] : 0;
     for (int by = int(rect.w) - 1; by >= 0; --by) {
         for (int bx = int(rect.z) - 1; bx >= 0; --bx) {
             const uint block = (rect.y + uint(by)) * params.blocksX + rect.x + uint(bx);
@@ -99,22 +102,24 @@ void acSections(uint3 tid: SV_DispatchThreadID) {
             const Varblock vb = varblockOf(block, acs[block] >> 1, params.blocksX);
             for (int ci = 2; ci >= 0; --ci) {
                 const uint c = physicalChannel(uint(ci));
-                const uint n = numTokens[c * params.nblocks + block];
+                const uint n = numTokens[pb + c * params.nblocks + block];
                 for (int k = int(vb.covered + n) - 1; k >= int(vb.covered); --k) {
-                    const uint t = acTokens[coeffSlot(vb, c, params.nblocks, params.blocksX, uint(k))];
-                    put(aw, t >> 18, t & 0x3FFFFu);
+                    const uint t = acTokens[pb * 64 + coeffSlot(vb, c, params.nblocks, params.blocksX, uint(k))];
+                    putIn(aw, ctxBase, regionBase, t >> 18, t & 0x3FFFFu);
                 }
-                put(aw, nzCtx[c * params.nblocks + block], nonZeros[c * params.nblocks + block]);
+                putIn(aw, ctxBase, regionBase, nzCtx[pb + c * params.nblocks + block], nonZeros[pb + c * params.nblocks + block]);
             }
         }
     }
     if (aw.mode == 1) {
-        acOnlyBits[g] = aw.bits;
+        acOnlyBits[s] = aw.bits;
     } else {
         emitAtomic(body, sectionStart[section], 32, aw.state);
     }
-    if (params.ecInGroups == 0) {
-        if (aw.mode == 1) acSectionBits[g] = aw.bits;
+    // The alpha channel's modular group goes with the last pass (its shift 0 is
+    // in that pass's downsampling bracket).
+    if (params.ecInGroups == 0 || pass + 1 != params.numPasses) {
+        if (aw.mode == 1) acSectionBits[s] = aw.bits;
         return;
     }
     // The alpha channel's modular group: GroupHeader (global tree, default WP
@@ -126,8 +131,8 @@ void acSections(uint3 tid: SV_DispatchThreadID) {
     ew.mode = params.mode;
     ew.state = kAnsSignature << 16;
     ew.bits = 4 + 32;
-    const uint ecStart = sectionStart[section] + acOnlyBits[g];
-    ew.pos = ew.mode == 2 ? sectionStart[section] + acSectionBits[g] : 0;
+    const uint ecStart = sectionStart[section] + acOnlyBits[s];
+    ew.pos = ew.mode == 2 ? sectionStart[section] + acSectionBits[s] : 0;
     for (int y = int(h) - 1; y >= 0; --y) {
         for (int x = int(w) - 1; x >= 0; --x) {
             const uint t = ecTokens[(y0 + uint(y)) * params.width + x0 + uint(x)];
@@ -135,7 +140,7 @@ void acSections(uint3 tid: SV_DispatchThreadID) {
         }
     }
     if (ew.mode == 1) {
-        acSectionBits[g] = aw.bits + ew.bits;
+        acSectionBits[s] = aw.bits + ew.bits;
     } else {
         emitAtomic(body, ecStart, 4, 0x3u);
         emitAtomic(body, ecStart + 4, 32, ew.state);

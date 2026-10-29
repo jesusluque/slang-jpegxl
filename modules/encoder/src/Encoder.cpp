@@ -5,7 +5,9 @@
 #include <array>
 #include <bit>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
+#include <map>
 
 #include "sjxl/codestream/Headers.h"
 #include "sjxl/codestream/Tables.h"
@@ -59,8 +61,48 @@ constexpr uint32_t kPredZero = 0, kPredLeft = 1, kPredGradient = 5, kPredWeighte
 /// LoopFilterFromParams (enc_frame.cc): Gaborish above distance 0.5, EPF
 /// iterations by distance thresholds 0.7, 1.5 and 4. x_qm_scale 3 up to
 /// distance 2.5 then 4, 5, 6 (the pixel-statistics adjustment is squirrel+).
+/// A progressive pass as libjxl defines it (enc_progressive_split.h PassDefinition).
+struct PassDef {
+    uint32_t ncoeffs;      // side of the coefficient square per 8x8 block
+    uint32_t shift;
+    uint32_t downsampling; // 0: not a downsampling stop
+};
+
+/// libjxl's pass lists (enc_frame.cc SetProgressiveMode): qprogressive codes every
+/// coefficient at shift 1 then the remainder; progressive the 2x2 lowest
+/// frequencies, then 3x3, then all.
+std::vector<PassDef> passesFor(const Options& options) {
+    if (const std::string custom = platform::env("SJXL_PASSES"); !custom.empty()) {   // debug: "ncoeffs:shift:downsample,..."
+        std::vector<PassDef> passes;
+        size_t pos = 0;
+        while (pos < custom.size()) {
+            PassDef d{};
+            int n = 0;
+            if (std::sscanf(custom.c_str() + pos, "%u:%u:%u%n", &d.ncoeffs, &d.shift, &d.downsampling, &n) != 3) break;
+            passes.push_back(d);
+            pos += static_cast<size_t>(n) + 1;
+        }
+        if (!passes.empty()) return passes;
+    }
+    if (options.progressive == 1) return {{8, 1, 2}, {8, 0, 0}};
+    if (options.progressive == 2) return {{2, 0, 4}, {3, 0, 2}, {8, 0, 0}};
+    return {{8, 0, 0}};
+}
+
 codestream::FrameParams frameParamsFor(const Options& options) {
     codestream::FrameParams frame;
+    // Passes (ProgressiveSplitter::InitPasses).
+    const std::vector<PassDef> passes = passesFor(options);
+    frame.numPasses = static_cast<uint32_t>(passes.size());
+    frame.numDownsample = 0;
+    for (uint32_t i = 0; i + 1 < frame.numPasses; ++i) {
+        frame.shift[i] = passes[i].shift;
+        if (passes[i].downsampling > 1) {
+            frame.downsample[frame.numDownsample] = passes[i].downsampling;
+            frame.lastPass[frame.numDownsample] = i;
+            if (passes[i + 1].downsampling < passes[i].downsampling) ++frame.numDownsample;
+        }
+    }
     frame.gaborish = options.loopFilter && options.distance > 0.5f;
     frame.epfIters = 0;
     if (options.loopFilter) {
@@ -101,6 +143,7 @@ Result<std::unique_ptr<Encoder>> Encoder::create(std::shared_ptr<gpu::ShaderLibr
     SJXL_ASSIGN(enc->dcFromLlf_, gpu::ComputeKernel::create(lib, "sjxl/enc/transform", "dcFromLlf"));
     SJXL_ASSIGN(enc->specialTransform_, gpu::ComputeKernel::create(lib, "sjxl/enc/transform", "specialTransform"));
     SJXL_ASSIGN(enc->acTokenize_, gpu::ComputeKernel::create(lib, "sjxl/enc/transform", "acTokenize"));
+    SJXL_ASSIGN(enc->passNonZeroCount_, gpu::ComputeKernel::create(lib, "sjxl/enc/transform", "passNonZeroCount"));
     SJXL_ASSIGN(enc->cflTile_, gpu::ComputeKernel::create(lib, "sjxl/enc/cfl", "cflTile"));
     SJXL_ASSIGN(enc->quantize_, gpu::ComputeKernel::create(lib, "sjxl/enc/quantize", "quantize"));
     SJXL_ASSIGN(enc->dcTokenize_, gpu::ComputeKernel::create(lib, "sjxl/enc/dc_tokens", "dcTokenize"));
@@ -250,7 +293,10 @@ Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, cons
     const uint32_t cellsY = dim.ysizePadded / 4;
     const uint32_t numGroups = dim.numGroups();
     const uint32_t numDcGroups = dim.numDcGroups();
-    const uint32_t numSections = dim.numSections();
+    const std::vector<PassDef> passes = passesFor(options);
+    const uint32_t numPasses = frame.numPasses;
+    const uint32_t numSections = dim.numSections(numPasses);
+    const bool singleSection = dim.singleSection(numPasses);
 
     // Input, padded to whole words.
     std::vector<uint32_t> rgbWords((image.pixels.size() + 3) / 4, 0);
@@ -270,9 +316,10 @@ Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, cons
     SJXL_ASSIGN(auto coeffs, gpu::Buffer::ofType<float>(dev, uint64_t{3} * nblocks * 64, "enc.coeffs"));
     SJXL_ASSIGN(auto dcValue, gpu::Buffer::ofType<float>(dev, uint64_t{3} * nblocks, "enc.dcValue"));
     SJXL_ASSIGN(auto yRecon, gpu::Buffer::ofType<float>(dev, uint64_t{nblocks} * 64, "enc.yRecon"));
-    SJXL_ASSIGN(auto acTokens, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{3} * nblocks * 64, "enc.acTokens"));
-    SJXL_ASSIGN(auto numTokens, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{3} * nblocks, "enc.numTokens"));
-    SJXL_ASSIGN(auto nzCtx, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{3} * nblocks, "enc.nzCtx"));
+    SJXL_ASSIGN(auto acTokens, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{numPasses} * 3 * nblocks * 64, "enc.acTokens"));
+    SJXL_ASSIGN(auto numTokens, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{numPasses} * 3 * nblocks, "enc.numTokens"));
+    SJXL_ASSIGN(auto nzCtx, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{numPasses} * 3 * nblocks, "enc.nzCtx"));
+    SJXL_ASSIGN(auto passNonZeros, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{numPasses} * 3 * nblocks, "enc.passNonZeros"));
     SJXL_ASSIGN(auto cmapX, gpu::Buffer::ofType<int32_t>(dev, uint64_t{tilesX} * tilesY, "enc.cmapX"));
     SJXL_ASSIGN(auto cmapB, gpu::Buffer::ofType<int32_t>(dev, uint64_t{tilesX} * tilesY, "enc.cmapB"));
     SJXL_ASSIGN(auto acQuant, gpu::Buffer::ofType<int32_t>(dev, uint64_t{3} * nblocks * 64, "enc.acQuant"));
@@ -284,14 +331,18 @@ Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, cons
     SJXL_ASSIGN(auto groups, gpu::Buffer::fromSpan<Uint4>(dev, acRects, "enc.groups"));
     SJXL_ASSIGN(auto dcGroups, gpu::Buffer::fromSpan<Uint4>(dev, dcRects, "enc.dcGroups"));
 
-    // Histogram sets: 0 the AC contexts, 1 + 2g the DC stream of DC group g, 2 + 2g its
-    // AcMetadata, then the alpha channel's modular stream when there is one.
+    // Histogram sets: one per AC pass (the AC contexts), then P + 2g the DC stream of
+    // DC group g, P + 1 + 2g its AcMetadata, then the alpha channel's modular stream
+    // when there is one.
     const bool hasAlpha = image.channels == 4;
     const bool ecFits = image.width <= dim.groupDim && image.height <= dim.groupDim;
     const uint32_t numEcSets = hasAlpha ? 1 : 0;
-    const uint32_t ecSet = 1 + 2 * numDcGroups;
-    const uint32_t numSets = 1 + 2 * numDcGroups + numEcSets;
-    const uint32_t numContextsAll = kNumAcContexts + (2 * numDcGroups + numEcSets) * kSetContexts;
+    const uint32_t ecSet = numPasses + 2 * numDcGroups;
+    const uint32_t numSets = numPasses + 2 * numDcGroups + numEcSets;
+    const uint32_t numContextsAll = numPasses * kNumAcContexts + (2 * numDcGroups + numEcSets) * kSetContexts;
+    const auto setCtxBase = [&](uint32_t set) {
+        return set < numPasses ? set * kNumAcContexts : numPasses * kNumAcContexts + (set - numPasses) * kSetContexts;
+    };
     const uint32_t numCodeRegions = numSets * kAcClusters;
     const uint64_t pixels = uint64_t{image.width} * image.height;
     const uint32_t numBlobRegions = 2 + 2 * numDcGroups;
@@ -327,11 +378,11 @@ Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, cons
     SJXL_ASSIGN(auto alphaPassBits, gpu::Buffer::ofType<float>(dev, 2, "enc.alphaPassBits"));
     const uint32_t alphaWpWords = 5 * 2 * (dim.groupDim + 2);
     SJXL_ASSIGN(auto alphaWpScratch, gpu::Buffer::ofType<uint32_t>(dev, hasAlpha ? uint64_t{numGroups} * alphaWpWords : 4, "enc.alphaWp"));
-    SJXL_ASSIGN(auto acOnlyBits, gpu::Buffer::ofType<uint32_t>(dev, numGroups, "enc.acOnlyBits"));
+    SJXL_ASSIGN(auto acOnlyBits, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{numGroups} * numPasses, "enc.acOnlyBits"));
     uint32_t alphaLeaves = 0, alphaNodes = 0;
     gpu::Buffer alphaTree;
     SJXL_ASSIGN(alphaTree, gpu::Buffer::ofType<uint32_t>(dev, 8, "enc.alphaTree"));
-    SJXL_ASSIGN(auto acSectionBits, gpu::Buffer::ofType<uint32_t>(dev, numGroups, "enc.acSectionBits"));
+    SJXL_ASSIGN(auto acSectionBits, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{numGroups} * numPasses, "enc.acSectionBits"));
 
     const uint32_t metaItems = numDcGroups * kMetaItemsPerGroup;
     SJXL_ASSIGN(auto metaTokens, gpu::Buffer::ofType<uint32_t>(dev, metaItems, "enc.metaTokens"));
@@ -472,12 +523,27 @@ Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, cons
         c["acTokens"].setBinding(acTokens.rhi());
         c["numTokens"].setBinding(numTokens.rhi());
         c["nzCtx"].setBinding(nzCtx.rhi());
+        c["passNonZeros"].setBinding(passNonZeros.rhi());
         c["ctxHist"].setBinding(ctxHist.rhi());
         c["params"]["paddedWidth"].setData(dim.xsizePadded);
         c["params"]["paddedHeight"].setData(dim.ysizePadded);
         c["params"]["blocksX"].setData(dim.xsizeBlocks);
         c["params"]["blocksY"].setData(dim.ysizeBlocks);
         c["params"]["distance"].setData(options.distance);
+    };
+    // The pass split (SplitACCoefficients): what this pass codes and what the earlier ones did.
+    const auto bindPass = [&](rhi::ShaderCursor c, uint32_t p) {
+        bindTransform(c);
+        uint32_t prevExact = 1;   // ncoeffs_all_done_from_earlier_passes
+        for (uint32_t i = 0; i < p; ++i) {
+            if (passes[i].shift == 0) prevExact = passes[i].ncoeffs;
+        }
+        c["params"]["pass"].setData(p);
+        c["params"]["shift"].setData(passes[p].shift);
+        c["params"]["prevShift"].setData(p == 0 ? 0u : passes[p - 1].shift);
+        c["params"]["ncoeffs"].setData(passes[p].ncoeffs);
+        c["params"]["prevNcoeffs"].setData(prevExact);
+        c["params"]["ctxBase"].setData(p * kNumAcContexts);
     };
     adjustQuantField_.dispatch(batch, {nblocks, 1, 1}, bindTransform);
     // Oracle experiment: another encoder's quant field and strategy map (as the
@@ -546,7 +612,10 @@ Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, cons
         c["params"]["bQmMultiplier"].setData(static_cast<float>(std::pow(1.25, static_cast<int>(frame.bQmScale) - 2)));
         c["params"]["noAdjust"].setData(uint32_t{platform::env("SJXL_ENC_NO_ADJUST").empty() ? 0u : 1u});
     });
-    acTokenize_.dispatch(batch, {3 * nblocks, 1, 1}, bindTransform);
+    for (uint32_t p = 0; p < numPasses; ++p) {
+        passNonZeroCount_.dispatch(batch, {3 * nblocks, 1, 1}, [&](rhi::ShaderCursor c) { bindPass(c, p); });
+        acTokenize_.dispatch(batch, {3 * nblocks, 1, 1}, [&](rhi::ShaderCursor c) { bindPass(c, p); });
+    }
 
     // The DC group streams' tokens: the DC with the weighted predictor (one
     // thread per group, as the error state is serial) and the AcMetadata per item.
@@ -579,6 +648,7 @@ Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, cons
         c["params"]["dcTreeNodes"].setData(static_cast<uint32_t>(dcTreeWords.size() / kModTreeWords));
         c["params"]["metaTreeNodes"].setData(static_cast<uint32_t>(metaTreeWords.size() / kModTreeWords));
         c["params"]["wpWordsPerGroup"].setData(wpWordsPerGroup);
+        c["params"]["numAcSets"].setData(numPasses);
     };
     dcTokenize_.dispatch(batch, {numDcGroups, 1, 1}, [&](rhi::ShaderCursor c) { bindDc(c, 0, dummy_); });
     metaTokenize_.dispatch(batch, {metaItems, 1, 1}, [&](rhi::ShaderCursor c) { bindDc(c, 0, dummy_); });
@@ -623,7 +693,7 @@ Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, cons
             c["params"]["bitDepth"].setData(image.bitDepth);
             c["params"]["wpWordsPerGroup"].setData(alphaWpWords);
             c["params"]["pass"].setData(pass);
-            c["params"]["ctxBase"].setData(kNumAcContexts + (ecSet - 1) * kSetContexts);
+            c["params"]["ctxBase"].setData(setCtxBase(ecSet));
         };
         extractAlpha_.dispatch(batch, {image.width, image.height, 1}, [&](rhi::ShaderCursor c) { bindAlpha(c, wpTreeBuf, 0, choice, leafMapBuf); });
         // modTokenize reads one channel: the alpha plane is plane 0 of a one-channel image.
@@ -653,7 +723,7 @@ Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, cons
     const auto bindSections = [&](rhi::ShaderCursor c, uint32_t mode, const gpu::Buffer& body) {
         c["groups"].setBinding(groups.rhi());
         c["acs"].setBinding(acs.rhi());
-        c["nonZeros"].setBinding(nonZeros.rhi());
+        c["nonZeros"].setBinding(passNonZeros.rhi());
         c["acTokens"].setBinding(acTokens.rhi());
         c["numTokens"].setBinding(numTokens.rhi());
         c["nzCtx"].setBinding(nzCtx.rhi());
@@ -672,15 +742,16 @@ Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, cons
         c["params"]["numDcGroups"].setData(numDcGroups);
         c["params"]["mode"].setData(mode);
         c["params"]["ecInGroups"].setData(uint32_t{hasAlpha && !ecFits ? 1u : 0u});
-        c["params"]["ecCtxBase"].setData(kNumAcContexts + (ecSet - 1) * kSetContexts);
+        c["params"]["ecCtxBase"].setData(setCtxBase(ecSet));
         c["params"]["ecRegionBase"].setData(ecSet * kAcClusters);
         c["params"]["width"].setData(image.width);
         c["params"]["height"].setData(image.height);
         c["params"]["groupDim"].setData(dim.groupDim);
+        c["params"]["numPasses"].setData(numPasses);
     };
     // The ANS sections (one thread per AC group, one per DC group) measured in mode 1 and emitted in mode 2.
     const auto sectionPasses = [&](uint32_t mode, const gpu::Buffer& body) {
-        acSections_.dispatch(batch, {numGroups, 1, 1}, [&](rhi::ShaderCursor c) { bindSections(c, mode, body); });
+        acSections_.dispatch(batch, {numGroups * numPasses, 1, 1}, [&](rhi::ShaderCursor c) { bindSections(c, mode, body); });
         dcGroupSections_.dispatch(batch, {numDcGroups, 1, 1}, [&](rhi::ShaderCursor c) { bindDc(c, mode, body); });
     };
 
@@ -696,12 +767,12 @@ Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, cons
         c["clusterInfo"].setBinding(clusterInfo.rhi());
         c["params"]["numContexts"].setData(numContexts);
         c["params"]["maxClusters"].setData(std::min<uint32_t>(options.acClusters, kAcClusters));
-        c["params"]["ctxBase"].setData(set == 0 ? 0u : kNumAcContexts + (set - 1) * kSetContexts);
+        c["params"]["ctxBase"].setData(setCtxBase(set));
         c["params"]["infoIndex"].setData(set);
         c["params"]["regionBase"].setData(set * kAcClusters);
     };
     for (uint32_t set = 0; set < numSets; ++set) {
-        const uint32_t numContexts = set == 0 ? kNumAcContexts : kSetContexts;
+        const uint32_t numContexts = set < numPasses ? kNumAcContexts : kSetContexts;
         clusterContexts_.dispatchGroups(batch, {1, 1, 1}, [&](rhi::ShaderCursor c) { bindCluster(c, set, numContexts); });
         accumulateClusters_.dispatch(batch, {numContexts, 1, 1}, [&](rhi::ShaderCursor c) { bindCluster(c, set, numContexts); });
     }
@@ -734,6 +805,7 @@ Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, cons
         c["params"]["metaLeaves"].setData(metaLeaves);
         c["params"]["numAcContexts"].setData(kNumAcContexts);
         c["params"]["numEcSets"].setData(numEcSets);
+        c["params"]["numAcSets"].setData(numPasses);
         c["params"]["ecInGlobal"].setData(uint32_t{hasAlpha && ecFits ? 1u : 0u});
         c["params"]["ecLogAlpha"].setData(uint32_t{image.bitDepth > 8 ? 7u : 6u});
         c["params"]["width"].setData(image.width);
@@ -763,7 +835,8 @@ Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, cons
         c["body"].setBinding(body.rhi());
         c["params"]["numGroups"].setData(numGroups);
         c["params"]["numDcGroups"].setData(numDcGroups);
-        c["params"]["packed"].setData(uint32_t{dim.singleSection() ? 1u : 0u});
+        c["params"]["packed"].setData(uint32_t{singleSection ? 1u : 0u});
+        c["params"]["numPasses"].setData(numPasses);
     };
     layout_.dispatch(batch, {1, 1, 1}, [&](rhi::ShaderCursor c) { bindLayout(c, dummy_); });
     SJXL_TRY(batch.submit(true));
@@ -805,6 +878,36 @@ Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, cons
         std::string sections;
         for (uint32_t b : sizesHost) sections += std::format("{} ", b);
         log::info("enc debug: blob bits DcGlobal {} AcGlobal {}; section bytes {}", blobBitsHost[0], blobBitsHost[1], sections);
+        SJXL_ASSIGN(const auto passNzHost, passNonZeros.readAll<uint32_t>(dev));
+        SJXL_ASSIGN(const auto numTokensHost, numTokens.readAll<uint32_t>(dev));
+        SJXL_ASSIGN(const auto acOnlyHost, acOnlyBits.readAll<uint32_t>(dev));
+        for (uint32_t p = 0; p < numPasses; ++p) {
+            uint64_t nzSum = 0, tokSum = 0;
+            for (uint32_t i = 0; i < 3 * nblocks; ++i) { nzSum += passNzHost[p * 3 * nblocks + i]; tokSum += numTokensHost[p * 3 * nblocks + i]; }
+            std::string bits;
+            for (uint32_t g = 0; g < numGroups; ++g) bits += std::format("{} ", acOnlyHost[p * numGroups + g]);
+            log::info("enc debug: pass {}: shift {} ncoeffs {} non-zeros {} tokens {} clusters {} AC bits per group {}", p, passes[p].shift, passes[p].ncoeffs,
+                      nzSum, tokSum, clusterInfoHost[p], bits);
+            SJXL_ASSIGN(const auto ctxHistHost, ctxHist.readAll<uint32_t>(dev));
+            SJXL_ASSIGN(const auto histHost, hist.readAll<uint32_t>(dev));
+            uint64_t zeroTok = 0, otherTok = 0;
+            for (uint32_t ctx = 0; ctx < kNumAcContexts; ++ctx) {
+                for (uint32_t b = 0; b < kHistBins; ++b) (b == 0 ? zeroTok : otherTok) += ctxHistHost[(uint64_t{p} * kNumAcContexts + ctx) * kHistBins + b];
+            }
+            std::string h;
+            for (uint32_t b = 0; b < 8; ++b) h += std::format("{} ", histHost[(uint64_t{p} * kAcClusters) * kCodeStride + b]);
+            log::info("enc debug: pass {} ctxHist token0 {} others {}; cluster 0 hist {}", p, zeroTok, otherTok, h);
+            SJXL_ASSIGN(const auto ctxMapHost, ctxMap.readAll<uint32_t>(dev));
+            SJXL_ASSIGN(const auto ansInfoHost, ansInfo.readAll<uint32_t>(dev));
+            SJXL_ASSIGN(const auto ansReverseHost, ansReverse.readAll<uint32_t>(dev));
+            std::map<uint32_t, uint32_t> mapCensus;
+            for (uint32_t ctx = 0; ctx < kNumAcContexts; ++ctx) ++mapCensus[ctxMapHost[uint64_t{p} * kNumAcContexts + ctx]];
+            std::string census, info, rev;
+            for (const auto& [k, v] : mapCensus) census += std::format("{}x{} ", k, v);
+            for (uint32_t b = 0; b < 4; ++b) info += std::format("{:x} ", ansInfoHost[(uint64_t{p} * kAcClusters) * 256 + b]);
+            for (uint32_t b = 0; b < 6; ++b) rev += std::format("{} ", ansReverseHost[(uint64_t{p} * kAcClusters) * 4096 + b]);
+            log::info("enc debug: pass {} ctxMap census {}; ansInfo {}; reverse {}", p, census, info, rev);
+        }
         SJXL_ASSIGN(const auto partsHost, dcPartStart.readAll<uint32_t>(dev));
         uint64_t dcTokenBits = 0, metaTokenBits = 0, headBits = 0;
         for (uint32_t g = 0; g < numDcGroups; ++g) {
@@ -833,7 +936,7 @@ Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, cons
     // The frame header and TOC on the CPU, then the body.
     codestream::BitWriter head;
     codestream::writeFrameHeader(head, frame, hasAlpha ? 1u : 0u, info);
-    if (dim.singleSection()) {
+    if (singleSection) {
         sizes.assign(1, bodyBytes);
     }
     codestream::writeToc(head, sizes);
@@ -1201,6 +1304,7 @@ Result<std::vector<uint8_t>> Encoder::encodeLossless(const image::Rgb8& image, c
         c["params"]["metaLeaves"].setData(0u);
         c["params"]["numAcContexts"].setData(numLeaves);
         c["params"]["numEcSets"].setData(0u);
+        c["params"]["numAcSets"].setData(1u);
         c["params"]["ecInGlobal"].setData(0u);
         c["params"]["ecLogAlpha"].setData(6u);
     };

@@ -247,7 +247,14 @@ void writeFrameHeader(BitWriter& w, const FrameParams& params, uint32_t numExtra
     }
     w.write(3, params.xQmScale);                                   // x_qm_scale
     w.write(3, params.bQmScale);                                   // b_qm_scale
-    writeU32(w, U32Enc{{Val(1), Val(2), Val(3), BitsOffset(3, 4)}}, 1);   // num_passes = 1
+    // Passes (frame_header.cc Passes::VisitFields).
+    writeU32(w, U32Enc{{Val(1), Val(2), Val(3), BitsOffset(3, 4)}}, params.numPasses);
+    if (params.numPasses != 1) {
+        writeU32(w, U32Enc{{Val(0), Val(1), Val(2), BitsOffset(1, 3)}}, params.numDownsample);
+        for (uint32_t i = 0; i + 1 < params.numPasses; ++i) w.write(2, params.shift[i]);
+        for (uint32_t i = 0; i < params.numDownsample; ++i) writeU32(w, U32Enc{{Val(1), Val(2), Val(4), Val(8)}}, params.downsample[i]);
+        for (uint32_t i = 0; i < params.numDownsample; ++i) writeU32(w, U32Enc{{Val(0), Val(1), Val(2), Bits(3)}}, params.lastPass[i]);
+    }
     w.writeBool(false);                                            // custom_size_or_origin
     writeU32(w, U32Enc{{Val(0), Val(1), Val(2), BitsOffset(2, 3)}}, 0);   // blending mode kReplace
     for (uint32_t i = 0; i < numExtraChannels; ++i) {

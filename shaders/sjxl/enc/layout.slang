@@ -14,7 +14,7 @@ struct LayoutParams {
     uint numGroups;
     uint numDcGroups;
     uint packed;    // 1: single section
-    uint pad0;
+    uint numPasses; // AC sections: numGroups per pass
 };
 
 StructuredBuffer<uint>      blobBits;
@@ -60,7 +60,7 @@ void layoutSections(uint3 tid: SV_DispatchThreadID) {
         dcPartStart[g * 4 + 3] = start + pre + dcT + mid;
     }
     place(s++, blobBits[1], pos, start);
-    for (uint g = 0; g < params.numGroups; ++g) {
+    for (uint g = 0; g < params.numGroups * params.numPasses; ++g) {
         place(s++, acSectionBits[g], pos, start);
     }
     totals[1] = pos;

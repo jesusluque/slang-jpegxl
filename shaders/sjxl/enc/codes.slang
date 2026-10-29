@@ -31,10 +31,16 @@ static const uint kBlobStrideWords = 8192;
 static const uint kAcClusters = 32;        // clusters per histogram set, and code regions per set
 static const uint kSetContexts = 64;       // contexts of the DC group sets (tree leaves)
 /// Histogram sets: 0 the AC contexts, 1 + 2g the DC group g's DC stream, 2 + 2g its AcMetadata.
-uint setCtxBase(uint set) { return set == 0 ? 0 : params.numAcContexts + (set - 1) * kSetContexts; }
+/// Histogram sets: the AC passes first (numAcSets of numAcContexts each), then
+/// the DC groups' DC and AcMetadata sets and the alpha set (kSetContexts each).
+uint setCtxBase(uint set) {
+    return set < params.numAcSets ? set * params.numAcContexts : params.numAcSets * params.numAcContexts + (set - params.numAcSets) * kSetContexts;
+}
 uint setRegionBase(uint set) { return set * kAcClusters; }
-uint mapRegion() { return (1 + 2 * params.numDcGroups + params.numEcSets) * kAcClusters; }   // the context-map stream's own code
-uint ecSet() { return 1 + 2 * params.numDcGroups; }
+uint mapRegion() { return (params.numAcSets + 2 * params.numDcGroups + params.numEcSets) * kAcClusters; }   // the context-map stream's own code
+uint ecSet() { return params.numAcSets + 2 * params.numDcGroups; }
+uint dcSetOf(uint g) { return params.numAcSets + 2 * g; }
+uint metaSetOf(uint g) { return params.numAcSets + 1 + 2 * g; }
 static const int kPredictorZero = 0;
 static const int kPredictorGradient = 5;
 static const int kEpfSharpness = 4;   // what libjxl writes at every speed up to wombat
@@ -60,7 +66,7 @@ struct CodeParams {
     uint numEcSets;       // 1 when a VarDCT frame carries an alpha channel (set 1 + 2 numDcGroups)
     uint ecInGlobal;      // 1: the alpha channel fits a group and its stream goes into DcGlobal
     uint ecLogAlpha;      // the alpha stream's ANS alphabet (6 at 8 bits, 7 at 16)
-    uint pad0;
+    uint numAcSets;       // AC passes (one histogram set each); 1 for a lossless frame's layout
 };
 
 StructuredBuffer<uint4>    dcGroups;   // bx0, by0, w, h in blocks
@@ -594,7 +600,7 @@ void buildDcGroupBlobs(uint3 gid: SV_GroupID) {
     serialWrite(blobs, pre, 2, 0);
     writeLocalGroupHeader(blobs, pre);
     writeTreeFromNodes(blobs, pre, dcTree, params.dcTreeNodes);
-    writeHistogramSet(blobs, pre, params.dcLeaves, clusterInfo[1 + 2 * g], 7, 1 + 2 * g);
+    writeHistogramSet(blobs, pre, params.dcLeaves, clusterInfo[dcSetOf(g)], 7, dcSetOf(g));
     blobBits[2 + 2 * g] = pre.pos;
 
     // "mid": count - 1 (one AcMetadata entry per varblock), the AcMetadata
@@ -612,7 +618,7 @@ void buildDcGroupBlobs(uint3 gid: SV_GroupID) {
     serialWrite(blobs, mid, ceilLog2Nonzero(totalBlocks), numVarblocks - 1);
     writeLocalGroupHeader(blobs, mid);
     writeTreeFromNodes(blobs, mid, metaTree, params.metaTreeNodes);
-    writeHistogramSet(blobs, mid, params.metaLeaves, clusterInfo[2 + 2 * g], 6, 2 + 2 * g);
+    writeHistogramSet(blobs, mid, params.metaLeaves, clusterInfo[metaSetOf(g)], 6, metaSetOf(g));
     blobBits[3 + 2 * g] = mid.pos;
 }
 
@@ -737,15 +743,17 @@ void buildGlobalBlobs(uint3 gid: SV_GroupID) {
     }
     blobBits[0] = dc.pos;
 
-    // AcGlobal: dequant matrices default, one histogram set, natural orders,
-    // then the clustered AC histogram set.
+    // AcGlobal: dequant matrices default, one histogram per group set, then per
+    // pass natural orders and the pass's clustered AC histogram set.
     SerialWriter ac;
     ac.base = kBlobStrideWords;
     ac.pos = 0;
     serialWrite(blobs, ac, 1, 1);
     serialWrite(blobs, ac, ceilLog2Nonzero(params.numGroups), 0);
-    serialWrite(blobs, ac, 2, 2);   // used_orders: Val(0) is the third distribution
-    writeHistogramSet(blobs, ac, kNumAcContexts, clusterInfo[0], kAcLogAlpha, 0);
+    for (uint p = 0; p < params.numAcSets; ++p) {
+        serialWrite(blobs, ac, 2, 2);   // used_orders: Val(0) is the third distribution
+        writeHistogramSet(blobs, ac, kNumAcContexts, clusterInfo[p], kAcLogAlpha, p);
+    }
     blobBits[1] = ac.pos;
 }
 

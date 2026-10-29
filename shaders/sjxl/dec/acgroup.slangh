@@ -102,7 +102,7 @@ void decodeAcGroup(inout Dec d, AcGroupGeom g, uint pass, uint shift, uint windo
                 const uint blockCtx = blockContext(dcIdx, qfv, ord, c);
                 const uint nzeroCtx = nonZeroContext(predicted, blockCtx) + ctxOffset;
                 uint nzeros = readHybridUint(d, r, nzeroCtx);
-                if (nzeros > size - covered) { fail(d, kErrCorrupt); return; }
+                if (nzeros > size - covered) { fail(d, kErrAcNzeros); return; }
                 const uint normalized = (nzeros + covered - 1) >> log2Covered;
                 for (uint y = 0; y < cy; ++y) {
                     for (uint x = 0; x < cx; ++x) {
@@ -123,11 +123,11 @@ void decodeAcGroup(inout Dec d, AcGroupGeom g, uint pass, uint shift, uint windo
                     prev = u != 0 ? 1 : 0;
                     nzeros -= prev;
                 }
-                if (nzeros != 0) { fail(d, kErrCorrupt); return; }
+                if (nzeros != 0) { fail(d, kErrAcLeftover); return; }
                 if (d.error != kErrNone) return;
             }
             bx += cx;
         }
     }
-    if (!checkFinalState(r)) fail(d, kErrCorrupt);
+    if (!checkFinalState(r)) fail(d, kErrAnsState);
 }

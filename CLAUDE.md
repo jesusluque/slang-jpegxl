@@ -17,7 +17,7 @@ ctest --test-dir build/macos-arm64-debug -R prefix          # tests matching a n
 build/macos-arm64-debug/bin/sjxl_gpu_tests "prefix sum*"    # one Catch2 case by name (or a [tag])
 cmake --build build/macos-arm64-debug --target sjxl_gpu_tests   # one binary
 build/macos-arm64-debug/bin/sjxl info [in.jxl]              # device info, or a file's headers and frame list
-build/macos-arm64-debug/bin/sjxl encode in.png out.jxl --distance 1.0 [--no-aq] [--no-cfl] [--no-filters] [--no-acs] [--lambda x] [--clusters n]
+build/macos-arm64-debug/bin/sjxl encode in.png out.jxl --distance 1.0 [--no-aq] [--no-cfl] [--no-filters] [--no-acs] [--lambda x] [--clusters n] [--progressive | --qprogressive]
 build/macos-arm64-debug/bin/sjxl encode in.png out.jxl --lossless   # Modular frame, bit-exact; RGB/RGBA, 8/16-bit
 build/macos-arm64-debug/bin/sjxl animate out.jxl --fps 10 [--loops n] [--lossless] [-d d] f1.png f2.png ...   # animation, one tick per frame
 build/macos-arm64-debug/bin/sjxl decode in.jxl out.png                  # every stage on the GPU; animations write out_000.png, ...
@@ -150,6 +150,12 @@ dumps a file's quant field and strategy map, `SJXL_ENC_MAPS=f` (plus
 `SJXL_ENC_NO_ADJUST=1`) encodes with them. PNG gAMA/cHRM/sRGB chunks are
 honoured as libjxl does (`image::Rgb8::gamma`; ICC profiles are not).
 
+Progressive (`--progressive`: three frequency passes; `--qprogressive`: two
+precision passes, libjxl's pass lists): `passValue` splits the quantised
+coefficients per pass, every pass has its own token buffers, non-zero grid and
+histogram set (sets are numbered passes first, then DC/AcMetadata per DC
+group, then alpha), AcGlobal carries one orders+histograms block per pass and
+the TOC one AC section per (pass, group); `SJXL_PASSES` overrides the list.
 `Encoder::encodeAnimation` writes the animation metadata and one frame per
 image through the same `encodeFrame` (full canvas, kReplace, duration in
 ticks, `is_last` on the final frame).

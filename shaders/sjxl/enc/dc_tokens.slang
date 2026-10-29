@@ -40,7 +40,8 @@ struct DcTokenParams {
     uint dcTreeNodes;
     uint metaTreeNodes;
     uint wpWordsPerGroup;
-    uint pad0, pad1, pad2;
+    uint numAcSets;         // the AC passes' sets precede the DC groups' sets
+    uint pad1, pad2;
 };
 
 StructuredBuffer<uint4>    dcGroups;      // bx0, by0, w, h (blocks)
@@ -64,10 +65,10 @@ RWStructuredBuffer<uint>   metaBits;      // mode 1: the AcMetadata stream's bit
 RWStructuredBuffer<uint>   body;
 ConstantBuffer<DcTokenParams> params;
 
-uint dcSet(uint g) { return 1 + 2 * g; }
-uint metaSet(uint g) { return 2 + 2 * g; }
-/// Set 0 (the AC contexts) comes first in ctxHist / ctxMap; the DC group sets follow, kSetContexts each.
-uint setCtxBase(uint set) { return kNumAcContexts + (set - 1) * kSetContexts; }
+uint dcSet(uint g) { return params.numAcSets + 2 * g; }
+uint metaSet(uint g) { return params.numAcSets + 1 + 2 * g; }
+/// The AC sets (one per pass, kNumAcContexts each) come first in ctxHist / ctxMap; the DC group sets follow, kSetContexts each.
+uint setCtxBase(uint set) { return params.numAcSets * kNumAcContexts + (set - params.numAcSets) * kSetContexts; }
 
 void countToken(uint set, uint ctx, uint value) {
     uint tok, nbits, raw;

@@ -31,6 +31,9 @@ static const uint kErrCorrupt = 1;        // the codestream violates the specifi
 static const uint kErrUnsupported = 2;    // a feature this decoder does not implement
 static const uint kErrArena = 3;          // scratch exhausted
 static const uint kErrLz77Window = 4;     // LZ77 used and this thread has no window
+static const uint kErrAcNzeros = 5;       // an AC block's non-zero count exceeds its coefficients
+static const uint kErrAcLeftover = 6;     // an AC block ended with non-zeros outstanding
+static const uint kErrAnsState = 7;       // an ANS stream's final state is not the signature
 
 struct BitReader {
     uint pos;   // absolute bit position in cs
