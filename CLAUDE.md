@@ -67,7 +67,9 @@ cjxl in.png ref.jxl -d 1 -e 5 ; djxl out.jxl check.png      # Homebrew oracle (/
   chains"): the DC tokens through the weighted predictor and the ANS emission
   of every section run on CPU cores from the GPU's tokens, tables and blobs,
   writing byte-identical files (`SJXL_ENC_CPU=0` keeps the kernels, the
-  `[enc-cpu]` test compares; alpha frames stay on the GPU). Any further CPU
+  `[enc-cpu]` test compares; alpha frames stay on the GPU); for lossless frames
+  the tree learner's samples, the tokenisers, the run-length scan and the group
+  sections run there too (docs "The lossless encoder's chains on the CPU"). Any further CPU
   step needs the same justification (a serial chain the GPU cannot split),
   the same fallback and the same test. Tests check results with kernels too (mismatch
   counters, PSNR/max-diff metrics) and read back only counters, section

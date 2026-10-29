@@ -70,10 +70,14 @@ uint fingerprint(uint2 k) {
 void paletteCount(uint3 tid: SV_DispatchThreadID) {
     const uint n = params.width * params.height;
     if (tid.x >= n) return;
+    // Once the colours exceed the limit no palette will be used: the remaining
+    // threads leave (a photo's million colours would otherwise probe a full table).
+    if (table[kTableSize * 4 + 1] != 0) return;
     const uint2 key = colourKey(tid.x);
     const uint fp = fingerprint(key);
     uint slot = hashKey(key) & (kTableSize - 1);
     for (uint probe = 0; probe < kTableSize; ++probe) {
+        if ((probe & 15) == 15 && table[kTableSize * 4 + 1] != 0) return;
         const uint base = slot * 4;
         uint prev;
         InterlockedCompareExchange(table[base + 0], kEmpty, fp, prev);
@@ -100,6 +104,7 @@ void paletteCount(uint3 tid: SV_DispatchThreadID) {
 void paletteVerify(uint3 tid: SV_DispatchThreadID) {
     const uint n = params.width * params.height;
     if (tid.x >= n) return;
+    if (table[kTableSize * 4 + 1] != 0) return;   // no palette: nothing to verify
     const uint2 key = colourKey(tid.x);
     const uint fp = fingerprint(key);
     uint slot = hashKey(key) & (kTableSize - 1);

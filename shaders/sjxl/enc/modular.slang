@@ -565,6 +565,28 @@ void remapTokens(uint3 tid: SV_DispatchThreadID) {
     InterlockedAdd(ctxHist[(params.ctxBase + ctx) * kHistBins + min(tok, kHistBins - 1)], 1u, before);
 }
 
+/// One thread per sample: the histograms of tokens the CPU produced
+/// (EntropyCpu.cpp): mode 0 the final tokens into ctxHist, mode 1 the pass's
+/// tokens into passHist (modTokenize's layout).
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void modTokenCount(uint3 tid: SV_DispatchThreadID) {
+    if (tid.x >= params.totalSamples) return;
+    uint before;
+    if (params.mode == 0) {
+        const uint t = modTokens[tid.x];
+        uint tok, nbits, raw;
+        hybridEncode(t & 0x3FFFFu, tok, nbits, raw);
+        InterlockedAdd(ctxHist[(params.ctxBase + (t >> 18)) * kHistBins + min(tok, kHistBins - 1)], 1u, before);
+    } else {
+        const uint c = channelOfSample(tid.x);
+        const uint t = passTokens[params.pass * params.totalSamples + tid.x];
+        uint tok, nbits, raw;
+        hybridEncode(t & 0x3FFFFu, tok, nbits, raw);
+        InterlockedAdd(passHist[((params.pass * params.numChannels + c) * kSetContexts + (t >> 18)) * kHistBins + min(tok, kHistBins - 1)], 1u, before);
+    }
+}
+
 // --- the group sections ------------------------------------------------------------------
 
 struct AnsWriter {

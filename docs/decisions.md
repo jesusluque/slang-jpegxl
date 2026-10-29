@@ -1683,3 +1683,41 @@ creation with the pinned commit and patches, 64-bit atomics are not used
 (`InterlockedOr` on 32-bit words only), `[noinline]` and threadgroup sizes
 under the SPIR-V backend, and the timing of the single-thread kernels on a
 discrete GPU, where the CPU readbacks of this milestone cross PCIe.
+
+## The lossless encoder's chains on the CPU (2026-10-29)
+
+With timer marks in `encodeLossless` / `encodeModularFrame` the 1920x1080
+lossless encode (2.9 s) broke down as: palette counting 744 ms, the tree
+learner's samples 895 ms, the tokeniser 683 ms, the run-length scan 279 ms,
+the global blob and the group sections' two passes 165 ms.
+
+- **Palette counting was a bug, not a chain.** A photo has far more colours
+  than the palette limit; once the hash table (8192 slots) was full, every
+  remaining pixel's thread probed the whole table. The kernels now leave as
+  soon as the overflow flag is set (checked at the start and every 16 probes):
+  744 → 2 ms, the file unchanged.
+- **The run-length scan's cost estimate** summed a context's 128 bins for
+  every token of a run; `rleTotals` computes the totals once (279 → 85 ms on
+  the GPU path).
+- **The chains** (`EntropyCpu.cpp`, the same decision as the lossy ones):
+  `modSamples` (the tree learner's samples: the weighted predictor, the 16
+  properties, both predictors' residuals and the quantised candidate
+  properties for a quarter of the pixels), `modTokenizeTree` and the fixed-tree
+  `modTokenize` passes (one task per group over the planes read back once; the
+  tokens are uploaded and a parallel `modTokenCount` kernel builds the context
+  histograms), `rleScan` (one task per token stream; the decision uses the same
+  float cost estimate, so a near-tie could in principle differ from the GPU's
+  log2, which did not happen on the corpus) and the group sections (GroupHeader
+  with the group's RCT, the ANS chain over the compact token list, every group
+  a task, the body assembled with the GPU's global blob). Clustering, the
+  hybrid-uint configurations, the ANS tables, the tree learning kernels and
+  the global blob stay on the GPU. The samples' order differs from the GPU's
+  (atomic appends there, group order here); the tree learner only histograms
+  them, so the trees agree unless the capacity truncates the set.
+
+Byte-identical files on ten lossless encodes (1080p, the test images, a
+palette image, RGBA, an animation, `--fixed-tree`); the `[enc-cpu]` test
+includes a lossless case. 1920x1080 lossless encode: 2.9 s → 0.48 s (samples
+152 ms including the 25 MB plane readback, tokenise 137 ms including the token
+upload and histogram kernel, sections 60 ms, run-length 40 ms, tree learning
+32 ms). cjxl -d 0 -e 5: 0.3 s.

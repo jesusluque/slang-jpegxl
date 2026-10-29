@@ -139,7 +139,7 @@ private:
     gpu::ComputeKernel                  tables_, buildOrders_, selectStrategies_, largeQf_, largeRows_, largeCols_, mergeLarge_, adjustQuantField_, dctRows_, dctCols_, dcFromLlf_, specialTransform_, passNonZeroCount_, acTokenize_;
     gpu::ComputeKernel                  dcTokenize_, dcTokenCount_, metaTokenize_, dcGroupSections_, clusterContexts_, accumulateClusters_, acSections_;
     gpu::ComputeKernel                  propStats_, propThresholds_, treeHistograms_, treeSplit_, treeAssign_, modSamples_, modTokenizeTree_;
-    gpu::ComputeKernel                  unpackPlanes_, rctCost_, rctApply_, dcFramePlanes_, modTokenize_;
+    gpu::ComputeKernel                  unpackPlanes_, rctCost_, rctApply_, dcFramePlanes_, modTokenize_, modTokenCount_, rleTotals_;
     gpu::ComputeKernel                  paletteCount_, paletteBuild_, paletteIndex_, paletteVerify_, compactStats_, compactBuild_, compactApply_;
     gpu::ComputeKernel                  rleScan_, rleHistograms_, uintConfigHist_, uintConfigChoose_;
     gpu::ComputeKernel                  jpegDecodeScan_, jpegToCoeffs_, jpegBlockCtx_, quantTableBlob_, changeBounds_, cropBytes_;

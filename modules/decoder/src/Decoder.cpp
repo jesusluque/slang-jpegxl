@@ -417,9 +417,13 @@ Result<Decoder::FrameOutput> Decoder::run(const codestream::Parsed& parsed, cons
     };
     if (modular) {
         modularGlobals_.dispatch(batch, {1, 1, 1}, bindSections);
+        timer.mark("modular globals");
         modularDcGroups_.dispatch(batch, {numDcGroups, 1, 1}, bindSections);
+        timer.mark("modular dc groups");
         modularAcGroups_.dispatch(batch, {numGroups, 1, 1}, bindSections);
+        timer.mark("modular ac groups");
         modularFinalize_.dispatch(batch, {1, 1, 1}, bindSections);
+        timer.mark("modular finalize");
         modularToPlanes_.dispatch(batch, {dim.xsize * dim.ysize, 1, 1}, [&](rhi::ShaderCursor c) {
             c["arena"].setBinding(arena.rhi());
             c["xyb"].setBinding(xybA.rhi());

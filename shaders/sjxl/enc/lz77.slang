@@ -56,6 +56,7 @@ RWStructuredBuffer<uint>   lengthHist;     // [cluster][kAlpha] the length token
 RWStructuredBuffer<uint>   hist;           // the code regions' final histograms (regionBase + cluster) * kCodeStride
 RWStructuredBuffer<uint>   clusterCfg;     // per code region: split | msb << 8 | lsb << 16
 RWStructuredBuffer<uint>   maxToken;       // [0] the largest symbol over the set
+RWStructuredBuffer<uint>   rleTotal;       // per context: its ctxHist total (rleTotals), what symbolBits divides by
 ConstantBuffer<Lz77Params> params;
 
 static const uint3 kCandidates[kNumCandidates] = {uint3(4, 2, 0), uint3(4, 1, 2), uint3(0, 0, 0), uint3(2, 0, 1)};
@@ -82,12 +83,22 @@ bool streamRect(uint stream, uint c, out uint x0, out uint y0, out uint w, out u
 
 /// The cost in bits of a token under the pre-LZ77 statistics (SymbolCostEstimator).
 float symbolBits(uint ctx, uint tok) {
-    uint total = 0;
-    for (uint s = 0; s < kHistBins; ++s) total += ctxHist[ctx * kHistBins + s];
+    const uint total = rleTotal[ctx];
     const uint c = ctxHist[ctx * kHistBins + min(tok, kHistBins - 1)];
     if (c == 0) return float(kAnsLogTabSize);
     if (c == total) return 0.0f;
     return -log2(float(c) / float(total));
+}
+
+/// One thread per context: its histogram's total, so the scan's cost estimate
+/// does not sum 128 bins per token.
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void rleTotals(uint3 tid: SV_DispatchThreadID) {
+    if (tid.x > params.numContexts) return;
+    uint total = 0;
+    for (uint s = 0; s < kHistBins; ++s) total += ctxHist[tid.x * kHistBins + s];
+    rleTotal[tid.x] = total;
 }
 
 /// One thread per stream: its tokens in order into the compact list; in mode 1
