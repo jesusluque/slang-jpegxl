@@ -14,8 +14,8 @@
 namespace sjxl::metrics {
 
 struct Metrics {
-    double   psnr = 0;          ///< all channels, 8-bit scale; infinity when identical
-    uint32_t maxAbsDiff = 0;
+    double   psnr = 0;          ///< all channels, on the images' sample scale (255 or 65535); infinity when identical
+    uint32_t maxAbsDiff = 0;    ///< in sample units
     uint32_t maxAtX = 0, maxAtY = 0, maxAtChannel = 0;   ///< where the largest difference is
     uint64_t sumSquares = 0;
 };

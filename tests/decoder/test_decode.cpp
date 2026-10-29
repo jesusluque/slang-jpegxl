@@ -429,3 +429,63 @@ TEST_CASE("the decoder matches djxl on images with an ICC profile", "[decoder][c
     WARN(std::format("icc {}: vs djxl PSNR {:.2f} dB, max diff {}", tag, metrics->psnr, metrics->maxAbsDiff));
     CHECK(metrics->maxAbsDiff <= (options.empty() ? 1 : 0));   // the transcode goes through YCbCr floats; lossless is exact
 }
+
+namespace {
+
+/// berlin_200 as a 16-bit RGB PNG: samples * 257 plus a smooth low-byte ramp, so the
+/// low bytes carry information.
+std::filesystem::path deepImage() {
+    const std::filesystem::path path = test::scratchDir() / "berlin_16.png";
+    auto base = image::readRgb8(test::testData("berlin_200.png"));
+    REQUIRE(base);
+    image::Rgb8 deep;
+    deep.width = base->width;
+    deep.height = base->height;
+    deep.channels = 3;
+    deep.bitDepth = 16;
+    deep.pixels.resize(size_t{deep.width} * deep.height * 3 * 2);
+    for (size_t i = 0; i < size_t{deep.width} * deep.height * 3; ++i) {
+        const uint32_t x = static_cast<uint32_t>((i / 3) % deep.width);
+        const uint32_t v = std::min<uint32_t>(65535, base->pixels[i] * 257u + (x * 97u) % 251u);
+        deep.pixels[2 * i] = static_cast<uint8_t>(v & 0xFF);
+        deep.pixels[2 * i + 1] = static_cast<uint8_t>(v >> 8);
+    }
+    REQUIRE(image::writePng(path, deep));
+    return path;
+}
+
+}   // namespace
+
+TEST_CASE("the decoder matches djxl on 16-bit images", "[decoder][conformance][cjxl][depth16]") {
+    const std::filesystem::path djxl = test::findTool("djxl");
+    const std::filesystem::path cjxl = test::findTool("cjxl");
+    if (djxl.empty() || cjxl.empty()) SKIP("cjxl/djxl are not installed");
+    const std::filesystem::path png0 = deepImage();
+    const std::string options = GENERATE(std::string("-d 0 -e 3"), std::string("-d 0 -e 7 --responsive=1"), std::string("-d 1 -e 5"),
+                                         std::string("-m 1 -d 1 -e 7"));
+    CAPTURE(options);
+    std::string tag = options;
+    for (char& ch : tag) if (ch == ' ' || ch == '-' || ch == '=') ch = '_';
+    const std::filesystem::path jxl = test::scratchDir() / std::format("dec_16{}.jxl", tag);
+    const std::filesystem::path png = test::scratchDir() / std::format("dec_16{}.djxl.png", tag);
+    REQUIRE(test::run(std::format("\"{}\" \"{}\" \"{}\" {} >/dev/null 2>&1", cjxl.string(), png0.string(), jxl.string(), options)));
+    REQUIRE(test::run(std::format("\"{}\" \"{}\" \"{}\" >/dev/null 2>&1", djxl.string(), jxl.string(), png.string())));
+    auto bytes = image::readFile(jxl);
+    REQUIRE(bytes);
+    auto reference = image::readImage(png);
+    REQUIRE(reference);
+    REQUIRE(reference->bitDepth == 16);
+    auto ours = decoder().decode(*bytes);
+    if (!ours && ours.error().code() == ErrorCode::Unsupported) {
+        WARN(std::format("16-bit {}: unsupported: {}", options, ours.error().message()));
+        SUCCEED();
+        return;
+    }
+    REQUIRE(ours);
+    REQUIRE(ours->bitDepth == 16);
+    auto metrics = test::compare(*reference, *ours);
+    REQUIRE(metrics);
+    WARN(std::format("16-bit {}: vs djxl PSNR {:.2f} dB, max diff {} / 65535", options, metrics->psnr, metrics->maxAbsDiff));
+    // Lossless must be exact; lossy goes through floats on both sides, so a few 16-bit steps may differ.
+    CHECK(metrics->maxAbsDiff <= (options.find("-d 0") != std::string::npos ? 0u : 8u));
+}

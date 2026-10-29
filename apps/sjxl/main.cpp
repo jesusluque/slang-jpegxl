@@ -145,9 +145,9 @@ int convert(int argc, char** argv) {
 
 int compare(int argc, char** argv) {
     if (argc < 4) return usage();
-    auto a = sjxl::image::readImage8(argv[2]);
+    auto a = sjxl::image::readImage(argv[2]);
     if (!a) return fail(a.error());
-    auto b = sjxl::image::readImage8(argv[3]);
+    auto b = sjxl::image::readImage(argv[3]);
     if (!b) return fail(b.error());
     auto device = sjxl::gpu::Device::create();
     if (!device) return fail(device.error());

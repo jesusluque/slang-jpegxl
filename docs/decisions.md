@@ -54,10 +54,10 @@ per subsystem or milestone, appended to as the work goes. Dates are absolute.
 - **M3 encoder quality**: inverse Gaborish + default LoopFilter, EPF sharpness,
   CfL per tile, adaptive quant field, DCT16/32 strategy search, context
   clustering (≤ 32, fixed-point costs as cujpegxl), ANS for AC.
-- **M4 decoder completeness**: splines, >8-bit output, animation, grey
-  JPEG transcodes, loop filters on YCbCr frames, extra channel blending in
-  patches, premultiplied alpha handling, writing the ICC profile into the
-  output file. (64–256 px
+- **M4 decoder completeness**: splines, animation, grey JPEG transcodes,
+  loop filters on YCbCr frames, extra channel blending in patches,
+  premultiplied alpha handling, writing the ICC profile into the output
+  file, float samples. (16-bit output: done.) (64–256 px
   transforms, Modular frames with RCT/palette/Squeeze, lossy modular,
   patches, progressive passes, DC frames, permuted TOCs, upsampling, noise,
   extra channels with alpha output, JPEG recompression: done.)
@@ -449,3 +449,20 @@ profile (`UnpredictICC`, for embedding it in the PNG) is not done.
 
 Measured (`[icc]` test): a JPEG written by djxl (with its ICC), transcoded,
 re-encoded losslessly and as responsive modular: within 1 LSB / bit-exact.
+
+## 16-bit output (2026-10-29)
+
+Images deeper than 8 bits come out as 16-bit samples, as djxl writes them:
+the output stage computes each sample on a 65535 scale and packs two
+little-endian bytes (`bytesPerSample`); `image::Rgb8` (the name stayed)
+carries `bitDepth`, `readImage` keeps a file's depth and alpha, and the
+module writes 16-bit PNGs itself (stb_image_write only does 8: filter-0 rows,
+big-endian samples, a stored-deflate zlib stream with Adler-32 and CRC-32).
+The compare kernel works on samples of either depth in two passes (sums and
+the largest difference, then the first sample reaching it; the old packing of
+difference and index in one word had no room for 16-bit differences) and
+reports PSNR on the images' own scale.
+
+Measured (`[depth16]` test, berlin_200 as 16-bit with informative low bytes):
+lossless and responsive lossless bit-exact; VarDCT at distance 1 within 3 /
+65535 (108 dB), lossy modular within 1 / 65535.

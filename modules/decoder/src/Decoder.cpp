@@ -268,7 +268,8 @@ Result<image::Rgb8> Decoder::run(const codestream::Parsed& parsed, const codestr
     if (ycbcr) {
         for (size_t c = 0; c < 3; ++c) { hshift[c] = frame.header.hshift[c]; vshift[c] = frame.header.vshift[c]; }
     }
-    const uint32_t outBytes = outWidth * outHeight * outChannels;
+    const uint32_t outDepth = m.bitsPerSample > 8 ? 16u : 8u;   // djxl writes 16-bit files for deeper images
+    const uint32_t outBytes = outWidth * outHeight * outChannels * (outDepth / 8);
     SJXL_ASSIGN(auto rgb8, gpu::Buffer::ofType<uint32_t>(dev, (outBytes + 3) / 4, "dec.rgb8"));
     SJXL_ASSIGN(auto dummy, gpu::Buffer::ofType<float>(dev, 4, "dec.dummy"));   // stands in for absent optional inputs
     std::optional<gpu::Buffer> weightsKeep, ecWeightsKeep;   // upsampling weights live until the batch ran
@@ -681,6 +682,7 @@ Result<image::Rgb8> Decoder::run(const codestream::Parsed& parsed, const codestr
         c["params"]["mode"].setData(uint32_t{ycbcr ? 2u : (modular && !modularXyb) ? 1u : 0u});
         c["params"]["channels"].setData(outChannels);
         c["params"]["alphaPlane"].setData(alphaIndex < numEc ? alphaIndex : 0u);
+        c["params"]["bytesPerSample"].setData(outDepth / 8);
         c["alpha"].setBinding(ecOut ? ecOut->rhi() : dummy.rhi());
     });
     SJXL_TRY(batch.submit(true));
@@ -806,6 +808,7 @@ Result<image::Rgb8> Decoder::run(const codestream::Parsed& parsed, const codestr
     out.width = outWidth;
     out.height = outHeight;
     out.channels = outChannels;
+    out.bitDepth = outDepth;
     out.pixels.resize(outBytes);
     std::memcpy(out.pixels.data(), words.data(), outBytes);
     return out;

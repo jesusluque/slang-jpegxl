@@ -21,7 +21,8 @@ struct OutputParams {
     uint  mode;                // 0: XYB planes; 1: planes already hold the output encoding in [0, 1]; 2: YCbCr (Cb, Y, Cr planes)
     uint  channels;            // 3 (RGB) or 4 (RGBA)
     uint  alphaPlane;          // plane index of the alpha channel within `alpha`
-    uint  pad2, pad3;
+    uint  bytesPerSample;      // 1: 8-bit, 2: 16-bit little-endian
+    uint  pad3;
 };
 ConstantBuffer<OutputParams> params;
 
@@ -32,19 +33,21 @@ float encodeFromLinear(float v) {
     return v <= 0.0031308f ? 12.92f * v : 1.055f * pow(v, 1.0f / 2.4f) - 0.055f;
 }
 
-uint byteFor(uint index) {
+/// Sample `index` (pixel * channels + channel) as an integer on the output scale.
+uint sampleFor(uint index) {
+    const float peak = params.bytesPerSample == 2 ? 65535.0f : 255.0f;
     const uint pixel = index / params.channels;
     const uint c = index % params.channels;
     const uint x = pixel % params.width;
     const uint y = pixel / params.width;
     const uint plane = params.paddedWidth * params.paddedHeight;
     const uint at = y * params.paddedWidth + x;
-    if (c == 3) return uint(round(clamp(alpha[params.alphaPlane * plane + at], 0.0f, 1.0f) * 255.0f));
-    if (params.mode == 1) return uint(round(clamp(xyb[c * plane + at], 0.0f, 1.0f) * 255.0f));
+    if (c == 3) return uint(round(clamp(alpha[params.alphaPlane * plane + at], 0.0f, 1.0f) * peak));
+    if (params.mode == 1) return uint(round(clamp(xyb[c * plane + at], 0.0f, 1.0f) * peak));
     if (params.mode == 2) {   // stage_ycbcr.cc
         const float yv = xyb[plane + at] + 128.0f / 255.0f, cb = xyb[at], cr = xyb[2 * plane + at];
         const float v = c == 0 ? yv + 1.402f * cr : c == 1 ? yv + (-0.114f * 1.772f / 0.587f) * cb + (-0.299f * 1.402f / 0.587f) * cr : yv + 1.772f * cb;
-        return uint(round(clamp(v, 0.0f, 1.0f) * 255.0f));
+        return uint(round(clamp(v, 0.0f, 1.0f) * peak));
     }
     const float ox = xyb[at], oy = xyb[plane + at], ob = xyb[2 * plane + at];
     float gr = oy + ox - params.negBiasCbrt[0];
@@ -54,13 +57,18 @@ uint byteFor(uint index) {
     const float mg = gg * gg * gg + params.negBias[1];
     const float mb = gb * gb * gb + params.negBias[2];
     const float lin = params.inverseMatrix[c * 4 + 0] * mr + params.inverseMatrix[c * 4 + 1] * mg + params.inverseMatrix[c * 4 + 2] * mb;
-    return uint(round(encodeFromLinear(lin) * 255.0f));
+    return uint(round(encodeFromLinear(lin) * peak));
+}
+
+uint byteFor(uint index) {
+    if (params.bytesPerSample == 1) return sampleFor(index);
+    return (sampleFor(index / 2) >> ((index & 1) * 8)) & 0xFFu;
 }
 
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void xybToSrgb8(uint3 tid: SV_DispatchThreadID) {
-    const uint total = params.width * params.height * params.channels;
+    const uint total = params.width * params.height * params.channels * params.bytesPerSample;
     const uint word = tid.x;
     if (word * 4 >= total) return;
     uint packed = 0;

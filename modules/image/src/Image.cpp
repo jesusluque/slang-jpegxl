@@ -1,8 +1,11 @@
 // Copyright (c) 2026 jesus luque.
 #include "sjxl/image/Image.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <fstream>
+#include <span>
+#include <vector>
 
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_NO_HDR
@@ -15,36 +18,121 @@
 
 namespace sjxl::image {
 
+Result<void> writeFile(const std::filesystem::path& path, std::span<const uint8_t> bytes);
+
 namespace {
 
-Result<Rgb8> readWithChannels(const std::filesystem::path& path, bool keepAlpha) {
+Result<Rgb8> readWithChannels(const std::filesystem::path& path, bool keepAlpha, bool keepDepth) {
     int w = 0, h = 0, channels = 0;
     if (!stbi_info(path.string().c_str(), &w, &h, &channels)) {
         return Error::make(ErrorCode::IoFailure, "cannot read image '{}': {}", path.string(), stbi_failure_reason());
     }
     const int want = (keepAlpha && (channels == 2 || channels == 4)) ? 4 : 3;
-    stbi_uc* data = stbi_load(path.string().c_str(), &w, &h, &channels, want);
-    if (data == nullptr) {
-        return Error::make(ErrorCode::IoFailure, "cannot read image '{}': {}", path.string(), stbi_failure_reason());
-    }
+    const bool sixteen = keepDepth && stbi_is_16_bit(path.string().c_str());
     Rgb8 image;
     image.width = static_cast<uint32_t>(w);
     image.height = static_cast<uint32_t>(h);
     image.channels = static_cast<uint32_t>(want);
-    image.pixels.assign(data, data + static_cast<size_t>(w) * static_cast<size_t>(h) * static_cast<size_t>(want));
+    const size_t samples = static_cast<size_t>(w) * static_cast<size_t>(h) * static_cast<size_t>(want);
+    if (sixteen) {
+        stbi_us* data = stbi_load_16(path.string().c_str(), &w, &h, &channels, want);
+        if (data == nullptr) return Error::make(ErrorCode::IoFailure, "cannot read image '{}': {}", path.string(), stbi_failure_reason());
+        image.bitDepth = 16;
+        image.pixels.resize(samples * 2);
+        for (size_t i = 0; i < samples; ++i) {
+            image.pixels[2 * i] = static_cast<uint8_t>(data[i] & 0xFF);
+            image.pixels[2 * i + 1] = static_cast<uint8_t>(data[i] >> 8);
+        }
+        stbi_image_free(data);
+        return image;
+    }
+    stbi_uc* data = stbi_load(path.string().c_str(), &w, &h, &channels, want);
+    if (data == nullptr) {
+        return Error::make(ErrorCode::IoFailure, "cannot read image '{}': {}", path.string(), stbi_failure_reason());
+    }
+    image.pixels.assign(data, data + samples);
     stbi_image_free(data);
     return image;
 }
 
+uint32_t crc32Of(std::span<const uint8_t> bytes, uint32_t crc = 0xFFFFFFFFu) {
+    for (uint8_t b : bytes) {
+        crc ^= b;
+        for (int k = 0; k < 8; ++k) crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1u)));
+    }
+    return crc;
+}
+
+void putBe32(std::vector<uint8_t>& out, uint32_t v) {
+    out.push_back(static_cast<uint8_t>(v >> 24));
+    out.push_back(static_cast<uint8_t>(v >> 16));
+    out.push_back(static_cast<uint8_t>(v >> 8));
+    out.push_back(static_cast<uint8_t>(v));
+}
+
+void putChunk(std::vector<uint8_t>& out, const char* type, std::span<const uint8_t> data) {
+    putBe32(out, static_cast<uint32_t>(data.size()));
+    std::vector<uint8_t> body(type, type + 4);
+    body.insert(body.end(), data.begin(), data.end());
+    out.insert(out.end(), body.begin(), body.end());
+    putBe32(out, crc32Of(body) ^ 0xFFFFFFFFu);
+}
+
+/// A 16-bit PNG (stb_image_write only does 8): filter 0 rows, big-endian samples,
+/// zlib with stored deflate blocks.
+Result<void> writePng16(const std::filesystem::path& path, const Rgb8& image) {
+    const size_t rowBytes = size_t{image.width} * image.channels * 2;
+    std::vector<uint8_t> raw;
+    raw.reserve((rowBytes + 1) * image.height);
+    for (uint32_t y = 0; y < image.height; ++y) {
+        raw.push_back(0);   // filter: none
+        const uint8_t* row = image.pixels.data() + y * rowBytes;
+        for (size_t i = 0; i < rowBytes; i += 2) {   // little-endian in memory, big-endian in PNG
+            raw.push_back(row[i + 1]);
+            raw.push_back(row[i]);
+        }
+    }
+    std::vector<uint8_t> z = {0x78, 0x01};
+    uint32_t a = 1, b = 0;
+    for (uint8_t v : raw) { a = (a + v) % 65521; b = (b + a) % 65521; }
+    for (size_t pos = 0; pos < raw.size() || pos == 0;) {
+        const size_t n = std::min<size_t>(65535, raw.size() - pos);
+        const bool last = pos + n >= raw.size();
+        z.push_back(last ? 1 : 0);
+        z.push_back(static_cast<uint8_t>(n & 0xFF));
+        z.push_back(static_cast<uint8_t>(n >> 8));
+        z.push_back(static_cast<uint8_t>(~n & 0xFF));
+        z.push_back(static_cast<uint8_t>((~n >> 8) & 0xFF));
+        z.insert(z.end(), raw.begin() + static_cast<std::ptrdiff_t>(pos), raw.begin() + static_cast<std::ptrdiff_t>(pos + n));
+        pos += n;
+        if (last) break;
+    }
+    putBe32(z, (b << 16) | a);
+    std::vector<uint8_t> png = {0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A};
+    std::vector<uint8_t> ihdr;
+    putBe32(ihdr, image.width);
+    putBe32(ihdr, image.height);
+    ihdr.push_back(16);
+    ihdr.push_back(image.channels == 4 ? 6 : 2);
+    ihdr.push_back(0); ihdr.push_back(0); ihdr.push_back(0);
+    putChunk(png, "IHDR", ihdr);
+    putChunk(png, "IDAT", z);
+    putChunk(png, "IEND", {});
+    return writeFile(path, png);
+}
+
 }   // namespace
 
-Result<Rgb8> readRgb8(const std::filesystem::path& path) { return readWithChannels(path, false); }
-Result<Rgb8> readImage8(const std::filesystem::path& path) { return readWithChannels(path, true); }
+Result<Rgb8> readRgb8(const std::filesystem::path& path) { return readWithChannels(path, false, false); }
+Result<Rgb8> readImage8(const std::filesystem::path& path) { return readWithChannels(path, true, false); }
+Result<Rgb8> readImage(const std::filesystem::path& path) { return readWithChannels(path, true, true); }
 
 Result<void> writePng(const std::filesystem::path& path, const Rgb8& image) {
-    if ((image.channels != 3 && image.channels != 4) || image.pixels.size() != size_t{image.width} * image.height * image.channels) {
+    if ((image.channels != 3 && image.channels != 4) || (image.bitDepth != 8 && image.bitDepth != 16) ||
+        image.pixels.size() != size_t{image.width} * image.height * image.channels * (image.bitDepth / 8)) {
         return Error(ErrorCode::InvalidArgument, "image pixel count does not match its size");
     }
+    if (image.bitDepth == 16) return writePng16(path, image);
     if (stbi_write_png(path.string().c_str(), static_cast<int>(image.width), static_cast<int>(image.height), static_cast<int>(image.channels),
                        image.pixels.data(), static_cast<int>(image.width * image.channels)) == 0) {
         return Error::make(ErrorCode::IoFailure, "cannot write '{}'", path.string());
