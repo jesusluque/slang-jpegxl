@@ -35,6 +35,10 @@ struct Options {
     bool loopFilter = true;
     /// Most AC histogram clusters (1..32); 1 codes every context with one histogram.
     uint32_t acClusters = 32;
+    /// Transform selection (DCT8 to 32x32 per 32x32 superblock); off: DCT8 everywhere.
+    bool acStrategy = true;
+    /// The selection's distortion weight: bits per squared quant step of rounding error.
+    float acsLambda = 8.0f;
 };
 
 /// What the last encode measured, for tests and the CLI.
@@ -63,13 +67,14 @@ private:
     std::shared_ptr<gpu::ShaderLibrary> library_;
     gpu::Device*                        device_ = nullptr;
     gpu::ComputeKernel                  rgbToXyb_, aqDiff_, aqMap_, aqRawField_;
-    gpu::ComputeKernel                  gaborishInverse_, dct_, cflTile_, quantize_;
-    gpu::ComputeKernel                  acItems_, dcItems_, metaItems_, clusterContexts_, accumulateClusters_, acSections_;
+    gpu::ComputeKernel                  gaborishInverse_, cflTile_, quantize_;
+    gpu::ComputeKernel                  tables_, buildOrders_, selectStrategies_, adjustQuantField_, dctRows_, dctCols_, dcFromLlf_, acTokenize_;
+    gpu::ComputeKernel                  dcItems_, metaItems_, clusterContexts_, accumulateClusters_, acSections_;
     gpu::ComputeKernel                  rctYCoCg_, modHist_, modGroupSections_, modularGlobalBlob_;
     gpu::ComputeKernel                  dcGroupBlobs_, globalBlobs_, layout_, blobEmit_;
     gpu::PrefixSum                      prefixSum_;
-    gpu::Buffer                         dequant_;   // 3 * 64 floats
-    gpu::Buffer                         order_;     // 64 uints
+    gpu::Buffer                         dequantAll_;   // every quant table kind, 3 channels each (kTableBase layout)
+    gpu::Buffer                         orders_;       // the natural coefficient order of every bucket
     gpu::Buffer                         dummy_;     // bound where a pass has no body yet
     gpu::Buffer                         dummyInt_;  // an int buffer for the same purpose
     Stats                               stats_;

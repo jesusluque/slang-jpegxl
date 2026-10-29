@@ -6,14 +6,12 @@
 // offset the prefix sum of those lengths gave the item. The three passes walk
 // the same tokens, so the layout is decided once, here.
 //
-// AC tokens are coded in libjxl's contexts (ac_context.slangh): mode 0 counts
-// them per context into ctxHist; the clustering kernel maps the contexts to
-// clusters, and ac_sections.slang codes the AC groups with ANS (the DC and
-// AcMetadata streams stay prefix coded here, modes 1 and 2).
+// The AC groups are tokenised by transform.slang and coded with ANS by
+// ac_sections.slang; the DC and AcMetadata streams are the prefix-coded items
+// here.
 //
 // Items are laid out regularly, padded to the largest group, so an item index
-// says where it belongs without a table: AC items are g * 3072 + (by * 32 +
-// bx) * 3 + ci (ci: Y, X, B); DC items g * 196608 + ci * 65536 + by * 256 + bx;
+// says where it belongs without a table: DC items g * 196608 + ci * 65536 + by * 256 + bx;
 // AcMetadata items g * 133120 + [0,1024) YtoX tiles, [1024,2048) YtoB tiles,
 // then 65536 strategies and 65536 quant-field values (the EPF channel costs
 // no bits: its alphabet has one symbol, sharpness 4 through the leaf offset). Items outside their group's rect
@@ -22,16 +20,13 @@ module enc_items;
 
 #include "sjxl/common/hybrid_uint.slangh"
 #include "sjxl/common/bitio.slangh"
-#include "sjxl/common/ac_context.slangh"
 
-static const uint kAcItemsPerGroup = 32 * 32 * 3;
 static const uint kDcItemsPerGroup = 256 * 256 * 3;
 static const uint kMetaTiles = 32 * 32;
 static const uint kMetaBlocks = 256 * 256;
 static const uint kMetaItemsPerGroup = 2 * kMetaTiles + 2 * kMetaBlocks;
 static const uint kCodeStride = 256;
 static const uint kAcClusters = 32;   // code regions 0..31 are the AC clusters
-static const uint kHistBins = 128;    // bins per context histogram
 
 struct ItemParams {
     uint nblocks;
@@ -44,19 +39,14 @@ struct ItemParams {
     uint pad0;
 };
 
-StructuredBuffer<uint4>    groups;        // AC groups: bx0, by0, w, h (blocks)
 StructuredBuffer<uint4>    dcGroups;      // DC groups: the same
-StructuredBuffer<int>      acQuant;       // [c][block][k]
 StructuredBuffer<int>      dcQuant;       // [c][block]
-StructuredBuffer<uint>     nonZeros;      // [c][block]
-StructuredBuffer<uint>     order;         // natural order, 64 entries
 StructuredBuffer<uint>     rawQf;         // [block]: the quant field, 1..256
 StructuredBuffer<int>      cmapX;         // [tile]: YtoX
 StructuredBuffer<int>      cmapB;         // [tile]: YtoB
 StructuredBuffer<uint>     codes;         // depth << 16 | bits; region r at r * 256
 RWStructuredBuffer<uint>   hist;          // same regions as codes
-RWStructuredBuffer<uint>   ctxHist;       // mode 0: AC context histograms, kNumAcContexts * kHistBins
-StructuredBuffer<uint>     ctxMap;        // AC context -> cluster (code region)
+StructuredBuffer<uint>     acs;           // per block: strategy << 1 | first
 RWStructuredBuffer<uint>   itemBits;      // mode 1 output
 StructuredBuffer<uint>     prefix;        // mode 2: exclusive prefix of itemBits
 StructuredBuffer<uint>     sectionStart;  // mode 2: bit offset of each section
@@ -97,62 +87,7 @@ void token(inout Cursor cur, uint value) {
     codeToken(cur, cur.codeBase, tok, nbits, raw);
 }
 
-/// One hybrid-uint value of the AC stream in context `ctx`, counted per
-/// context (mode 0 only: the AC sections are ANS coded by ac_sections.slang).
-void acToken(inout Cursor cur, uint ctx, uint value) {
-    uint tok, nbits, raw;
-    hybridEncode(value, tok, nbits, raw);
-    uint before;
-    InterlockedAdd(ctxHist[ctx * kHistBins + min(tok, kHistBins - 1)], 1u, before);
-}
-
 uint physicalChannel(uint ci) { return ci == 0 ? 1 : (ci == 1 ? 0 : 2); }
-
-[shader("compute")]
-[numthreads(64, 1, 1)]
-void acItems(uint3 tid: SV_DispatchThreadID) {
-    const uint i = tid.x;
-    if (i >= params.numGroups * kAcItemsPerGroup) {
-        return;
-    }
-    const uint g = i / kAcItemsPerGroup;
-    const uint l = i % kAcItemsPerGroup;
-    const uint ci = l % 3;
-    const uint bx = (l / 3) % 32;
-    const uint by = (l / 3) / 32;
-    const uint4 rect = groups[g];
-    Cursor cur;
-    cur.mode = params.mode;
-    cur.codeBase = 0;
-    cur.pos = 0;
-    if (params.mode == 2) {
-        cur.pos = sectionStart[2 + params.numDcGroups + g] + (prefix[i] - prefix[g * kAcItemsPerGroup]);
-    }
-    if (bx < rect.z && by < rect.w) {
-        const uint c = physicalChannel(ci);
-        const uint block = (rect.y + by) * params.blocksX + rect.x + bx;
-        const uint base = (c * params.nblocks + block) * 64;
-        const uint nzPlane = c * params.nblocks;
-        uint nz = nonZeros[nzPlane + block];
-        // The non-zero count's context: predicted from the top and left
-        // blocks of the group (default 32 at its corner) and the block context.
-        const uint predicted = predictNonZeros(bx > 0, by > 0, bx > 0 ? nonZeros[nzPlane + block - 1] : 0,
-                                               by > 0 ? nonZeros[nzPlane + block - params.blocksX] : 0);
-        const uint blockCtx = defaultBlockContext(c);
-        acToken(cur, nonZeroBucket(predicted) * kDefaultNumBlockCtxs + blockCtx, nz);
-        const uint histoOffset = kDefaultNumBlockCtxs * kNonZeroBuckets + kZeroDensityContextCount * blockCtx;
-        uint prev = nz > 4 ? 0 : 1;   // size / 16
-        for (uint k = 1; k < 64 && nz != 0; ++k) {
-            const int v = acQuant[base + order[k]];
-            acToken(cur, histoOffset + zeroDensityContext8(nz, k, prev), packSigned(v));
-            prev = v != 0 ? 1 : 0;
-            nz -= prev;
-        }
-    }
-    if (params.mode == 1) {
-        itemBits[i] = cur.pos;
-    }
-}
 
 [shader("compute")]
 [numthreads(64, 1, 1)]
@@ -223,9 +158,11 @@ void metaItems(uint3 tid: SV_DispatchThreadID) {
         const bool qfRow = (l - 2 * kMetaTiles) >= kMetaBlocks;
         const uint bx = b % 256, by = b / 256;
         if (bx < rect.z && by < rect.w) {
-            // Strategy row: DCT8 everywhere; QF row: qf - 1.
+            // One entry per varblock (its first block): the strategy, then qf - 1.
             const uint block = (rect.y + by) * params.blocksX + rect.x + bx;
-            token(cur, packSigned(qfRow ? int(rawQf[block]) - 1 : 0));
+            if ((acs[block] & 1) != 0) {
+                token(cur, packSigned(qfRow ? int(rawQf[block]) - 1 : int(acs[block] >> 1)));
+            }
         }
     }
     if (params.mode == 1) {

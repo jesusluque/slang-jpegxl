@@ -1,0 +1,68 @@
+// Copyright (c) 2026 jesus luque.
+//
+// Varblock geometry and the AC token contexts shared by the tokeniser, the
+// section coder and the chroma-from-luma pass. A varblock is described by its
+// first block's acs entry (strategy << 1 | 1; covered blocks hold strategy << 1)
+// and every block's firstBlock index. Coefficient memory index m of a varblock
+// lives in covered block m >> 6 (raster within the varblock), slot m & 63, as
+// the decoder stores it.
+#pragma once
+
+#include "sjxl/common/transform_basis.slangh"
+#include "sjxl/common/ac_context.slangh"
+
+struct Varblock {
+    uint first;      // first block index
+    uint strategy;
+    uint cx, cy;     // covered blocks
+    uint covered;    // cx * cy
+    uint log2Covered;
+    uint size;       // covered * 64 coefficients
+    uint nx, ny;     // pixels
+    uint fbx, fby;   // first block coordinates
+};
+
+Varblock varblockOf(uint first, uint strategy, uint blocksX) {
+    Varblock vb;
+    vb.first = first;
+    vb.strategy = strategy;
+    vb.cx = kCoveredX[strategy];
+    vb.cy = kCoveredY[strategy];
+    vb.covered = vb.cx * vb.cy;
+    vb.log2Covered = kLog2Covered[strategy];
+    vb.size = vb.covered * 64;
+    vb.nx = vb.cx * 8;
+    vb.ny = vb.cy * 8;
+    vb.fbx = first % blocksX;
+    vb.fby = first / blocksX;
+    return vb;
+}
+
+/// The coefficient buffer index of memory index m of channel c of a varblock.
+uint coeffSlot(Varblock vb, uint c, uint nblocks, uint blocksX, uint m) {
+    const uint q = m >> 6;
+    const uint block = (vb.fby + q / vb.cx) * blocksX + vb.fbx + q % vb.cx;
+    return (c * nblocks + block) * 64 + (m & 63);
+}
+
+/// Whether memory index m is one of the varblock's lowest frequencies (coded as DC).
+bool isLlf(Varblock vb, uint m) {
+    uint v, u;
+    memFreq(m, vb.ny, vb.nx, v, u);
+    return v < vb.cy && u < vb.cx;
+}
+
+/// ZeroDensityContext for a varblock.
+uint zeroDensityContextVar(uint nonzerosLeft, uint k, uint covered, uint log2Covered, uint prev) {
+    nonzerosLeft = (nonzerosLeft + covered - 1) >> log2Covered;
+    k >>= log2Covered;
+    return (kCoeffNumNonzeroContext[nonzerosLeft] + kCoeffFreqContext[k]) * 2 + prev;
+}
+
+/// The non-zero grid value of a cell: the normalised count of the varblock covering it.
+uint gridValue(uint block, StructuredBuffer<uint> acs, StructuredBuffer<uint> firstBlock, StructuredBuffer<uint> nonZeros, uint c, uint nblocks) {
+    const uint first = firstBlock[block];
+    const uint strategy = acs[first] >> 1;
+    const uint covered = kCoveredX[strategy] * kCoveredY[strategy];
+    return (nonZeros[c * nblocks + first] + covered - 1) >> kLog2Covered[strategy];
+}

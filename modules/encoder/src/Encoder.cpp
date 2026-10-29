@@ -20,7 +20,6 @@ namespace {
 
 using codestream::FrameDim;
 
-constexpr uint32_t kAcItemsPerGroup = 32 * 32 * 3;
 constexpr uint32_t kDcItemsPerGroup = 256 * 256 * 3;
 constexpr uint32_t kMetaItemsPerGroup = 2 * 32 * 32 + 2 * 256 * 256;
 constexpr uint32_t kCodeStride = 256;
@@ -28,6 +27,8 @@ constexpr uint32_t kBlobStrideWords = 8192;
 constexpr uint32_t kAcClusters = 32;
 constexpr uint32_t kNumAcContexts = 15 * (37 + 458);
 constexpr uint32_t kHistBins = 128;
+constexpr uint32_t kDequantTableFloats = 394752;
+constexpr uint32_t kCoeffOrderLimit = 6156;
 
 struct Uint4 {
     uint32_t x, y, z, w;
@@ -78,10 +79,16 @@ Result<std::unique_ptr<Encoder>> Encoder::create(std::shared_ptr<gpu::ShaderLibr
     SJXL_ASSIGN(enc->aqMap_, gpu::ComputeKernel::create(lib, "sjxl/enc/aq", "aqMap"));
     SJXL_ASSIGN(enc->aqRawField_, gpu::ComputeKernel::create(lib, "sjxl/enc/aq", "aqRawField"));
     SJXL_ASSIGN(enc->gaborishInverse_, gpu::ComputeKernel::create(lib, "sjxl/enc/gaborish", "gaborishInverse"));
-    SJXL_ASSIGN(enc->dct_, gpu::ComputeKernel::create(lib, "sjxl/enc/cfl", "dct"));
+    SJXL_ASSIGN(enc->tables_, gpu::ComputeKernel::create(lib, "sjxl/dec/tables", "computeDequantTable"));
+    SJXL_ASSIGN(enc->buildOrders_, gpu::ComputeKernel::create(lib, "sjxl/enc/transform", "buildOrders"));
+    SJXL_ASSIGN(enc->selectStrategies_, gpu::ComputeKernel::create(lib, "sjxl/enc/strategy", "selectStrategies"));
+    SJXL_ASSIGN(enc->adjustQuantField_, gpu::ComputeKernel::create(lib, "sjxl/enc/transform", "adjustQuantField"));
+    SJXL_ASSIGN(enc->dctRows_, gpu::ComputeKernel::create(lib, "sjxl/enc/transform", "dctRows"));
+    SJXL_ASSIGN(enc->dctCols_, gpu::ComputeKernel::create(lib, "sjxl/enc/transform", "dctCols"));
+    SJXL_ASSIGN(enc->dcFromLlf_, gpu::ComputeKernel::create(lib, "sjxl/enc/transform", "dcFromLlf"));
+    SJXL_ASSIGN(enc->acTokenize_, gpu::ComputeKernel::create(lib, "sjxl/enc/transform", "acTokenize"));
     SJXL_ASSIGN(enc->cflTile_, gpu::ComputeKernel::create(lib, "sjxl/enc/cfl", "cflTile"));
     SJXL_ASSIGN(enc->quantize_, gpu::ComputeKernel::create(lib, "sjxl/enc/quantize", "quantize"));
-    SJXL_ASSIGN(enc->acItems_, gpu::ComputeKernel::create(lib, "sjxl/enc/items", "acItems"));
     SJXL_ASSIGN(enc->dcItems_, gpu::ComputeKernel::create(lib, "sjxl/enc/items", "dcItems"));
     SJXL_ASSIGN(enc->metaItems_, gpu::ComputeKernel::create(lib, "sjxl/enc/items", "metaItems"));
     SJXL_ASSIGN(enc->clusterContexts_, gpu::ComputeKernel::create(lib, "sjxl/enc/cluster", "clusterContexts"));
@@ -97,12 +104,42 @@ Result<std::unique_ptr<Encoder>> Encoder::create(std::shared_ptr<gpu::ShaderLibr
     SJXL_ASSIGN(enc->blobEmit_, gpu::ComputeKernel::create(lib, "sjxl/enc/layout", "blobEmit"));
     SJXL_ASSIGN(enc->prefixSum_, gpu::PrefixSum::create(lib));
 
-    const auto weights = codestream::dct8DequantWeights();
-    SJXL_ASSIGN(enc->dequant_, gpu::Buffer::fromSpan<float>(*enc->device_, weights, "enc.dequant"));
-    const auto order = codestream::dct8NaturalOrder();
-    SJXL_ASSIGN(enc->order_, gpu::Buffer::fromSpan<uint32_t>(*enc->device_, order, "enc.order"));
     SJXL_ASSIGN(enc->dummy_, gpu::Buffer::ofType<uint32_t>(*enc->device_, 4, "enc.dummy"));
     SJXL_ASSIGN(enc->dummyInt_, gpu::Buffer::ofType<int32_t>(*enc->device_, 4, "enc.dummyInt"));
+
+    // libjxl's default dequant tables for every transform kind, from the
+    // decoder's table kernel over a globals region whose encodings are all
+    // "library" (zero), and the natural coefficient orders of every bucket.
+    gpu::Device& dev = *enc->device_;
+    std::vector<uint32_t> stubArena(4096, 0);
+    stubArena[44] = 64;   // kGsQuantEncOff -> a zeroed region: every kind takes the library default
+    SJXL_ASSIGN(auto arena, gpu::Buffer::fromSpan<uint32_t>(dev, stubArena, "enc.stubArena"));
+    SJXL_ASSIGN(enc->dequantAll_, gpu::Buffer::ofType<float>(dev, kDequantTableFloats, "enc.dequantAll"));
+    SJXL_ASSIGN(enc->orders_, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{kCoeffOrderLimit} * 64, "enc.orders"));
+    gpu::CommandBatch setup(dev);
+    enc->tables_.dispatch(setup, {kDequantTableFloats, 1, 1}, [&](rhi::ShaderCursor c) {
+        c["arena"].setBinding(arena.rhi());
+        c["dequant"].setBinding(enc->dequantAll_.rhi());
+        c["params"]["totalEntries"].setData(kDequantTableFloats);
+    });
+    enc->buildOrders_.dispatch(setup, {1, 1, 1}, [&](rhi::ShaderCursor c) {
+        c["orders"].setBinding(enc->orders_.rhi());
+        c["xyb"].setBinding(enc->dummy_.rhi());
+        c["acs"].setBinding(enc->dummy_.rhi());
+        c["firstBlock"].setBinding(enc->dummy_.rhi());
+        c["rowPass"].setBinding(enc->dummy_.rhi());
+        c["coeffs"].setBinding(enc->dummy_.rhi());
+        c["dcValue"].setBinding(enc->dummy_.rhi());
+        c["rawQf"].setBinding(enc->dummy_.rhi());
+        c["acQuant"].setBinding(enc->dummyInt_.rhi());
+        c["nonZeros"].setBinding(enc->dummy_.rhi());
+        c["acTokens"].setBinding(enc->dummy_.rhi());
+        c["numTokens"].setBinding(enc->dummy_.rhi());
+        c["nzCtx"].setBinding(enc->dummy_.rhi());
+        c["ctxHist"].setBinding(enc->dummy_.rhi());
+        c["params"]["blocksX"].setData(0u);
+    });
+    SJXL_TRY(setup.submit(true));
     return enc;
 }
 
@@ -155,7 +192,15 @@ Result<std::vector<uint8_t>> Encoder::encode(const image::Rgb8& image, const Opt
     SJXL_ASSIGN(auto qfField, gpu::Buffer::ofType<float>(dev, nblocks, "enc.qf"));
     SJXL_ASSIGN(auto quantizer, gpu::Buffer::fromSpan<uint32_t>(dev, quantizerWords, "enc.quantizer"));
     SJXL_ASSIGN(auto rawQf, gpu::Buffer::ofType<uint32_t>(dev, nblocks, "enc.rawQf"));
+    SJXL_ASSIGN(auto acs, gpu::Buffer::ofType<uint32_t>(dev, nblocks, "enc.acs"));
+    SJXL_ASSIGN(auto firstBlock, gpu::Buffer::ofType<uint32_t>(dev, nblocks, "enc.firstBlock"));
+    SJXL_ASSIGN(auto rowPass, gpu::Buffer::ofType<float>(dev, 3 * planePixels, "enc.rowPass"));
     SJXL_ASSIGN(auto coeffs, gpu::Buffer::ofType<float>(dev, uint64_t{3} * nblocks * 64, "enc.coeffs"));
+    SJXL_ASSIGN(auto dcValue, gpu::Buffer::ofType<float>(dev, uint64_t{3} * nblocks, "enc.dcValue"));
+    SJXL_ASSIGN(auto yRecon, gpu::Buffer::ofType<float>(dev, uint64_t{nblocks} * 64, "enc.yRecon"));
+    SJXL_ASSIGN(auto acTokens, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{3} * nblocks * 64, "enc.acTokens"));
+    SJXL_ASSIGN(auto numTokens, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{3} * nblocks, "enc.numTokens"));
+    SJXL_ASSIGN(auto nzCtx, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{3} * nblocks, "enc.nzCtx"));
     SJXL_ASSIGN(auto cmapX, gpu::Buffer::ofType<int32_t>(dev, uint64_t{tilesX} * tilesY, "enc.cmapX"));
     SJXL_ASSIGN(auto cmapB, gpu::Buffer::ofType<int32_t>(dev, uint64_t{tilesX} * tilesY, "enc.cmapB"));
     SJXL_ASSIGN(auto acQuant, gpu::Buffer::ofType<int32_t>(dev, uint64_t{3} * nblocks * 64, "enc.acQuant"));
@@ -185,7 +230,6 @@ Result<std::vector<uint8_t>> Encoder::encode(const image::Rgb8& image, const Opt
     SJXL_ASSIGN(auto ansReverse, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{kAcClusters + 1} * 4096, "enc.ansReverse"));
     SJXL_ASSIGN(auto acSectionBits, gpu::Buffer::ofType<uint32_t>(dev, numGroups, "enc.acSectionBits"));
 
-    const uint32_t acItems = numGroups * kAcItemsPerGroup;
     const uint32_t dcItems = numDcGroups * kDcItemsPerGroup;
     const uint32_t metaItems = numDcGroups * kMetaItemsPerGroup;
     SJXL_ASSIGN(auto dcBits, gpu::Buffer::ofType<uint32_t>(dev, dcItems + 1, "enc.dcBits"));
@@ -245,32 +289,81 @@ Result<std::vector<uint8_t>> Encoder::encode(const image::Rgb8& image, const Opt
             c["params"]["paddedHeight"].setData(dim.ysizePadded);
         });
     }
-    const auto bindCfl = [&](rhi::ShaderCursor c) {
+    // The strategy of every block, the field per varblock, the
+    // varblock DCTs, their DC, chroma-from-luma, quantisation, and the AC tokens
+    // with their context histograms.
+    const uint32_t superblocksX = (dim.xsizeBlocks + 3) / 4;
+    const uint32_t superblocksY = (dim.ysizeBlocks + 3) / 4;
+    selectStrategies_.dispatchGroups(batch, {superblocksX * superblocksY, 1, 1}, [&](rhi::ShaderCursor c) {
         c["xyb"].setBinding(planes.rhi());
-        c["coeffs"].setBinding(coeffs.rhi());
-        c["dequant"].setBinding(dequant_.rhi());
         c["rawQf"].setBinding(rawQf.rhi());
+        c["dequant"].setBinding(dequantAll_.rhi());
         c["quantizer"].setBinding(quantizer.rhi());
-        c["cmapX"].setBinding(cmapX.rhi());
-        c["cmapB"].setBinding(cmapB.rhi());
+        c["acs"].setBinding(acs.rhi());
+        c["firstBlock"].setBinding(firstBlock.rhi());
+        c["params"]["blocksX"].setData(dim.xsizeBlocks);
+        c["params"]["blocksY"].setData(dim.ysizeBlocks);
+        c["params"]["paddedWidth"].setData(dim.xsizePadded);
+        c["params"]["paddedHeight"].setData(dim.ysizePadded);
+        c["params"]["superblocksX"].setData(superblocksX);
+        c["params"]["lambda"].setData(options.acsLambda);
+        c["params"]["distance"].setData(options.distance);
+        c["params"]["enabled"].setData(uint32_t{options.acStrategy ? 1u : 0u});
+        uint32_t familyMask = 0x7F;
+        if (const std::string m = platform::env("SJXL_ACS_MASK"); !m.empty()) familyMask = static_cast<uint32_t>(std::strtoul(m.c_str(), nullptr, 0));
+        c["params"]["familyMask"].setData(familyMask);
+    });
+    const auto bindTransform = [&](rhi::ShaderCursor c) {
+        c["xyb"].setBinding(planes.rhi());
+        c["acs"].setBinding(acs.rhi());
+        c["firstBlock"].setBinding(firstBlock.rhi());
+        c["orders"].setBinding(orders_.rhi());
+        c["rowPass"].setBinding(rowPass.rhi());
+        c["coeffs"].setBinding(coeffs.rhi());
+        c["dcValue"].setBinding(dcValue.rhi());
+        c["rawQf"].setBinding(rawQf.rhi());
+        c["acQuant"].setBinding(acQuant.rhi());
+        c["nonZeros"].setBinding(nonZeros.rhi());
+        c["acTokens"].setBinding(acTokens.rhi());
+        c["numTokens"].setBinding(numTokens.rhi());
+        c["nzCtx"].setBinding(nzCtx.rhi());
+        c["ctxHist"].setBinding(ctxHist.rhi());
         c["params"]["paddedWidth"].setData(dim.xsizePadded);
         c["params"]["paddedHeight"].setData(dim.ysizePadded);
         c["params"]["blocksX"].setData(dim.xsizeBlocks);
         c["params"]["blocksY"].setData(dim.ysizeBlocks);
-        c["params"]["tilesX"].setData(tilesX);
-        c["params"]["tilesY"].setData(tilesY);
+        c["params"]["distance"].setData(options.distance);
     };
-    dct_.dispatch(batch, {nblocks, 1, 1}, bindCfl);
+    adjustQuantField_.dispatch(batch, {nblocks, 1, 1}, bindTransform);
+    dctRows_.dispatch(batch, {static_cast<uint32_t>(3 * planePixels), 1, 1}, bindTransform);
+    dctCols_.dispatch(batch, {static_cast<uint32_t>(3 * planePixels), 1, 1}, bindTransform);
+    dcFromLlf_.dispatch(batch, {3 * nblocks, 1, 1}, bindTransform);
     if (options.chromaFromLuma) {
-        cflTile_.dispatch(batch, {tilesX * tilesY, 1, 1}, bindCfl);
+        cflTile_.dispatch(batch, {tilesX * tilesY, 1, 1}, [&](rhi::ShaderCursor c) {
+            c["coeffs"].setBinding(coeffs.rhi());
+            c["dequant"].setBinding(dequantAll_.rhi());
+            c["acs"].setBinding(acs.rhi());
+            c["rawQf"].setBinding(rawQf.rhi());
+            c["quantizer"].setBinding(quantizer.rhi());
+            c["cmapX"].setBinding(cmapX.rhi());
+            c["cmapB"].setBinding(cmapB.rhi());
+            c["params"]["blocksX"].setData(dim.xsizeBlocks);
+            c["params"]["blocksY"].setData(dim.ysizeBlocks);
+            c["params"]["tilesX"].setData(tilesX);
+            c["params"]["tilesY"].setData(tilesY);
+        });
     }
     quantize_.dispatch(batch, {nblocks, 1, 1}, [&](rhi::ShaderCursor c) {
         c["coeffs"].setBinding(coeffs.rhi());
-        c["dequant"].setBinding(dequant_.rhi());
+        c["dcValue"].setBinding(dcValue.rhi());
+        c["dequant"].setBinding(dequantAll_.rhi());
+        c["acs"].setBinding(acs.rhi());
+        c["firstBlock"].setBinding(firstBlock.rhi());
         c["rawQf"].setBinding(rawQf.rhi());
         c["quantizer"].setBinding(quantizer.rhi());
         c["cmapX"].setBinding(cmapX.rhi());
         c["cmapB"].setBinding(cmapB.rhi());
+        c["yRecon"].setBinding(yRecon.rhi());
         c["acQuant"].setBinding(acQuant.rhi());
         c["dcQuant"].setBinding(dcQuant.rhi());
         c["nonZeros"].setBinding(nonZeros.rhi());
@@ -280,22 +373,18 @@ Result<std::vector<uint8_t>> Encoder::encode(const image::Rgb8& image, const Opt
         c["params"]["xQmMultiplier"].setData(static_cast<float>(std::pow(1.25, static_cast<int>(frame.xQmScale) - 2)));
         c["params"]["bQmMultiplier"].setData(static_cast<float>(std::pow(1.25, static_cast<int>(frame.bQmScale) - 2)));
     });
+    acTokenize_.dispatch(batch, {3 * nblocks, 1, 1}, bindTransform);
 
     const auto bindItems = [&](rhi::ShaderCursor c, uint32_t mode, const gpu::Buffer& bits, const gpu::Buffer& prefix,
                                const gpu::Buffer& body) {
-        c["groups"].setBinding(groups.rhi());
         c["dcGroups"].setBinding(dcGroups.rhi());
-        c["acQuant"].setBinding(acQuant.rhi());
         c["dcQuant"].setBinding(dcQuant.rhi());
-        c["nonZeros"].setBinding(nonZeros.rhi());
-        c["order"].setBinding(order_.rhi());
+        c["acs"].setBinding(acs.rhi());
         c["rawQf"].setBinding(rawQf.rhi());
         c["cmapX"].setBinding(cmapX.rhi());
         c["cmapB"].setBinding(cmapB.rhi());
         c["codes"].setBinding(codes.rhi());
         c["hist"].setBinding(hist.rhi());
-        c["ctxHist"].setBinding(ctxHist.rhi());
-        c["ctxMap"].setBinding(ctxMap.rhi());
         c["itemBits"].setBinding(bits.rhi());
         c["prefix"].setBinding(prefix.rhi());
         c["sectionStart"].setBinding(sectionStart.rhi());
@@ -311,9 +400,11 @@ Result<std::vector<uint8_t>> Encoder::encode(const image::Rgb8& image, const Opt
     };
     const auto bindSections = [&](rhi::ShaderCursor c, uint32_t mode, const gpu::Buffer& body) {
         c["groups"].setBinding(groups.rhi());
-        c["acQuant"].setBinding(acQuant.rhi());
+        c["acs"].setBinding(acs.rhi());
         c["nonZeros"].setBinding(nonZeros.rhi());
-        c["order"].setBinding(order_.rhi());
+        c["acTokens"].setBinding(acTokens.rhi());
+        c["numTokens"].setBinding(numTokens.rhi());
+        c["nzCtx"].setBinding(nzCtx.rhi());
         c["ctxMap"].setBinding(ctxMap.rhi());
         c["ansInfo"].setBinding(ansInfo.rhi());
         c["ansReverse"].setBinding(ansReverse.rhi());
@@ -327,12 +418,10 @@ Result<std::vector<uint8_t>> Encoder::encode(const image::Rgb8& image, const Opt
         c["params"]["numDcGroups"].setData(numDcGroups);
         c["params"]["mode"].setData(mode);
     };
-    // The AC groups: context histograms in mode 0 (items), then the ANS
-    // sections (one thread per group) measured in mode 1 and emitted in mode 2.
+    // The AC groups' context histograms were made by acTokenize; the ANS
+    // sections (one thread per group) are measured in mode 1 and emitted in mode 2.
     const auto itemPasses = [&](uint32_t mode, const gpu::Buffer& body) {
-        if (mode == 0) {
-            acItems_.dispatch(batch, {acItems, 1, 1}, [&](rhi::ShaderCursor c) { bindItems(c, mode, dcBits, dcPrefix, body); });
-        } else {
+        if (mode != 0) {
             acSections_.dispatch(batch, {numGroups, 1, 1}, [&](rhi::ShaderCursor c) { bindSections(c, mode, body); });
         }
         dcItems_.dispatch(batch, {dcItems, 1, 1}, [&](rhi::ShaderCursor c) { bindItems(c, mode, dcBits, dcPrefix, body); });
@@ -360,6 +449,7 @@ Result<std::vector<uint8_t>> Encoder::encode(const image::Rgb8& image, const Opt
 
     const auto bindCodes = [&](rhi::ShaderCursor c) {
         c["dcGroups"].setBinding(dcGroups.rhi());
+        c["acs"].setBinding(acs.rhi());
         c["hist"].setBinding(hist.rhi());
         c["quantizer"].setBinding(quantizer.rhi());
         c["ctxMap"].setBinding(ctxMap.rhi());
@@ -419,6 +509,23 @@ Result<std::vector<uint8_t>> Encoder::encode(const image::Rgb8& image, const Opt
         for (size_t i = 0; i < std::min<size_t>(cmapXHost.size(), 12); ++i) cm += std::format("({},{}) ", cmapXHost[i], cmapBHost[i]);
         log::info("enc debug: global_scale {} quant_dc {} raw qf [{}, {}] gab {} epf {} xqm {} ac clusters {} cmap(x,b) {}", qp.globalScale,
                   qp.quantDc, qfMin, qfMax, frame.gaborish, frame.epfIters, frame.xQmScale, clusterInfoHost[0], cm);
+        SJXL_ASSIGN(const auto acsHost, acs.readAll<uint32_t>(dev));
+        std::array<uint32_t, 27> strategyCount{};
+        uint32_t firsts = 0;
+        for (uint32_t a : acsHost) {
+            if (a & 1) { ++firsts; if ((a >> 1) < 27) ++strategyCount[a >> 1]; }
+        }
+        std::string sc;
+        for (uint32_t i = 0; i < 27; ++i) if (strategyCount[i]) sc += std::format("s{}:{} ", i, strategyCount[i]);
+        log::info("enc debug: {} varblocks of {} blocks: {}", firsts, nblocks, sc);
+        for (uint32_t by = 0; by < std::min<uint32_t>(dim.ysizeBlocks, 8); ++by) {
+            std::string row;
+            for (uint32_t bx = 0; bx < std::min<uint32_t>(dim.xsizeBlocks, 40); ++bx) {
+                const uint32_t a = acsHost[by * dim.xsizeBlocks + bx];
+                row += (a & 1) ? std::format("{:x} ", a >> 1) : ". ";
+            }
+            log::info("enc debug: acs row {:3} {}", by, row);
+        }
         SJXL_ASSIGN(const auto blobBitsHost, blobBits.readAll<uint32_t>(dev));
         SJXL_ASSIGN(const auto sizesHost, sectionBytes.readAll<uint32_t>(dev));
         std::string sections;
@@ -590,6 +697,7 @@ Result<std::vector<uint8_t>> Encoder::encodeLossless(const image::Rgb8& image, c
     accumulateClusters_.dispatch(batch, {numLeaves, 1, 1}, bindCluster);
     const auto bindCodes = [&](rhi::ShaderCursor c) {
         c["dcGroups"].setBinding(dummy_.rhi());
+        c["acs"].setBinding(dummy_.rhi());
         c["hist"].setBinding(hist.rhi());
         c["quantizer"].setBinding(dummy_.rhi());
         c["ctxMap"].setBinding(ctxMap.rhi());

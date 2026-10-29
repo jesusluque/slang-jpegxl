@@ -55,10 +55,11 @@ per subsystem or milestone, appended to as the work goes. Dates are absolute.
 - **M3 encoder quality**: (done 2026-10-29: inverse Gaborish + LoopFilter as
   libjxl chooses it, EPF sharpness 4, CfL per tile, adaptive quant field,
   AdjustQuantBlockAC; ANS for the AC groups with clustered coefficient
-  contexts; lossless Modular encoding of RGB and RGBA at 8 and 16 bits.)
-  Next: DCT16/32 strategy search, DC and AcMetadata coding (ANS, better
-  trees), a learned or WP-based tree and transforms for lossless, alpha and
-  16-bit in the lossy path.
+  contexts; lossless Modular encoding of RGB and RGBA at 8 and 16 bits;
+  transform selection DCT8..32x32 per superblock.) Next: DC and AcMetadata
+  coding (ANS, better trees), the quant field and strategy heuristics against
+  cjxl's maps, a learned or WP-based tree and transforms for lossless, alpha
+  and 16-bit in the lossy path.
 - **M4 decoder completeness**: splines, grey JPEG transcodes, loop filters
   on YCbCr frames, extra channel blending in patches, writing the ICC
   profile into the output file, float samples. (16-bit output, animation
@@ -270,6 +271,79 @@ stream, and the larger transforms cjxl uses in smooth areas. Encode time
 rose from 17 to 44 ms (Debug build) on 320×180: the ANS chain is serial per
 group and runs twice; a 2-lane interleave or the count pass reused for the
 placement are M5 options.
+
+## Transform selection: varblocks up to 32x32 (2026-10-29)
+
+The VarDCT pipeline now codes varblocks: every kernel after the quant field
+works on the strategy map (`acs[block] = strategy << 1 | first`,
+`firstBlock[block]`), with the geometry helpers of `enc/ac_tokens.slangh`
+and the tables of `common/transform_basis.slangh` (the decoder's basis
+functions, memory layout, covered-block and order-bucket tables, the
+dequant table layout, the natural order generator). The stages, each a kernel:
+
+- `selectStrategies` (`enc/strategy.slang`): one thread-group of 256 per
+  32×32 superblock. It loads the Y tile and the 8/16/32-point scaled DCT
+  bases into threadgroup memory and, for seven families (32×32, two 32×16,
+  two 16×32, four 16×16, eight 16×8, eight 8×16, sixteen 8×8; every family is
+  1024 coefficients, four per thread) computes the separable DCT, quantises
+  each coefficient with the varblock's field value (AdjustQuantField: the max
+  of its blocks', mixed with the mean above distance 1.54) and the kind's
+  dequant table, skips the lowest frequencies (coded as DC) and accumulates a
+  cost: a token estimate (0.3 bits for a zero, 3 + 2 log2 |q| otherwise) plus
+  λ times the squared rounding error in quant steps. Thread 0 then picks per
+  quadrant the cheapest of 16×16, two 16×8, two 8×16 or four 8×8, and for the
+  superblock the cheapest of 32×32, two 32×16, two 16×32 or the quadrants.
+  Candidates outside the block grid are invalid; a block beyond the grid
+  costs nothing, so partial superblocks fall back to what fits (the first
+  version let an all-infinite comparison pick a 32×32 that overhung the frame,
+  which both decoders rejected). `--no-acs` keeps DCT8; `--lambda` and
+  `SJXL_ACS_MASK` (a bit per family) are for experiments.
+- `adjustQuantField`: the varblock's field at its first block.
+- `dctRows` / `dctCols`: one thread per pixel and channel, the separable
+  forward scaled DCT of any varblock (the exact inverse of the decoder's
+  idctBasis), written to libjxl's coefficient memory (covered block m >> 6,
+  slot m & 63). The 8×8 butterfly is gone; the direct form changed the DCT8
+  output only in float rounding (same size, SSIMULACRA2 84.403 vs 84.401).
+- `dcFromLlf`: a covered block's DC image value from its varblock's lowest
+  frequencies, dc = idct(LLF / (rs rs)), the inverse of the decoder's
+  LowestFrequenciesFromDC; the DC of X and B is quantised against Y's as
+  before.
+- `quantize` per varblock: AdjustQuantBlockAC generalised (libjxl's rows ×
+  columns view of the coefficient memory, the partial-block exclusions, the
+  kMul1/kMul2 step for the large transforms, dead zones widened for chroma on
+  blocks of four or more), the non-zero count over the non-LLF coefficients,
+  Y's reconstruction kept in a scratch buffer for the chroma residuals.
+- `acTokenize` per varblock and channel: the non-zero count's context from
+  the group-local grid (a cell holds the normalised count of the varblock
+  covering it, read through firstBlock, so no serial state is needed), the
+  coefficient tokens in the bucket's natural order with
+  ZeroDensityContext(nz, k, covered, log2 covered, prev), each stored as
+  `ctx << 18 | value` at the coefficient index's slot, and the context
+  histograms. `acSections` walks these backwards per group. The AcMetadata
+  stream carries one strategy and one qf per varblock (`count` is the number
+  of first blocks); chroma-from-luma loops the tile's varblocks.
+- The dequant tables of every kind come from the decoder's table kernel over
+  a stub globals region at `Encoder::create` (every encoding "library"), and
+  the natural orders of the 13 buckets from `buildOrders`.
+
+λ was tuned on the three test images at matched size (mean Δ SSIMULACRA2
+against cjxl -e 5 over d = 1 and 3): λ = 1 −0.98, 2 −1.12, 4 −1.08, 8 −0.79
+(DCT8 only −0.9). The small images hardly move; the full-size photos
+(cujpegxl/data, 3840×2160) do:
+
+| image | d | cjxl bytes / SSIM2 | DCT8 only at cjxl's size | with selection |
+|---|---|---|---|---|
+| berlin_central | 1 | 1 217 920 / 84.61 | 82.99 (−1.62) | 83.15 (−1.46) |
+| berlin_central | 3 | 558 710 / 66.69 | 59.54 (−7.15) | 63.36 (−3.33) |
+| sveti_stefan | 1 | 1 885 027 / 84.46 | 83.20 (−1.26) | 82.52 (−1.94) |
+| sveti_stefan | 3 | 751 307 / 56.71 | 44.44 (−12.26) | 54.09 (−2.62) |
+
+At the same distance the selected layouts are 10 % smaller than DCT8 with a
+point less quality; at d = 3 on 4K images DCT8 alone was 23–34 % larger than
+cjxl at the same distance. The cost model is the obvious lever left (it
+prefers the rectangular shapes and rarely picks 16×16 or 32×32 on the small
+images; cjxl's maps use them in smooth areas), together with checking our
+quant field and strategy maps against cjxl's on the same image.
 
 ## Lossless Modular encoder (2026-10-29)
 

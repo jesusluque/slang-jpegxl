@@ -50,6 +50,7 @@ struct CodeParams {
 };
 
 StructuredBuffer<uint4>    dcGroups;   // bx0, by0, w, h in blocks
+StructuredBuffer<uint>     acs;        // per block: strategy << 1 | first
 StructuredBuffer<uint>     hist;
 StructuredBuffer<uint>     quantizer;  // [0] global_scale, [1] quant_dc
 StructuredBuffer<uint>     ctxMap;     // AC context -> cluster
@@ -581,7 +582,13 @@ void buildDcGroupBlobs(uint3 gid: SV_GroupID) {
     mid.base = (3 + 2 * g) * kBlobStrideWords;
     mid.pos = 0;
     const uint totalBlocks = rect.z * rect.w;
-    serialWrite(blobs, mid, ceilLog2Nonzero(totalBlocks), totalBlocks - 1);
+    uint numVarblocks = 0;   // one AcMetadata entry each
+    for (uint by = 0; by < rect.w; ++by) {
+        for (uint bx = 0; bx < rect.z; ++bx) {
+            numVarblocks += acs[(rect.y + by) * params.blocksX + rect.x + bx] & 1;
+        }
+    }
+    serialWrite(blobs, mid, ceilLog2Nonzero(totalBlocks), numVarblocks - 1);
     count = 0;
     tokens[count++] = 1;                 // property 0 + 1
     tokens[count++] = packSigned(2);     // split value: channel > 2

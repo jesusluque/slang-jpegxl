@@ -1,0 +1,126 @@
+// Copyright (c) 2026 jesus luque.
+//
+// The DCT bases, coefficient memory layout and strategy tables the encoder
+// shares with the decoder's conventions (dec/transforms.slang, frame.slangh):
+// libjxl's scaled DCT, coefficient memory [horizontal][vertical] for square
+// and tall blocks, [vertical][horizontal] for wide ones, the covered blocks
+// and order bucket of every AC strategy, and the dequant table layout
+// (quant_weights.cc: tables in kind order, 3 channels each).
+#pragma once
+
+#include "sjxl/common/bitio.slangh"
+
+static const float kBasisPi = 3.14159265358979323846f;
+static const float kBasisSqrt2 = 1.41421356237309504880f;
+
+/// cos(pi (t + 1/2) k / n) with the angle reduced in integers first.
+float cosBasis(uint k, uint t, uint n) {
+    const uint m = ((2 * t + 1) * k) % (4 * n);
+    return cos(kBasisPi * float(m) / float(2 * n));
+}
+
+/// 1D inverse of libjxl's scaled DCT: x[t] = sum_k c(k) X[k] cos(...), c(0) = 1, else sqrt 2.
+float idctBasis(uint k, uint t, uint n) {
+    return (k == 0 ? 1.0f : kBasisSqrt2) * cosBasis(k, t, n);
+}
+
+/// libjxl's forward scaled DCT basis: g(0) = 1/N, g(k) = sqrt(2)/N; the exact inverse of idctBasis.
+float fdctBasis(uint k, uint t, uint n) {
+    return ((k == 0 ? 1.0f : kBasisSqrt2) / float(n)) * cosBasis(k, t, n);
+}
+
+/// Coefficient memory of an ny x nx (pixel) transform: a wide block stores
+/// [vertical][horizontal] frequencies, a tall or square one [horizontal][vertical].
+uint memIndex(uint v, uint u, uint ny, uint nx) {
+    return ny < nx ? v * nx + u : u * ny + v;
+}
+
+/// The (v, u) frequencies of memory index m of an ny x nx transform.
+void memFreq(uint m, uint ny, uint nx, out uint v, out uint u) {
+    if (ny < nx) {
+        v = m / nx;
+        u = m % nx;
+    } else {
+        u = m / ny;
+        v = m % ny;
+    }
+}
+
+/// DCTResampleScales<n, 8 n> (LowestFrequenciesFromDC), every set a subsampling of <32, 256>.
+static const float kResample32[32] = {
+    1.0f,               1.0003954307206069f, 1.0015830492062623f, 1.0035668445360069f, 1.0063534990068217f, 1.009952439375063f,
+    1.0143759095928793f, 1.0196390660647288f, 1.0257600967811158f, 1.0327603660498115f, 1.0406645869480142f, 1.049501024072585f,
+    1.0593017296817173f, 1.0701028169146336f, 1.0819447744633812f, 1.0948728278734026f, 1.1089373535927318f, 1.124194353004584f,
+    1.1407059950032632f, 1.158541237256391f,  1.1777765381970435f, 1.1984966740820495f, 1.2207956782315876f, 1.244777922949508f,
+    1.2705593687654873f, 1.2982690107339132f, 1.3280505578213306f, 1.3600643892400104f, 1.3944898413647777f, 1.4315278911623237f,
+    1.4714043176061107f, 1.5143734423314616f};
+float resampleScale(uint n, uint k) { return kResample32[k * (32 / n)]; }
+
+// AC strategies (ac_strategy.h): covered blocks, log2 of their count, order
+// bucket, quant table kind.
+static const uint kNumStrategies = 27;
+static const uint kCoveredX[27] = {1, 1, 1, 1, 2, 4, 1, 2, 1, 4, 2, 4, 1, 1, 1, 1, 1, 1, 8, 4, 8, 16, 8, 16, 32, 16, 32};
+static const uint kCoveredY[27] = {1, 1, 1, 1, 2, 4, 2, 1, 4, 1, 4, 2, 1, 1, 1, 1, 1, 1, 8, 8, 4, 16, 16, 8, 32, 32, 16};
+static const uint kLog2Covered[27] = {0, 0, 0, 0, 2, 4, 1, 1, 2, 2, 3, 3, 0, 0, 0, 0, 0, 0, 6, 5, 5, 8, 7, 7, 10, 9, 9};
+static const uint kStrategyOrder[27] = {0, 1, 1, 1, 2, 3, 4, 4, 5, 5, 6, 6, 1, 1, 1, 1, 1, 1, 7, 8, 8, 9, 10, 10, 11, 12, 12};
+static const uint kStrategyToTable[27] = {0, 1, 2, 3, 4, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 10, 10, 11, 12, 12, 13, 14, 14, 15, 16, 16};
+static const uint kNumOrders = 13;
+/// Natural order of bucket ord starts at kCoeffOrderOffset[3 * ord] * 64 (the per-channel slots are identical for natural orders).
+static const uint kCoeffOrderOffset[40] = {0, 1, 2, 3, 4, 5, 6, 10, 14, 18, 34, 50, 66, 68, 70, 72, 76, 80, 84, 92, 100, 108, 172, 236, 300,
+                                           332, 364, 396, 652, 908, 1164, 1292, 1420, 1548, 2572, 3596, 4620, 5132, 5644, 6156};
+static const uint kCoeffOrderLimit = 6156;   // * 64 entries
+uint orderOffset(uint ord) { return kCoeffOrderOffset[3 * ord] * 64; }
+
+// Dequant tables (quant_weights.cc): kind order, 3 channels of (8 sx) x (8 sy) entries.
+static const uint kNumQuantTables = 17;
+static const uint kTableSizeX[17] = {1, 1, 1, 1, 2, 4, 1, 1, 2, 1, 1, 8, 4, 16, 8, 32, 16};
+static const uint kTableSizeY[17] = {1, 1, 1, 1, 2, 4, 2, 4, 4, 1, 1, 8, 8, 16, 16, 32, 32};
+static const uint kTableBase[18] = {0, 192, 384, 576, 768, 1536, 4608, 4992, 5760, 7296, 7488, 7680, 19968, 26112, 75264, 99840,
+                                    296448, 394752};
+static const uint kDequantTableFloats = 394752;
+
+/// The default BlockCtxMap (15 contexts) by channel (X, Y, B as c ^ 1 for the
+/// first two) and order bucket: kDefaultCtxMap[(c < 2 ? c ^ 1 : 2) * 13 + ord].
+static const uint kDefaultCtxMap[39] = {0, 1, 2, 2, 3, 3, 4, 5, 6, 6, 6, 6, 6, 7, 8, 9, 9, 10, 11, 12, 13, 14, 14, 14, 14, 14,
+                                        7, 8, 9, 9, 10, 11, 12, 13, 14, 14, 14, 14, 14};
+uint blockContextFor(uint c, uint strategy) {
+    const uint idx = c < 2 ? (c ^ 1) : 2;
+    return kDefaultCtxMap[idx * 13 + kStrategyOrder[strategy]];
+}
+
+/// ac_strategy.cc CoeffOrderAndLut (the order, not the LUT) for a strategy
+/// with covered blocks cxIn x cyIn, written to out[base .. base + 64 cx cy).
+void naturalCoeffOrder(uint cxIn, uint cyIn, RWStructuredBuffer<uint> out, uint base) {
+    uint cx = max(cxIn, cyIn);
+    uint cy = min(cxIn, cyIn);
+    const uint xs = cx / cy;
+    const uint xsm = xs - 1;
+    const uint xss = ceilLog2Nonzero(xs);
+    uint cur = cx * cy;
+    const uint n = cx * 8;
+    for (uint i = 0; i < n; ++i) {
+        for (uint j = 0; j <= i; ++j) {
+            uint x = j;
+            uint y = i - j;
+            if ((i & 1) != 0) { const uint t = x; x = y; y = t; }
+            if ((y & xsm) != 0) continue;
+            y >>= xss;
+            uint val;
+            if (x < cx && y < cy) val = y * cx + x;
+            else val = cur++;
+            out[base + val] = y * cx * 8 + x;
+        }
+    }
+    for (uint ip = n - 1; ip > 0; --ip) {
+        const uint i = ip - 1;
+        for (uint j = 0; j <= i; ++j) {
+            uint x = n - 1 - (i - j);
+            uint y = n - 1 - j;
+            if ((i & 1) != 0) { const uint t = x; x = y; y = t; }
+            if ((y & xsm) != 0) continue;
+            y >>= xss;
+            out[base + cur] = y * cx * 8 + x;
+            ++cur;
+        }
+    }
+}

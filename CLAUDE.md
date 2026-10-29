@@ -17,7 +17,7 @@ ctest --test-dir build/macos-arm64-debug -R prefix          # tests matching a n
 build/macos-arm64-debug/bin/sjxl_gpu_tests "prefix sum*"    # one Catch2 case by name (or a [tag])
 cmake --build build/macos-arm64-debug --target sjxl_gpu_tests   # one binary
 build/macos-arm64-debug/bin/sjxl info [in.jxl]              # device info, or a file's headers and frame list
-build/macos-arm64-debug/bin/sjxl encode in.png out.jxl --distance 1.0 [--no-aq] [--no-cfl] [--no-filters] [--clusters n]
+build/macos-arm64-debug/bin/sjxl encode in.png out.jxl --distance 1.0 [--no-aq] [--no-cfl] [--no-filters] [--no-acs] [--lambda x] [--clusters n]
 build/macos-arm64-debug/bin/sjxl encode in.png out.jxl --lossless   # Modular frame, bit-exact; RGB/RGBA, 8/16-bit
 build/macos-arm64-debug/bin/sjxl decode in.jxl out.png                  # every stage on the GPU; animations write out_000.png, ...
 build/macos-arm64-debug/bin/sjxl compare a.png b.png                    # PSNR + largest diff, on the GPU
@@ -104,7 +104,7 @@ Modules are static libraries `sjxl_<name>` aliased `sjxl::<name>`
 | codestream | CPU-side syntax only: `BitWriter`, U32/U64/F16 field coders, SizeHeader, ImageMetadata, FrameHeader, LoopFilter, TOC (`Headers.h`); `Tables.h`: quantizer params from a distance, DCT8 dequant weights, natural order, computed from libjxl formulas |
 | image | file I/O only: PNG/PPM/JPEG via stb (`readRgb8` 8-bit RGB, `readImage8` keeps alpha, `readImage` keeps alpha and 16-bit depth; `Rgb8` has `channels` 3/4 and `bitDepth` 8/16; `writePng` writes 16-bit PNGs itself; `readFile`, `writeFile`) |
 | metrics | `metrics::compare`: PSNR, largest difference and where, measured by `shaders/sjxl/metrics/compare.slang`; what tests and `sjxl compare` use |
-| encoder | `enc::Encoder::encode(Rgb8, Options{lossless, distance, adaptiveQuant, chromaFromLuma, loopFilter, acClusters})`: lossless → `encodeLossless` (modular: rctYCoCg → modHist → cluster → buildModularGlobalBlob (tree, histograms, RCT header, the stream when the image fits a group) → modGroupSections (ANS per group)); lossy → the VarDCT pipeline (`shaders/sjxl/enc/`): xyb → aq (quant field) → gaborish (inverse) → cfl (dct, per-tile least squares) → quantize (AdjustQuantBlockAC, dead zones) → items (mode 0 context histograms; DC/AcMetadata modes 1 count, 2 emit) → cluster → codes (ANS histograms + context map for AC, Huffman + headers per DC group) → ac_sections (ANS per group) → prefix sums → layout → emit |
+| encoder | `enc::Encoder::encode(Rgb8, Options{lossless, distance, adaptiveQuant, chromaFromLuma, loopFilter, acClusters})`: lossless → `encodeLossless` (modular: rctYCoCg → modHist → cluster → buildModularGlobalBlob (tree, histograms, RCT header, the stream when the image fits a group) → modGroupSections (ANS per group)); lossy → the VarDCT pipeline (`shaders/sjxl/enc/`): xyb → aq (quant field) → gaborish (inverse) → cfl (dct, per-tile least squares) → quantize (AdjustQuantBlockAC, dead zones) → strategy (transform selection per 32×32 superblock) → transform (adjustQuantField, dctRows/dctCols for any varblock, dcFromLlf, acTokenize) → cfl → quantize (per varblock) → items (DC/AcMetadata: modes 0 histogram, 1 count, 2 emit) → cluster → codes (ANS histograms + context map for AC, Huffman + headers per DC group) → ac_sections (ANS per group) → prefix sums → layout → emit |
 | decoder | `dec::Decoder::decode(bytes)`: `codestream::parse` on the CPU, then `shaders/sjxl/dec/`: sections (one thread per section: globals, DC groups, AC groups; libraries entropy/modular/frame/modframe .slangh over one `arena` buffer) → VarDCT: tables → dc_finalize → transforms; Modular: finalise (inverse transforms) → modular_out (channels to planes) → filters → output |
 | decoder (M2) | `dec::Decoder`: the GPU decode pipeline |
 
@@ -115,12 +115,18 @@ section per pass); DC group 2048×2048 px (one section: DC + AcMetadata).
 Encoder stages (each a kernel, one `CommandBatch` per stage): sRGB8→XYB per
 pixel → adaptive quant field (libjxl's masking model per 4×4 cell and block,
 `aq.slang`; the quantizer's global scale is 0.39/distance as libjxl's hare
-tier) → inverse Gaborish → DCT8 per block (float coefficients) →
+tier) → inverse Gaborish → transform selection per 32×32 superblock
+(`strategy.slang`: DCT8, 8×16, 16×8, 16×16, 16×32, 32×16, 32×32 by a
+rate-distortion proxy, λ = 8) → separable forward DCT of every varblock
+(`transform.slang`, libjxl's coefficient memory; `common/transform_basis.slangh`
+holds the bases and strategy tables) → DC from the lowest frequencies →
 chroma-from-luma per 64 px tile (least squares on the scaled coefficients) →
-quantise per block (AdjustQuantBlockAC per channel, Y dead zones, CfL
-residuals, x_qm_scale) → DC gradient residual and AcMetadata tokens (YtoX,
-YtoB, strategy, qf, sharpness 4) → histograms (atomics; AC per coefficient
-context) → AC context clustering (one thread-group) → ANS histograms,
+quantise per varblock (AdjustQuantBlockAC per channel, Y dead zones, CfL
+residuals, x_qm_scale) → AC tokens per varblock and channel (contexts from
+the firstBlock grid, `ctx << 18 | value` per coefficient slot) → DC gradient
+residual and AcMetadata tokens (YtoX, YtoB, strategy and qf per varblock,
+sharpness 4) → histograms (atomics; AC per coefficient context) → AC context
+clustering (one thread-group) → ANS histograms,
 alias/reverse tables and the context map stream for AC, 15-bit
 length-limited prefix codes + Brotli-style code-length serialisation for DC
 and AcMetadata → AC section sizes (ANS chain per group) and token bit
@@ -129,9 +135,10 @@ emission by `InterlockedOr` into a zeroed body buffer (ANS sections placed
 backwards by their thread) → readback of sizes and body; CPU writes headers
 (LoopFilter: Gaborish above d 0.5, EPF iterations by distance) + TOC and
 appends the body.
-`sjxl encode --no-aq --no-cfl --no-filters --clusters n` switch the stages off
-or limit the clusters for A/B runs; `SJXL_DEBUG=1` prints the quantizer,
-cluster count, blob bits and section bytes.
+`sjxl encode --no-aq --no-cfl --no-filters --no-acs --lambda x --clusters n`
+switch the stages off or tune them for A/B runs (`SJXL_ACS_MASK` limits the
+transform families); `SJXL_DEBUG=1` prints the quantizer, cluster count,
+strategy census and map, blob bits and section bytes.
 
 Lossless (`--lossless`, RGB or RGBA at 8 or 16 bits; the lossy path takes
 8-bit RGB): a Modular frame, YCoCg RCT over the colour channels (alpha is the
