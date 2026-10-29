@@ -1,6 +1,8 @@
 // Copyright (c) 2026 jesus luque.
 #include "sjxl/decoder/Decoder.h"
 
+#include "sjxl/decoder/DcGroupCpu.h"
+
 #include "sjxl/image/Image.h"
 
 #include "sjxl/codestream/UpsamplingWeights.h"
@@ -31,6 +33,7 @@ constexpr uint32_t kMaxPatchPositions = 1u << 16;     // frame.slangh kMaxPatchP
 constexpr uint32_t kLz77WindowWords = 1u << 20;
 constexpr uint32_t kDequantTableFloats = 394752;
 constexpr uint32_t kGsTreeNumNodesIndex = 33;
+constexpr uint32_t kGsGlobalTreeBitIndex = 54;   // frame.slangh kGsGlobalTreeBit
 constexpr uint32_t kErrNone = 0, kErrCorrupt = 1, kErrUnsupported = 2, kErrArena = 3, kErrLz77Window = 4, kErrAcNzeros = 5, kErrAcLeftover = 6, kErrAnsState = 7;
 
 struct Uint2 {
@@ -320,7 +323,15 @@ Result<Decoder::FrameOutput> Decoder::run(const codestream::Parsed& parsed, cons
     gpu::CommandBatch batch(dev);
     gpu::StageTimer timer(batch, "decode");
 
+    // The DC groups' modular streams decoded on the CPU (DcGroupCpu.h): set after the
+    // globals ran, bound to every sections kernel (the DC group kernel copies them).
+    bool dcFromHost = false;
+    std::optional<gpu::Buffer> hostDc, hostDcBase;
+
     const auto bindSections = [&](rhi::ShaderCursor c) {
+        c["params"]["dcFromHost"].setData(uint32_t{dcFromHost ? 1u : 0u});
+        c["hostDc"].setBinding(hostDc ? hostDc->rhi() : dummy.rhi());
+        c["hostDcBase"].setBinding(hostDcBase ? hostDcBase->rhi() : dummy.rhi());
         c["params"]["wideSamples"].setData(uint32_t{m.floatingPointSample || m.bitsPerSample > 16 ? 1u : 0u});
         c["params"]["perfSkip"].setData(static_cast<uint32_t>(std::strtoul(platform::env("SJXL_PERF_SKIP").c_str(), nullptr, 0)));
         c["cs"].setBinding(cs.rhi());
@@ -439,8 +450,45 @@ Result<Decoder::FrameOutput> Decoder::run(const codestream::Parsed& parsed, cons
         }
     } else {
     globals_.dispatch(batch, {1, 1, 1}, bindSections);
+    timer.mark("globals");
+    if (!useDcFrame && numEc == 0 && !frame.singleSection && platform::env("SJXL_DC_CPU") != "0") {
+        // The DC groups' serial chains on CPU cores (the project's one exception to GPU-only
+        // coded data, docs/decisions.md "M5"): wait for the globals, decode, upload.
+        SJXL_TRY(batch.submit(true));
+        SJXL_ASSIGN(const std::vector<uint32_t> header, arena.readRange<uint32_t>(dev, 0, kGsHeaderSize));
+        if (header[0] == 0) {   // kGsError: the globals thread succeeded
+            std::vector<cpu::DcGroupGeom> geoms(numDcGroups);
+            const uint32_t dcGroupsX = (dim.xsizeBlocks + dim.groupDim - 1) / dim.groupDim;
+            for (uint32_t g = 0; g < numDcGroups; ++g) {
+                cpu::DcGroupGeom& geo = geoms[g];
+                geo.x0 = (g % dcGroupsX) * dim.groupDim;
+                geo.y0 = (g / dcGroupsX) * dim.groupDim;
+                geo.w = std::min(dim.groupDim, dim.xsizeBlocks - geo.x0);
+                geo.h = std::min(dim.groupDim, dim.ysizeBlocks - geo.y0);
+                for (size_t c = 0; c < 3; ++c) { geo.hshift[c] = hshift[c]; geo.vshift[c] = vshift[c]; }
+            }
+            std::vector<cpu::DcGroupData> data;
+            SJXL_ASSIGN(const bool done, cpu::decodeDcGroups(parsed.codestream, frame, header[kGsGlobalTreeBitIndex], geoms, data));
+            if (done) {
+                std::vector<int32_t> words;
+                std::vector<uint32_t> bases(numDcGroups);
+                for (uint32_t g = 0; g < numDcGroups; ++g) {
+                    bases[g] = static_cast<uint32_t>(words.size());
+                    words.push_back(static_cast<int32_t>(data[g].extraPrecision));
+                    words.push_back(static_cast<int32_t>(data[g].count));
+                    words.insert(words.end(), data[g].words.begin(), data[g].words.end());
+                }
+                SJXL_ASSIGN(hostDc, gpu::Buffer::fromSpan<int32_t>(dev, words, "dec.hostDc"));
+                SJXL_ASSIGN(hostDcBase, gpu::Buffer::fromSpan<uint32_t>(dev, bases, "dec.hostDcBase"));
+                dcFromHost = true;
+            } else {
+                log::debug("decoder: DC groups use a feature the CPU port leaves out; the GPU decodes them");
+            }
+        }
+        timer.mark("dc groups (cpu)");
+    }
     dcGroups_.dispatch(batch, {numDcGroups, 1, 1}, bindSections);
-    timer.mark("globals + dc groups");
+    timer.mark("dc groups");
     tables_.dispatch(batch, {kDequantTableFloats, 1, 1}, [&](rhi::ShaderCursor c) {
         c["arena"].setBinding(arena.rhi());
         c["dequant"].setBinding(dequant.rhi());

@@ -25,6 +25,8 @@ RWStructuredBuffer<int>   ytox;
 RWStructuredBuffer<int>   ytob;
 RWStructuredBuffer<uint>  firstBlock;   // nblocks: the varblock's first block
 RWStructuredBuffer<int>   coeffs;
+StructuredBuffer<int>     hostDc;       // DC groups decoded on the CPU (dcgroup.slangh fromHost): per group extraPrecision, count, then the channels
+StructuredBuffer<uint>    hostDcBase;   // word offset of each DC group in hostDc
 
 #include "sjxl/dec/dcgroup.slangh"
 #include "sjxl/dec/acgroup.slangh"
@@ -60,6 +62,7 @@ struct SectionParams {
     int4  passMinC;
     uint  perfSkip;       // SJXL_PERF_SKIP timing experiments (entropy.slangh gPerfSkip)
     uint  wideSamples;    // 1: samples beyond 16 bits (the 64-bit modular arithmetic)
+    uint  dcFromHost;     // 1: the DC groups' modular streams come decoded in hostDc (SJXL_DC_CPU)
     int4  passMaxA;
     int4  passMaxB;
     int4  passMaxC;
@@ -125,6 +128,7 @@ DcGroupGeom dcGeom(uint g) {
     geom.groupBlocks = groupBlocks();
     geom.useDcFrame = (params.frameFlags & 32u) != 0 ? 1u : 0u;
     geom.windowOff = windowFor(1 + g);
+    geom.fromHost = params.dcFromHost;
     geom.hshift = params.hshift;
     geom.vshift = params.vshift;
     return geom;

@@ -1543,3 +1543,38 @@ one thread per section.
 
 1920x1080 (M5 Pro, debug build): lossy decode 650 → 330 ms (DC group 285,
 AC groups 27); lossless decode 1350 → 580 ms. djxl: 90 / 100 ms.
+
+### The DC groups on the CPU (2026-10-29)
+
+With the GPU thread at its floor, the user decided to allow the CPU for the
+serial chains the GPU cannot speed up ("usa CPU si no hay más remedio"). This
+is the project's one exception to "no CPU arithmetic on coded data", and it is
+scoped: `modules/decoder/src/DcGroupCpu.cpp` is a C++ port of the pieces of
+`entropy.slangh`, `modular.slangh` and `modular_channel.slangh` a DC group
+section needs (the bit reader, DecodeHistograms with prefix codes and ANS alias
+tables, simple and MTF context maps, the MA tree, the weighted predictor with
+libjxl's 64-bit pixel arithmetic, the channel loop), driven per DC group as
+`dcgroup.slangh` is: the global tree from DcGlobal (the globals thread stores
+its bit position in `arena[kGsGlobalTreeBit]`), then per group extra_precision,
+the Y/X/B DC channels (stream 1 + g) and the AcMetadata channels (stream
+1 + 2·nDC + g). The port decodes the modular *streams* only; DequantDC, the
+block-context buckets, the chroma-from-luma tiles, the raster walk over the
+strategies and the coverage checks stay in the DC group kernel, which reads the
+decoded channels from `hostDc` (per group: extra_precision, count, then the
+channels row-major) instead of running `decodeModularStream`. The GPU path is
+untouched and remains the reference: `SJXL_DC_CPU=0` selects it, and the
+`[dc-cpu]` test decodes our own and cjxl's files (several DC groups,
+subsampling, progressive) both ways and requires a zero maximum difference;
+the 26 decodable conformance inputs were swept the same way, all bit-identical.
+
+The CPU path is taken only for VarDCT frames without extra channels, without a
+DC frame and with more than one section; a stream with transforms or LZ77 (the
+port leaves them out) returns false and the frame falls back to the GPU
+kernel. The host waits for the globals thread (one extra submit), decodes the
+groups, uploads the words and binds them to the sections kernels.
+
+1920x1080 lossy decode (M5 Pro, debug build): 327 → 132 ms. The DC group stage
+went from 228 ms on one GPU thread to 27 ms on one CPU core plus 29 ms for the
+kernel that copies the channels and does the per-block work (serial, next to
+parallelise), and the AcGlobal decode (globals, 36-58 ms, one thread reading
+the histograms and orders) is now the largest serial piece left. djxl: 90 ms.

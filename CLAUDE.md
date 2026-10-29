@@ -39,7 +39,7 @@ cjxl in.png ref.jxl -d 1 -e 5 ; djxl out.jxl check.png      # Homebrew oracle (/
   They SKIP when no device opens and never fall back. `tests/support/TestDevice.h`
   gives one device and shader library per process.
 - **Environment**: `SJXL_TIMING=1` (per-stage times, encoder and decoder),
-  `SJXL_PERF_SKIP=bits` (decoder timing experiments), `SJXL_BACKEND=metal,cuda,vulkan` (order to try),
+  `SJXL_PERF_SKIP=bits` (decoder timing experiments), `SJXL_DC_CPU=0` (DC groups on the GPU thread, the reference path), `SJXL_BACKEND=metal,cuda,vulkan` (order to try),
   `SJXL_GPU_VALIDATION=1` (debug layers), `SJXL_SHADER_DIR`, `SJXL_SHADER_CACHE`
   (default `~/Library/Caches/sjxl/shaders`).
 - **Toolchain**: Slang 2026.14.1 at `~/tools/slang` (`SLANG_ROOT`), slang-rhi
@@ -52,7 +52,15 @@ cjxl in.png ref.jxl -d 1 -e 5 ; djxl out.jxl check.png      # Homebrew oracle (/
   files, parses and emits headers, TOC and container boxes, and does
   bookkeeping (sizes, offsets, section tables). Colour transforms, DCTs,
   quantisation, tokens, histograms, code tables, bit emission and symbol
-  decoding are kernels. Tests check results with kernels too (mismatch
+  decoding are kernels. **One exception, taken by decision (docs/decisions.md,
+  "The DC groups on the CPU")**: the decoder's DC group modular streams (DC +
+  AcMetadata, one serial ANS chain per 2048 px group) are decoded on the CPU by
+  `modules/decoder/src/DcGroupCpu.cpp` when the frame qualifies (VarDCT, no
+  extra channels, no DC frame, several sections; LZ77 or transforms fall back
+  to the kernel); the GPU path stays the reference, `SJXL_DC_CPU=0` selects it
+  and the `[dc-cpu]` test requires both to be bit-identical. Any further CPU
+  step needs the same justification (a serial chain the GPU cannot split),
+  the same fallback and the same test. Tests check results with kernels too (mismatch
   counters, PSNR/max-diff metrics) and read back only counters, section
   sizes or the final bytes/pixels to write a file.
 - **Shader parameters are bound by name** through reflection

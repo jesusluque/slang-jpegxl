@@ -5,6 +5,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 
+#include <cstdlib>
 #include <format>
 #include <string>
 
@@ -922,4 +923,39 @@ TEST_CASE("the decoder matches djxl on the JPEG XL conformance inputs", "[decode
     if (!metrics) FAIL(std::format("conformance {}: compare failed: {}", name, metrics.error().message()));
     WARN(std::format("conformance {}: {} frame(s), PSNR {:.2f} dB, max diff {}", name, ours->size(), metrics->psnr, metrics->maxAbsDiff));
     CHECK(metrics->maxAbsDiff <= 1);
+}
+
+TEST_CASE("the CPU DC-group decoder matches the GPU path bit for bit", "[decoder][dc-cpu]") {
+    // Both paths over our own and cjxl's files: images wider than a DC group and with
+    // chroma subsampling / several DC groups come from the cjxl matrix below.
+    struct Case { std::string name; std::string cjxlArgs; };
+    const Case c = GENERATE(Case{"sveti_stefan_320.png", ""}, Case{"sveti_crop_257x129.png", "-d 1 -e 7"}, Case{"berlin_200.png", "-d 2 -e 5"},
+                            Case{"sveti_stefan_320.png", "-d 0.5 -e 6 -p"});
+    CAPTURE(c.name, c.cjxlArgs);
+    std::vector<uint8_t> encoded;
+    if (c.cjxlArgs.empty()) {
+        auto source = image::readRgb8(test::testData(c.name));
+        REQUIRE(source);
+        auto made = encoder().encode(*source, enc::Options{});
+        REQUIRE(made);
+        encoded = std::move(*made);
+    } else {
+        const std::filesystem::path cjxl = test::findTool("cjxl");
+        if (cjxl.empty()) SKIP("cjxl is not installed");
+        const std::filesystem::path jxl = test::scratchDir() / ("dc_cpu_" + c.name + ".jxl");
+        REQUIRE(test::run(std::format("\"{}\" \"{}\" \"{}\" {} >/dev/null 2>&1", cjxl.string(), test::testData(c.name).string(), jxl.string(), c.cjxlArgs)));
+        auto bytes = image::readFile(jxl);
+        REQUIRE(bytes);
+        encoded = std::move(*bytes);
+    }
+    setenv("SJXL_DC_CPU", "0", 1);
+    auto gpu = decoder().decode(encoded);
+    setenv("SJXL_DC_CPU", "1", 1);
+    auto cpu = decoder().decode(encoded);
+    unsetenv("SJXL_DC_CPU");
+    REQUIRE(gpu);
+    REQUIRE(cpu);
+    auto metrics = test::compare(*gpu, *cpu);
+    REQUIRE(metrics);
+    CHECK(metrics->maxAbsDiff == 0);
 }

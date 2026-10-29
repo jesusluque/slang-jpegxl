@@ -5,7 +5,11 @@ kernel, run through [slang-rhi](https://github.com/shader-slang/slang-rhi):
 Metal on Apple silicon, CUDA or Vulkan on Linux. The CPU parses and writes
 headers, the table of contents and files; transforms, quantisation, tokens,
 histograms, code tables, bit emission and symbol decoding run on the GPU,
-entropy coding included.
+entropy coding included. One exception, taken deliberately: the decoder's DC
+group streams (one serial ANS chain per 2048-pixel group, which a lone GPU
+thread walks at 1 µs a sample) are decoded on the CPU when the frame allows
+it; the GPU path stays and the two are tested bit-identical
+(`docs/decisions.md`, "The DC groups on the CPU").
 
 Status: the decoder reproduces djxl's output on everything `cjxl` emits on
 the test images, lossy and lossless: VarDCT with every transform size, Modular

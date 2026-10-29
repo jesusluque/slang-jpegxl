@@ -26,10 +26,21 @@ struct DcGroupGeom {
     uint groupBlocks;    // AC group size in blocks (groupDim / 8)
     uint useDcFrame;     // kUseDcFrame: the DC comes from a DC frame, nothing of it is coded here
     uint windowOff;      // LZ77 window of this thread (for the modular group)
+    uint fromHost;       // 1: the modular streams were decoded on the CPU (hostDc / hostDcBase); this thread copies them
     uint4 hshift, vshift;   // chroma subsampling per channel (XYB order X, Y, B)
 };
 
 uint shiftOf(uint4 v, uint c) { return c == 0 ? v.x : c == 1 ? v.y : v.z; }
+
+/// Fills `numChannels` freshly made channels from hostDc at `pos` (row-major, w*h words
+/// each, the CPU decoder's order) and advances `pos`.
+void fillChannelsFromHost(uint chansOff, uint numChannels, inout uint pos) {
+    for (uint i = 0; i < numChannels; ++i) {
+        const Channel c = loadChannel(chansOff, i);
+        for (uint k = 0; k < c.w * c.h; ++k) arena[c.data + k] = uint(hostDc[pos + k]);
+        pos += c.w * c.h;
+    }
+}
 
 void decodeDcGroup(inout Dec d, DcGroupGeom g, uint windowOff) {
     const GlobalTree global = globalTree();
@@ -37,9 +48,17 @@ void decodeDcGroup(inout Dec d, DcGroupGeom g, uint windowOff) {
     if (d.error != kErrNone) return;
     uint numChannels = 3;
     const bool is444 = (g.hshift.x | g.hshift.y | g.hshift.z | g.vshift.x | g.vshift.y | g.vshift.z) == 0;
+    // The CPU decoder's words for this group: extraPrecision, AcMetadata count, then every channel.
+    uint hostPos = 0, hostExtra = 0, hostCount = 0;
+    if (g.fromHost != 0) {
+        hostPos = hostDcBase[g.group];
+        hostExtra = uint(hostDc[hostPos]);
+        hostCount = uint(hostDc[hostPos + 1]);
+        hostPos += 2;
+    }
     if (g.useDcFrame == 0) {
     // VarDCT DC: extra precision, three channels in Y, X, B order.
-    const uint extraPrecision = brRead(d.br, 2);
+    const uint extraPrecision = g.fromHost != 0 ? hostExtra : brRead(d.br, 2);
     const float mul = 1.0f / float(1u << extraPrecision);
     // Channels in Y, X, B order, each at its subsampled size (DecodeVarDCTDC shrink).
     const uint phys[3] = {1, 0, 2};
@@ -48,7 +67,8 @@ void decodeDcGroup(inout Dec d, DcGroupGeom g, uint windowOff) {
         storeChannel(chansOff, i, newChannel(d, g.w >> shiftOf(g.hshift, c), g.h >> shiftOf(g.vshift, c), 0, 0));
     }
     if (d.error != kErrNone) return;
-    decodeModularStream(d, chansOff, numChannels, 1 + g.group, global, windowOff, 8);
+    if (g.fromHost != 0) fillChannelsFromHost(chansOff, numChannels, hostPos);
+    else decodeModularStream(d, chansOff, numChannels, 1 + g.group, global, windowOff, 8);
     if (d.error != kErrNone) return;
     if (numChannels != 3) { fail(d, kErrCorrupt); return; }
     // DequantDC: channel 0 is Y (physical 1), 1 is X (0), 2 is B (2).
@@ -101,7 +121,7 @@ void decodeDcGroup(inout Dec d, DcGroupGeom g, uint windowOff) {
 
     // AcMetadata.
     const uint upperBound = g.w * g.h;
-    const uint count = brRead(d.br, ceilLog2Nonzero(upperBound)) + 1;
+    const uint count = g.fromHost != 0 ? hostCount : brRead(d.br, ceilLog2Nonzero(upperBound)) + 1;
     const uint tw = (g.w + 7) >> 3;
     const uint th = (g.h + 7) >> 3;
     numChannels = 4;
@@ -110,7 +130,8 @@ void decodeDcGroup(inout Dec d, DcGroupGeom g, uint windowOff) {
     storeChannel(chansOff, 2, newChannel(d, count, 2, 0, 0));
     storeChannel(chansOff, 3, newChannel(d, g.w, g.h, 0, 0));
     if (d.error != kErrNone) return;
-    decodeModularStream(d, chansOff, numChannels, 1 + 2 * g.numDcGroups + g.group, global, windowOff, 8);
+    if (g.fromHost != 0) fillChannelsFromHost(chansOff, numChannels, hostPos);
+    else decodeModularStream(d, chansOff, numChannels, 1 + 2 * g.numDcGroups + g.group, global, windowOff, 8);
     if (d.error != kErrNone) return;
     if (numChannels != 4) { fail(d, kErrCorrupt); return; }
     const Channel cYtoX = loadChannel(chansOff, 0);

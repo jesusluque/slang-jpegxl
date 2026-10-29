@@ -51,7 +51,8 @@ static const uint kGsQuantEncOff = 44;     // 17 * kQeWords
 static const uint kGsDcGlobalBits = 45;
 static const uint kGsAcGlobalBits = 46;
 static const uint kGsUsedAcs = 47;         // bit per strategy, ORed by DC groups
-// 48..55: modular frame fields (modframe.slangh)
+// 48..53: modular frame fields (modframe.slangh)
+static const uint kGsGlobalTreeBit = 54;   // VarDCT: bit position of DcGlobal's modular part (the CPU DC-group decoder starts there)
 static const uint kGsPatchNumRef = 56;     // patch dictionary: reference positions (5 words: ref, x0, y0, w, h)
 static const uint kGsPatchRefOff = 57;
 static const uint kGsPatchNumPos = 58;     // positions (4 words: x, y, ref position index, blend mode | clamp << 8)
@@ -251,6 +252,7 @@ void readColorCorrelationDc(inout Dec d) {
 /// ModularFrameDecoder::DecodeGlobalInfo for a VarDCT frame without extra
 /// channels: the optional global tree; the global image has no channels.
 void readGlobalModular(inout Dec d, uint windowOff) {
+    arena[kGsGlobalTreeBit] = d.br.pos;
     const uint hasTree = brRead(d.br, 1);
     arena[kGsTreePresent] = hasTree;
     if (hasTree == 0) return;
