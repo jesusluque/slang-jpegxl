@@ -26,8 +26,10 @@ static const float kFar = 3.0e38f;
 struct ClusterParams {
     uint numContexts;
     uint maxClusters;   // 1..kMaxClusters
-    uint pad0;
-    uint pad1;
+    uint ctxBase;       // first context of this set in ctxHist / ctxMap
+    uint infoIndex;     // clusterInfo slot for the cluster count
+    uint regionBase;    // first code region of this set in hist (accumulateClusters)
+    uint pad0, pad1, pad2;
 };
 
 StructuredBuffer<uint>      ctxHist;      // numContexts * kHistBins
@@ -37,7 +39,7 @@ RWStructuredBuffer<float>   ctxDist;      // scratch: distance to the nearest se
 RWStructuredBuffer<uint>    ctxSingle;    // scratch: 1 when the context has at most one symbol
 RWStructuredBuffer<uint>    ctxMap;       // numContexts: cluster per context
 RWStructuredBuffer<uint>    hist;         // code regions: cluster c's histogram at c * kCodeStride
-RWStructuredBuffer<uint>    clusterInfo;  // [0] number of clusters
+RWStructuredBuffer<uint>    clusterInfo;  // [infoIndex] number of clusters
 ConstantBuffer<ClusterParams> params;
 
 groupshared uint  gSeedHist[kMaxClusters * kHistBins];
@@ -54,7 +56,7 @@ groupshared uint  gStop;
 float xlog2x(float x) { return x > 0.0f ? x * log2(x) : 0.0f; }
 
 /// Shannon cost in bits of a histogram: total log2 total - sum c log2 c.
-float entropyOf(uint base) {
+float entropyOf(uint base) {   // base: the context's first bin in ctxHist
     float total = 0.0f;
     float sum = 0.0f;
     for (uint s = 0; s < kHistBins; ++s) {
@@ -70,7 +72,7 @@ float clusterDistance(uint ctx, uint j) {
     const float ta = ctxTotal[ctx];
     const float tb = gSeedTotal[j];
     if (ta == 0.0f || tb == 0.0f) return 0.0f;
-    const uint base = ctx * kHistBins;
+    const uint base = (params.ctxBase + ctx) * kHistBins;
     float sum = 0.0f;
     uint symbols = 0;
     for (uint s = 0; s < kHistBins; ++s) {
@@ -109,7 +111,7 @@ void argmaxReduce(uint tid, float val, uint idx) {
 
 void addSeed(uint tid, uint j, uint ctx) {
     for (uint s = tid; s < kHistBins; s += kThreads) {
-        gSeedHist[j * kHistBins + s] = ctxHist[ctx * kHistBins + s];
+        gSeedHist[j * kHistBins + s] = ctxHist[(params.ctxBase + ctx) * kHistBins + s];
     }
     if (tid == 0) {
         gSeedTotal[j] = ctxTotal[ctx];
@@ -117,7 +119,7 @@ void addSeed(uint tid, uint j, uint ctx) {
         gSeedSingle[j] = ctxSingle[ctx];
         gSeedCtx[j] = ctx;
         ctxDist[ctx] = 0.0f;
-        ctxMap[ctx] = j;
+        ctxMap[params.ctxBase + ctx] = j;
     }
 }
 
@@ -131,15 +133,15 @@ void clusterContexts(uint3 gtid: SV_GroupThreadID) {
         float total = 0.0f;
         uint symbols = 0;
         for (uint s = 0; s < kHistBins; ++s) {
-            const uint c = ctxHist[ctx * kHistBins + s];
+            const uint c = ctxHist[(params.ctxBase + ctx) * kHistBins + s];
             total += float(c);
             symbols += c != 0 ? 1 : 0;
         }
         ctxTotal[ctx] = total;
-        ctxEntropy[ctx] = entropyOf(ctx * kHistBins);
+        ctxEntropy[ctx] = entropyOf((params.ctxBase + ctx) * kHistBins);
         ctxSingle[ctx] = symbols <= 1 ? 1 : 0;
         ctxDist[ctx] = total == 0.0f ? 0.0f : kFar;
-        ctxMap[ctx] = 0xFFFFFFFFu;
+        ctxMap[params.ctxBase + ctx] = 0xFFFFFFFFu;
     }
     AllMemoryBarrierWithGroupSync();
 
@@ -153,8 +155,8 @@ void clusterContexts(uint3 gtid: SV_GroupThreadID) {
         argmaxReduce(tid, best, bestIdx);
     }
     if (gRedIdx[0] == 0xFFFFFFFFu) {   // no tokens at all
-        if (tid == 0) clusterInfo[0] = 1;
-        for (uint ctx = tid; ctx < n; ctx += kThreads) ctxMap[ctx] = 0;
+        if (tid == 0) clusterInfo[params.infoIndex] = 1;
+        for (uint ctx = tid; ctx < n; ctx += kThreads) ctxMap[params.ctxBase + ctx] = 0;
         return;
     }
     addSeed(tid, 0, gRedIdx[0]);
@@ -189,14 +191,14 @@ void clusterContexts(uint3 gtid: SV_GroupThreadID) {
     // Every context with tokens to its nearest seed.
     for (uint ctx = tid; ctx < n; ctx += kThreads) {
         if (ctxTotal[ctx] == 0.0f) continue;
-        if (ctxMap[ctx] != 0xFFFFFFFFu) continue;   // a seed is its own cluster
+        if (ctxMap[params.ctxBase + ctx] != 0xFFFFFFFFu) continue;   // a seed is its own cluster
         uint best = 0;
         float bestDist = kFar;
         for (uint j = 0; j < numSeeds; ++j) {
             const float d = clusterDistance(ctx, j);
             if (d < bestDist) { bestDist = d; best = j; }
         }
-        ctxMap[ctx] = best;
+        ctxMap[params.ctxBase + ctx] = best;
     }
     AllMemoryBarrierWithGroupSync();
 
@@ -206,16 +208,16 @@ void clusterContexts(uint3 gtid: SV_GroupThreadID) {
         uint next = 0;
         uint prev = 0;
         for (uint ctx = 0; ctx < n; ++ctx) {
-            const uint m = ctxMap[ctx];
+            const uint m = ctxMap[params.ctxBase + ctx];
             if (m == 0xFFFFFFFFu) {
-                ctxMap[ctx] = prev;
+                ctxMap[params.ctxBase + ctx] = prev;
                 continue;
             }
             if (gRank[m] == 0xFFFFFFFFu) gRank[m] = next++;
-            ctxMap[ctx] = gRank[m];
+            ctxMap[params.ctxBase + ctx] = gRank[m];
             prev = gRank[m];
         }
-        clusterInfo[0] = next;
+        clusterInfo[params.infoIndex] = next;
     }
 }
 
@@ -225,12 +227,12 @@ void clusterContexts(uint3 gtid: SV_GroupThreadID) {
 void accumulateClusters(uint3 tid: SV_DispatchThreadID) {
     const uint ctx = tid.x;
     if (ctx >= params.numContexts) return;
-    const uint cluster = ctxMap[ctx];
+    const uint cluster = ctxMap[params.ctxBase + ctx];
     for (uint s = 0; s < kHistBins; ++s) {
-        const uint c = ctxHist[ctx * kHistBins + s];
+        const uint c = ctxHist[(params.ctxBase + ctx) * kHistBins + s];
         if (c != 0) {
             uint before;
-            InterlockedAdd(hist[cluster * kCodeStride + s], c, before);
+            InterlockedAdd(hist[(params.regionBase + cluster) * kCodeStride + s], c, before);
         }
     }
 }

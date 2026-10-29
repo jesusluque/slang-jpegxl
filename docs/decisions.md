@@ -16,13 +16,14 @@ per subsystem or milestone, appended to as the work goes. Dates are absolute.
   renderer is not something an embedder wants.
 - **Conformance oracle** is Homebrew `cjxl`/`djxl`. libjxl is not linked, so
   the build has no second copy of the format's logic to disagree with.
-- **Encoder entropy coding.** The DC and AcMetadata streams use prefix
-  codes: every token's bit length is a table lookup, section offsets are
-  prefix sums and emission is one thread per token with `InterlockedOr`. The
-  AC groups use ANS with clustered coefficient contexts (M3): the chain is
-  serial per section, one thread per group, run twice (size, then placement
-  backwards from the section's end). ANS alone gains little; the context
-  modelling it makes affordable gains 12 % (see "AC entropy coding").
+- **Encoder entropy coding.** Every stream is ANS with clustered contexts
+  (M3): the AC groups in libjxl's coefficient contexts, the DC and
+  AcMetadata streams in the leaves of libjxl's fixed trees. The chain is
+  serial per stream, one thread per group, run twice (size, then placement
+  backwards from the stream's end); histograms are counted in parallel first.
+  Prefix codes remain for the headers' own small codes (the MA trees). ANS
+  alone gains little; the context modelling it makes affordable gains 12 % on
+  the AC and 16–41 % on the DC streams.
 
 ## Build (M0, 2026-10-28)
 
@@ -57,9 +58,10 @@ per subsystem or milestone, appended to as the work goes. Dates are absolute.
   AdjustQuantBlockAC; ANS for the AC groups with clustered coefficient
   contexts; lossless Modular encoding of RGB and RGBA at 8 and 16 bits;
   transform selection DCT8..64x64 with libjxl's entropy model and the 8x8
-  specials; PNG colour chunks.) Next: DC and AcMetadata coding (ANS, better
-  trees), three-channel strategy costs, a learned or WP-based tree and
-  transforms for lossless, alpha and 16-bit in the lossy path.
+  specials; PNG colour chunks; DC and AcMetadata with the weighted predictor,
+  libjxl's fixed trees and ANS.) Next: three-channel strategy costs, the
+  weighted predictor and transforms for lossless, alpha and 16-bit in the
+  lossy path, encoder speed (the serial ANS and WP passes).
 - **M4 decoder completeness**: splines, grey JPEG transcodes, loop filters
   on YCbCr frames, extra channel blending in patches, writing the ICC
   profile into the output file, float samples. (16-bit output, animation
@@ -344,6 +346,62 @@ cjxl at the same distance. The cost model is the obvious lever left (it
 prefers the rectangular shapes and rarely picks 16×16 or 32×32 on the small
 images; cjxl's maps use them in smooth areas), together with checking our
 quant field and strategy maps against cjxl's on the same image.
+
+## DC and AcMetadata streams: weighted predictor, fixed trees, ANS (2026-10-29)
+
+With the AC groups level with cjxl's, the DC group sections were 17–22 %
+larger than cjxl's on the 4K image (DC 177 KB + AcMetadata 65 KB against
+198 KB in all at d = 1): a single Gradient leaf and prefix codes against
+cjxl's weighted predictor, fixed trees and ANS. The two modular streams of
+every DC group now follow libjxl's hare tier:
+
+- **DC** (`enc/dc_tokens.slang dcTokenize`, one thread per DC group): the
+  quantised DC of Y, X, B in raster order through the weighted predictor
+  (`enc/wp.slangh`, the decoder's port with its state in a per-thread region
+  of a scratch buffer: the error rows propagate, so this pass is serial per
+  group and channel) and libjxl's `kWPFixedDC` tree, a fixed binary search
+  over the WP property (the largest neighbouring error) with 33 cutoffs,
+  shallower for small images, built on the host like the lossless tree. The
+  token and its leaf context are kept per block; a second kernel walks them
+  backwards for ANS.
+- **AcMetadata** (`metaTokenize`, one thread per item): libjxl's `kACMeta`
+  tree, re-serialised in DecodeTree's breadth-first order on the host (the
+  table in enc_encoding.cc is not in that order): Gradient for the
+  chroma-from-luma tiles, Left for the qf with splits on the left value, Zero
+  for the strategies, and Zero with offset 4 for the EPF sharpness. The ACS/QF
+  channel is a two-row image of the varblocks in raster order, so an item's
+  "left" is the previous varblock's value (found by scanning back through the
+  covered blocks) and the qf row's top is its own strategy. **Every token has
+  to be in an ANS stream**, the zero-cost EPF ones included: the decoder's
+  state walks through each symbol, and the first version, which skipped them
+  as the prefix code could, decoded as corrupt. They cost no bits because
+  their contexts form a single-symbol cluster.
+- **Histogram sets**: the clustering and the histogram-set writer now work on
+  numbered sets (set 0 the AC contexts, 1 + 2g the DC stream of group g,
+  2 + 2g its AcMetadata), each with its own context range, cluster count and
+  code regions; the group's "pre" and "mid" headers carry the local
+  GroupHeader, the tree and the clustered ANS histograms; `dcGroupSections`
+  (one thread per group) measures and places the two ANS streams. The
+  prefix-code item kernels are gone.
+
+On berlin_central (3840×2160) the DC tokens went from 177 KB to 148 KB and
+the AcMetadata from 65 KB to 38 KB at d = 1 (2.9 KB of headers): the DC
+group sections are 189 KB against cjxl's 198 KB, and the whole file
+1 212 760 bytes against cjxl's 1 217 920 at a higher SSIMULACRA2 (84.81 vs
+84.61); at d = 3, 526 909 against 558 710 bytes. At matched size the 4K
+photos now come out ahead of cjxl -e 5:
+
+| image | d | cjxl bytes / SSIM2 | ours at cjxl's size | Δ |
+|---|---|---|---|---|
+| berlin_central | 1 | 1 217 920 / 84.61 | 1 215 696 / 84.84 | +0.23 |
+| berlin_central | 3 | 558 710 / 66.69 | 558 467 / 67.26 | +0.57 |
+| sveti_stefan | 1 | 1 885 027 / 84.46 | 1 888 580 / 84.55 | +0.08 |
+| sveti_stefan | 3 | 751 307 / 56.71 | 748 760 / 57.31 | +0.60 |
+
+The small images average −0.77 (berlin_200 −1.95 / −2.35, sveti_crop +0.35 /
++0.58, sveti_stefan_320 +0.20 / −1.43 at d = 1 / 3): on a 200×112 image the
+per-group trees and histogram headers weigh, and the three-channel strategy
+cost is still missing.
 
 ## The 64-pixel families and libjxl's entropy model (2026-10-29)
 

@@ -71,7 +71,7 @@ private:
     gpu::ComputeKernel                  rgbToXyb_, aqDiff_, aqMap_, aqRawField_;
     gpu::ComputeKernel                  gaborishInverse_, cflTile_, quantize_;
     gpu::ComputeKernel                  tables_, buildOrders_, selectStrategies_, largeQf_, largeRows_, largeCols_, mergeLarge_, adjustQuantField_, dctRows_, dctCols_, dcFromLlf_, specialTransform_, acTokenize_;
-    gpu::ComputeKernel                  dcItems_, metaItems_, clusterContexts_, accumulateClusters_, acSections_;
+    gpu::ComputeKernel                  dcTokenize_, metaTokenize_, dcGroupSections_, clusterContexts_, accumulateClusters_, acSections_;
     gpu::ComputeKernel                  rctYCoCg_, modHist_, modGroupSections_, modularGlobalBlob_;
     gpu::ComputeKernel                  dcGroupBlobs_, globalBlobs_, layout_, blobEmit_;
     gpu::PrefixSum                      prefixSum_;

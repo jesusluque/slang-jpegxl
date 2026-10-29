@@ -1,0 +1,129 @@
+// Copyright (c) 2026 jesus luque.
+//
+// libjxl's weighted predictor (modular/encoding/context_predict.h
+// weighted::State) for the encoder, a port of the decoder's (dec/modular.slangh)
+// with the state in a caller-provided region of a scratch buffer instead of
+// the arena: four prediction-error rows and the error row, two rows each
+// (current and previous), (xsize + 2) entries per row. The default header.
+#pragma once
+
+static const uint kWpP1C = 16, kWpP2C = 10, kWpP3Ca = 7, kWpP3Cb = 7, kWpP3Cc = 7, kWpP3Cd = 0, kWpP3Ce = 0;
+static const uint kWpW0 = 0xd, kWpW1 = 0xc, kWpW2 = 0xc, kWpW3 = 0xc;
+static const int kWpExtraBits = 3;
+static const int64_t kWpRound = ((1 << kWpExtraBits) >> 1) - 1;
+
+static const uint kWpDivLookup[64] = {
+    16777216, 8388608, 5592405, 4194304, 3355443, 2796202, 2396745, 2097152, 1864135, 1677721, 1525201, 1398101, 1290555,
+    1198372, 1118481, 1048576, 986895, 932067, 883011, 838860, 798915, 762600, 729444, 699050, 671088, 645277, 621378,
+    599186, 578524, 559240, 541200, 524288, 508400, 493447, 479349, 466033, 453438, 441505, 430185, 419430, 409200,
+    399457, 390167, 381300, 372827, 364722, 356962, 349525, 342392, 335544, 328965, 322638, 316551, 310689, 305040,
+    299593, 294337, 289262, 284359, 279620, 275036, 270600, 266305, 262144};
+
+/// Words of scratch a state of width xsize needs: 5 rows of 2 * (xsize + 2).
+uint wpScratchWords(uint xsize) { return 5 * 2 * (xsize + 2); }
+
+struct WpState {
+    uint xsize;
+    uint predErrors;   // scratch offset: 4 * rowLen
+    uint error;        // scratch offset: rowLen
+    int64_t prediction[4];
+    int64_t pred;
+};
+
+WpState wpInit(RWStructuredBuffer<uint> scratch, uint base, uint xsize) {
+    WpState s;
+    s.xsize = xsize;
+    const uint rowLen = (xsize + 2) * 2;
+    s.predErrors = base;
+    s.error = base + 4 * rowLen;
+    for (uint i = 0; i < 5 * rowLen; ++i) scratch[base + i] = 0;
+    s.prediction[0] = s.prediction[1] = s.prediction[2] = s.prediction[3] = 0;
+    s.pred = 0;
+    return s;
+}
+
+uint wpErrorWeight(uint64_t x, uint maxweight) {
+    int shift = int(firstbithigh(uint(min(x + 1, uint64_t(0xFFFFFFFFu))))) - 5;
+    if (shift < 0) shift = 0;
+    return 4 + uint((uint64_t(maxweight) * uint64_t(kWpDivLookup[uint(x >> shift)])) >> shift);
+}
+
+int64_t wpWeightedAverage(int64_t p[4], uint w[4]) {
+    uint weightSum = 0;
+    for (uint i = 0; i < 4; ++i) weightSum += w[i];
+    const uint logWeight = firstbithigh(weightSum);
+    weightSum = 0;
+    for (uint i = 0; i < 4; ++i) {
+        w[i] >>= (logWeight - 4);
+        weightSum += w[i];
+    }
+    int64_t sum = int64_t(weightSum >> 1) - 1;
+    for (uint i = 0; i < 4; ++i) sum += p[i] * int64_t(w[i]);
+    return (sum * int64_t(kWpDivLookup[weightSum - 1])) >> 24;
+}
+
+int64_t wpAddBits(int64_t x) { return x << kWpExtraBits; }
+
+/// The prediction for (x, y) from the neighbours (the caller applies the edge
+/// rules) and the WP property (the largest absolute neighbouring error).
+int64_t wpPredict(RWStructuredBuffer<uint> scratch, inout WpState s, uint x, uint y, int64_t N, int64_t W, int64_t NE, int64_t NW, int64_t NN,
+                  out int wpProp) {
+    const uint xsize = s.xsize;
+    const uint curRow = (y & 1) != 0 ? 0 : (xsize + 2);
+    const uint prevRow = (y & 1) != 0 ? (xsize + 2) : 0;
+    const uint posN = prevRow + x;
+    const uint posNE = x < xsize - 1 ? posN + 1 : posN;
+    const uint posNW = x > 0 ? posN - 1 : posN;
+    const uint rowLen = (xsize + 2) * 2;
+    uint weights[4];
+    const uint hw[4] = {kWpW0, kWpW1, kWpW2, kWpW3};
+    for (uint i = 0; i < 4; ++i) {
+        const uint64_t sum = uint64_t(scratch[s.predErrors + i * rowLen + posN]) + uint64_t(scratch[s.predErrors + i * rowLen + posNE]) +
+                             uint64_t(scratch[s.predErrors + i * rowLen + posNW]);
+        weights[i] = wpErrorWeight(sum, hw[i]);
+    }
+    N = wpAddBits(N);
+    W = wpAddBits(W);
+    NE = wpAddBits(NE);
+    NW = wpAddBits(NW);
+    NN = wpAddBits(NN);
+    const int64_t teW = x == 0 ? 0 : int64_t(int(scratch[s.error + curRow + x - 1]));
+    const int64_t teN = int64_t(int(scratch[s.error + posN]));
+    const int64_t teNW = int64_t(int(scratch[s.error + posNW]));
+    const int64_t sumWN = teN + teW;
+    const int64_t teNE = int64_t(int(scratch[s.error + posNE]));
+    {
+        int64_t p = teW;
+        if (abs(teN) > abs(p)) p = teN;
+        if (abs(teNW) > abs(p)) p = teNW;
+        if (abs(teNE) > abs(p)) p = teNE;
+        wpProp = int(p);
+    }
+    s.prediction[0] = W + NE - N;
+    s.prediction[1] = N - (((sumWN + teNE) * int64_t(kWpP1C)) >> 5);
+    s.prediction[2] = W - (((sumWN + teNW) * int64_t(kWpP2C)) >> 5);
+    s.prediction[3] = N - ((teNW * int64_t(kWpP3Ca) + teN * int64_t(kWpP3Cb) + teNE * int64_t(kWpP3Cc) + (NN - N) * int64_t(kWpP3Cd) +
+                            (NW - W) * int64_t(kWpP3Ce)) >> 5);
+    s.pred = wpWeightedAverage(s.prediction, weights);
+    if (((teN ^ teW) | (teN ^ teNW)) > 0) {
+        return (s.pred + kWpRound) >> kWpExtraBits;
+    }
+    const int64_t mx = max(W, max(NE, N));
+    const int64_t mn = min(W, min(NE, N));
+    s.pred = max(mn, min(mx, s.pred));
+    return (s.pred + kWpRound) >> kWpExtraBits;
+}
+
+void wpUpdateErrors(RWStructuredBuffer<uint> scratch, inout WpState s, int64_t val, uint x, uint y) {
+    const uint xsize = s.xsize;
+    const uint curRow = (y & 1) != 0 ? 0 : (xsize + 2);
+    const uint prevRow = (y & 1) != 0 ? (xsize + 2) : 0;
+    const uint rowLen = (xsize + 2) * 2;
+    val = wpAddBits(val);
+    scratch[s.error + curRow + x] = uint(int(s.pred - val));
+    for (uint i = 0; i < 4; ++i) {
+        const uint err = uint((abs(s.prediction[i] - val) + kWpRound) >> kWpExtraBits);
+        scratch[s.predErrors + i * rowLen + curRow + x] = err;
+        scratch[s.predErrors + i * rowLen + prevRow + x + 1] += err;
+    }
+}

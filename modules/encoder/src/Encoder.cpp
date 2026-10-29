@@ -20,8 +20,7 @@ namespace {
 
 using codestream::FrameDim;
 
-constexpr uint32_t kDcItemsPerGroup = 256 * 256 * 3;
-constexpr uint32_t kMetaItemsPerGroup = 2 * 32 * 32 + 2 * 256 * 256;
+constexpr uint32_t kMetaItemsPerGroup = 2 * 32 * 32 + 3 * 256 * 256;
 constexpr uint32_t kCodeStride = 256;
 constexpr uint32_t kBlobStrideWords = 8192;
 constexpr uint32_t kAcClusters = 32;
@@ -46,6 +45,14 @@ std::vector<Uint4> groupRects(const FrameDim& dim, uint32_t groupBlocks, uint32_
     }
     return rects;
 }
+
+std::vector<uint32_t> fixedTree(uint32_t property, uint32_t predictor, uint64_t totalPixels, uint32_t& numLeaves);
+std::vector<uint32_t> acMetaTree(uint32_t& numLeaves);
+constexpr uint32_t kSetContexts = 64;
+constexpr uint32_t kModTreeWords = 8;
+constexpr uint32_t kModPropGradient = 9;
+constexpr uint32_t kModPropWp = 15;
+constexpr uint32_t kPredZero = 0, kPredLeft = 1, kPredGradient = 5, kPredWeighted = 6;
 
 /// LoopFilterFromParams (enc_frame.cc): Gaborish above distance 0.5, EPF
 /// iterations by distance thresholds 0.7, 1.5 and 4. x_qm_scale 3 up to
@@ -94,8 +101,9 @@ Result<std::unique_ptr<Encoder>> Encoder::create(std::shared_ptr<gpu::ShaderLibr
     SJXL_ASSIGN(enc->acTokenize_, gpu::ComputeKernel::create(lib, "sjxl/enc/transform", "acTokenize"));
     SJXL_ASSIGN(enc->cflTile_, gpu::ComputeKernel::create(lib, "sjxl/enc/cfl", "cflTile"));
     SJXL_ASSIGN(enc->quantize_, gpu::ComputeKernel::create(lib, "sjxl/enc/quantize", "quantize"));
-    SJXL_ASSIGN(enc->dcItems_, gpu::ComputeKernel::create(lib, "sjxl/enc/items", "dcItems"));
-    SJXL_ASSIGN(enc->metaItems_, gpu::ComputeKernel::create(lib, "sjxl/enc/items", "metaItems"));
+    SJXL_ASSIGN(enc->dcTokenize_, gpu::ComputeKernel::create(lib, "sjxl/enc/dc_tokens", "dcTokenize"));
+    SJXL_ASSIGN(enc->metaTokenize_, gpu::ComputeKernel::create(lib, "sjxl/enc/dc_tokens", "metaTokenize"));
+    SJXL_ASSIGN(enc->dcGroupSections_, gpu::ComputeKernel::create(lib, "sjxl/enc/dc_tokens", "dcGroupSections"));
     SJXL_ASSIGN(enc->clusterContexts_, gpu::ComputeKernel::create(lib, "sjxl/enc/cluster", "clusterContexts"));
     SJXL_ASSIGN(enc->accumulateClusters_, gpu::ComputeKernel::create(lib, "sjxl/enc/cluster", "accumulateClusters"));
     SJXL_ASSIGN(enc->acSections_, gpu::ComputeKernel::create(lib, "sjxl/enc/ac_sections", "acSections"));
@@ -217,31 +225,40 @@ Result<std::vector<uint8_t>> Encoder::encode(const image::Rgb8& image, const Opt
     SJXL_ASSIGN(auto groups, gpu::Buffer::fromSpan<Uint4>(dev, acRects, "enc.groups"));
     SJXL_ASSIGN(auto dcGroups, gpu::Buffer::fromSpan<Uint4>(dev, dcRects, "enc.dcGroups"));
 
-    const uint32_t numCodeRegions = kAcClusters + 2 * numDcGroups;
+    // Histogram sets: 0 the AC contexts, 1 + 2g the DC stream of DC group g, 2 + 2g its AcMetadata.
+    const uint32_t numSets = 1 + 2 * numDcGroups;
+    const uint32_t numContextsAll = kNumAcContexts + 2 * numDcGroups * kSetContexts;
+    const uint32_t numCodeRegions = numSets * kAcClusters;
     const uint32_t numBlobRegions = 2 + 2 * numDcGroups;
     SJXL_ASSIGN(auto hist, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{numCodeRegions} * kCodeStride, "enc.hist"));
     SJXL_ASSIGN(auto codes, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{numCodeRegions} * kCodeStride, "enc.codes"));
     SJXL_ASSIGN(auto blobs, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{numBlobRegions} * kBlobStrideWords, "enc.blobs"));
     SJXL_ASSIGN(auto blobBits, gpu::Buffer::ofType<uint32_t>(dev, numBlobRegions, "enc.blobBits"));
-    SJXL_ASSIGN(auto ctxHist, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{kNumAcContexts} * kHistBins, "enc.ctxHist"));
-    SJXL_ASSIGN(auto ctxMap, gpu::Buffer::ofType<uint32_t>(dev, kNumAcContexts, "enc.ctxMap"));
+    SJXL_ASSIGN(auto ctxHist, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{numContextsAll} * kHistBins, "enc.ctxHist"));
+    SJXL_ASSIGN(auto ctxMap, gpu::Buffer::ofType<uint32_t>(dev, numContextsAll, "enc.ctxMap"));
     SJXL_ASSIGN(auto ctxTotal, gpu::Buffer::ofType<float>(dev, kNumAcContexts, "enc.ctxTotal"));
     SJXL_ASSIGN(auto ctxEntropy, gpu::Buffer::ofType<float>(dev, kNumAcContexts, "enc.ctxEntropy"));
     SJXL_ASSIGN(auto ctxDist, gpu::Buffer::ofType<float>(dev, kNumAcContexts, "enc.ctxDist"));
     SJXL_ASSIGN(auto ctxSingle, gpu::Buffer::ofType<uint32_t>(dev, kNumAcContexts, "enc.ctxSingle"));
-    SJXL_ASSIGN(auto clusterInfo, gpu::Buffer::ofType<uint32_t>(dev, 4, "enc.clusterInfo"));
-    SJXL_ASSIGN(auto ctxMapMtf, gpu::Buffer::ofType<uint32_t>(dev, kNumAcContexts, "enc.ctxMapMtf"));
-    SJXL_ASSIGN(auto ansInfo, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{kAcClusters + 1} * 256, "enc.ansInfo"));
-    SJXL_ASSIGN(auto ansReverse, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{kAcClusters + 1} * 4096, "enc.ansReverse"));
+    SJXL_ASSIGN(auto clusterInfo, gpu::Buffer::ofType<uint32_t>(dev, numSets, "enc.clusterInfo"));
+    SJXL_ASSIGN(auto ctxMapMtf, gpu::Buffer::ofType<uint32_t>(dev, numContextsAll, "enc.ctxMapMtf"));
+    SJXL_ASSIGN(auto ansInfo, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{numCodeRegions + 1} * 256, "enc.ansInfo"));
+    SJXL_ASSIGN(auto ansReverse, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{numCodeRegions + 1} * 4096, "enc.ansReverse"));
+    // The DC group streams: libjxl's kWPFixedDC tree (weighted predictor) and kACMeta tree, the WP scratch, the tokens.
+    uint32_t dcLeaves = 0, metaLeaves = 0;
+    const std::vector<uint32_t> dcTreeWords = fixedTree(kModPropWp, kPredWeighted, uint64_t{3} * nblocks, dcLeaves);
+    const std::vector<uint32_t> metaTreeWords = acMetaTree(metaLeaves);
+    SJXL_ASSIGN(auto dcTree, gpu::Buffer::fromSpan<uint32_t>(dev, dcTreeWords, "enc.dcTree"));
+    SJXL_ASSIGN(auto metaTree, gpu::Buffer::fromSpan<uint32_t>(dev, metaTreeWords, "enc.metaTree"));
+    const uint32_t wpWordsPerGroup = 5 * 2 * (codestream::kDcGroupDimBlocks + 2);
+    SJXL_ASSIGN(auto wpScratch, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{numDcGroups} * wpWordsPerGroup, "enc.wpScratch"));
+    SJXL_ASSIGN(auto dcTokens, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{3} * nblocks, "enc.dcTokens"));
     SJXL_ASSIGN(auto acSectionBits, gpu::Buffer::ofType<uint32_t>(dev, numGroups, "enc.acSectionBits"));
 
-    const uint32_t dcItems = numDcGroups * kDcItemsPerGroup;
     const uint32_t metaItems = numDcGroups * kMetaItemsPerGroup;
-    SJXL_ASSIGN(auto dcBits, gpu::Buffer::ofType<uint32_t>(dev, dcItems + 1, "enc.dcBits"));
-    SJXL_ASSIGN(auto metaBits, gpu::Buffer::ofType<uint32_t>(dev, metaItems + 1, "enc.metaBits"));
-    SJXL_ASSIGN(auto dcPrefix, gpu::Buffer::ofType<uint32_t>(dev, dcItems + 1, "enc.dcPrefix"));
-    SJXL_ASSIGN(auto metaPrefix, gpu::Buffer::ofType<uint32_t>(dev, metaItems + 1, "enc.metaPrefix"));
-    SJXL_ASSIGN(auto scanTotals, gpu::Buffer::ofType<uint32_t>(dev, 3, "enc.scanTotals"));
+    SJXL_ASSIGN(auto metaTokens, gpu::Buffer::ofType<uint32_t>(dev, metaItems, "enc.metaTokens"));
+    SJXL_ASSIGN(auto dcBits, gpu::Buffer::ofType<uint32_t>(dev, numDcGroups, "enc.dcBits"));
+    SJXL_ASSIGN(auto metaBits, gpu::Buffer::ofType<uint32_t>(dev, numDcGroups, "enc.metaBits"));
 
     SJXL_ASSIGN(auto sectionStart, gpu::Buffer::ofType<uint32_t>(dev, numSections, "enc.sectionStart"));
     SJXL_ASSIGN(auto sectionBits, gpu::Buffer::ofType<uint32_t>(dev, numSections, "enc.sectionBits"));
@@ -451,29 +468,40 @@ Result<std::vector<uint8_t>> Encoder::encode(const image::Rgb8& image, const Opt
     });
     acTokenize_.dispatch(batch, {3 * nblocks, 1, 1}, bindTransform);
 
-    const auto bindItems = [&](rhi::ShaderCursor c, uint32_t mode, const gpu::Buffer& bits, const gpu::Buffer& prefix,
-                               const gpu::Buffer& body) {
+    // The DC group streams' tokens: the DC with the weighted predictor (one
+    // thread per group, as the error state is serial) and the AcMetadata per item.
+    const auto bindDc = [&](rhi::ShaderCursor c, uint32_t mode, const gpu::Buffer& body) {
         c["dcGroups"].setBinding(dcGroups.rhi());
         c["dcQuant"].setBinding(dcQuant.rhi());
         c["acs"].setBinding(acs.rhi());
         c["rawQf"].setBinding(rawQf.rhi());
         c["cmapX"].setBinding(cmapX.rhi());
         c["cmapB"].setBinding(cmapB.rhi());
-        c["codes"].setBinding(codes.rhi());
-        c["hist"].setBinding(hist.rhi());
-        c["itemBits"].setBinding(bits.rhi());
-        c["prefix"].setBinding(prefix.rhi());
-        c["sectionStart"].setBinding(sectionStart.rhi());
+        c["dcTree"].setBinding(dcTree.rhi());
+        c["metaTree"].setBinding(metaTree.rhi());
+        c["wpScratch"].setBinding(wpScratch.rhi());
+        c["dcTokens"].setBinding(dcTokens.rhi());
+        c["metaTokens"].setBinding(metaTokens.rhi());
+        c["ctxHist"].setBinding(ctxHist.rhi());
+        c["ctxMap"].setBinding(ctxMap.rhi());
+        c["ansInfo"].setBinding(ansInfo.rhi());
+        c["ansReverse"].setBinding(ansReverse.rhi());
         c["dcPartStart"].setBinding(dcPartStart.rhi());
+        c["dcBits"].setBinding(dcBits.rhi());
+        c["metaBits"].setBinding(metaBits.rhi());
         c["body"].setBinding(body.rhi());
         c["params"]["nblocks"].setData(nblocks);
         c["params"]["blocksX"].setData(dim.xsizeBlocks);
         c["params"]["blocksY"].setData(dim.ysizeBlocks);
-        c["params"]["numGroups"].setData(numGroups);
         c["params"]["numDcGroups"].setData(numDcGroups);
-        c["params"]["mode"].setData(mode);
         c["params"]["tilesX"].setData(tilesX);
+        c["params"]["mode"].setData(mode);
+        c["params"]["dcTreeNodes"].setData(static_cast<uint32_t>(dcTreeWords.size() / kModTreeWords));
+        c["params"]["metaTreeNodes"].setData(static_cast<uint32_t>(metaTreeWords.size() / kModTreeWords));
+        c["params"]["wpWordsPerGroup"].setData(wpWordsPerGroup);
     };
+    dcTokenize_.dispatch(batch, {numDcGroups, 1, 1}, [&](rhi::ShaderCursor c) { bindDc(c, 0, dummy_); });
+    metaTokenize_.dispatch(batch, {metaItems, 1, 1}, [&](rhi::ShaderCursor c) { bindDc(c, 0, dummy_); });
     const auto bindSections = [&](rhi::ShaderCursor c, uint32_t mode, const gpu::Buffer& body) {
         c["groups"].setBinding(groups.rhi());
         c["acs"].setBinding(acs.rhi());
@@ -494,21 +522,14 @@ Result<std::vector<uint8_t>> Encoder::encode(const image::Rgb8& image, const Opt
         c["params"]["numDcGroups"].setData(numDcGroups);
         c["params"]["mode"].setData(mode);
     };
-    // The AC groups' context histograms were made by acTokenize; the ANS
-    // sections (one thread per group) are measured in mode 1 and emitted in mode 2.
-    const auto itemPasses = [&](uint32_t mode, const gpu::Buffer& body) {
-        if (mode != 0) {
-            acSections_.dispatch(batch, {numGroups, 1, 1}, [&](rhi::ShaderCursor c) { bindSections(c, mode, body); });
-        }
-        dcItems_.dispatch(batch, {dcItems, 1, 1}, [&](rhi::ShaderCursor c) { bindItems(c, mode, dcBits, dcPrefix, body); });
-        metaItems_.dispatch(batch, {metaItems, 1, 1},
-                            [&](rhi::ShaderCursor c) { bindItems(c, mode, metaBits, metaPrefix, body); });
+    // The ANS sections (one thread per AC group, one per DC group) measured in mode 1 and emitted in mode 2.
+    const auto sectionPasses = [&](uint32_t mode, const gpu::Buffer& body) {
+        acSections_.dispatch(batch, {numGroups, 1, 1}, [&](rhi::ShaderCursor c) { bindSections(c, mode, body); });
+        dcGroupSections_.dispatch(batch, {numDcGroups, 1, 1}, [&](rhi::ShaderCursor c) { bindDc(c, mode, body); });
     };
 
-    itemPasses(0, dummy_);   // histograms
-
-    // The AC contexts' histograms clustered into the codes' histograms.
-    const auto bindCluster = [&](rhi::ShaderCursor c) {
+    // Every histogram set's contexts clustered into its codes' histograms.
+    const auto bindCluster = [&](rhi::ShaderCursor c, uint32_t set, uint32_t numContexts) {
         c["ctxHist"].setBinding(ctxHist.rhi());
         c["ctxTotal"].setBinding(ctxTotal.rhi());
         c["ctxEntropy"].setBinding(ctxEntropy.rhi());
@@ -517,11 +538,17 @@ Result<std::vector<uint8_t>> Encoder::encode(const image::Rgb8& image, const Opt
         c["ctxMap"].setBinding(ctxMap.rhi());
         c["hist"].setBinding(hist.rhi());
         c["clusterInfo"].setBinding(clusterInfo.rhi());
-        c["params"]["numContexts"].setData(kNumAcContexts);
+        c["params"]["numContexts"].setData(numContexts);
         c["params"]["maxClusters"].setData(std::min<uint32_t>(options.acClusters, kAcClusters));
+        c["params"]["ctxBase"].setData(set == 0 ? 0u : kNumAcContexts + (set - 1) * kSetContexts);
+        c["params"]["infoIndex"].setData(set);
+        c["params"]["regionBase"].setData(set * kAcClusters);
     };
-    clusterContexts_.dispatchGroups(batch, {1, 1, 1}, bindCluster);
-    accumulateClusters_.dispatch(batch, {kNumAcContexts, 1, 1}, bindCluster);
+    for (uint32_t set = 0; set < numSets; ++set) {
+        const uint32_t numContexts = set == 0 ? kNumAcContexts : kSetContexts;
+        clusterContexts_.dispatchGroups(batch, {1, 1, 1}, [&](rhi::ShaderCursor c) { bindCluster(c, set, numContexts); });
+        accumulateClusters_.dispatch(batch, {numContexts, 1, 1}, [&](rhi::ShaderCursor c) { bindCluster(c, set, numContexts); });
+    }
 
     const auto bindCodes = [&](rhi::ShaderCursor c) {
         c["dcGroups"].setBinding(dcGroups.rhi());
@@ -535,6 +562,8 @@ Result<std::vector<uint8_t>> Encoder::encode(const image::Rgb8& image, const Opt
         c["ansReverse"].setBinding(ansReverse.rhi());
         c["planes"].setBinding(dummyInt_.rhi());
         c["treeNodes"].setBinding(dummy_.rhi());
+        c["dcTree"].setBinding(dcTree.rhi());
+        c["metaTree"].setBinding(metaTree.rhi());
         c["codes"].setBinding(codes.rhi());
         c["blobs"].setBinding(blobs.rhi());
         c["blobBits"].setBinding(blobBits.rhi());
@@ -542,20 +571,22 @@ Result<std::vector<uint8_t>> Encoder::encode(const image::Rgb8& image, const Opt
         c["params"]["numGroups"].setData(numGroups);
         c["params"]["blocksX"].setData(dim.xsizeBlocks);
         c["params"]["blocksY"].setData(dim.ysizeBlocks);
+        c["params"]["dcTreeNodes"].setData(static_cast<uint32_t>(dcTreeWords.size() / kModTreeWords));
+        c["params"]["dcLeaves"].setData(dcLeaves);
+        c["params"]["metaTreeNodes"].setData(static_cast<uint32_t>(metaTreeWords.size() / kModTreeWords));
+        c["params"]["metaLeaves"].setData(metaLeaves);
+        c["params"]["numAcContexts"].setData(kNumAcContexts);
     };
     dcGroupBlobs_.dispatchGroups(batch, {numDcGroups, 1, 1}, bindCodes);
     globalBlobs_.dispatchGroups(batch, {1, 1, 1}, bindCodes);
 
-    itemPasses(1, dummy_);   // bit counts
-
-    SJXL_TRY(prefixSum_.apply(batch, dcBits, dcPrefix, scanTotals, dcItems + 1));
-    SJXL_TRY(prefixSum_.apply(batch, metaBits, metaPrefix, scanTotals, metaItems + 1));
+    sectionPasses(1, dummy_);   // bit counts
 
     const auto bindLayout = [&](rhi::ShaderCursor c, const gpu::Buffer& body) {
         c["blobBits"].setBinding(blobBits.rhi());
         c["acSectionBits"].setBinding(acSectionBits.rhi());
-        c["dcPrefix"].setBinding(dcPrefix.rhi());
-        c["metaPrefix"].setBinding(metaPrefix.rhi());
+        c["dcBits"].setBinding(dcBits.rhi());
+        c["metaBits"].setBinding(metaBits.rhi());
         c["blobs"].setBinding(blobs.rhi());
         c["sectionStart"].setBinding(sectionStart.rhi());
         c["sectionBits"].setBinding(sectionBits.rhi());
@@ -607,6 +638,15 @@ Result<std::vector<uint8_t>> Encoder::encode(const image::Rgb8& image, const Opt
         std::string sections;
         for (uint32_t b : sizesHost) sections += std::format("{} ", b);
         log::info("enc debug: blob bits DcGlobal {} AcGlobal {}; section bytes {}", blobBitsHost[0], blobBitsHost[1], sections);
+        SJXL_ASSIGN(const auto partsHost, dcPartStart.readAll<uint32_t>(dev));
+        uint64_t dcTokenBits = 0, metaTokenBits = 0, headBits = 0;
+        for (uint32_t g = 0; g < numDcGroups; ++g) {
+            const uint32_t pre = partsHost[g * 4], dcs = partsHost[g * 4 + 1], mid = partsHost[g * 4 + 2], meta = partsHost[g * 4 + 3];
+            headBits += (dcs - pre) + (meta - mid);
+            dcTokenBits += mid - dcs;
+            metaTokenBits += sizesHost[1 + g] * 8 - (meta - pre);
+        }
+        log::info("enc debug: DC groups: headers {} B, DC tokens {} B, AcMetadata tokens {} B", headBits / 8, dcTokenBits / 8, metaTokenBits / 8);
     }
 
     SJXL_ASSIGN(const std::vector<uint32_t> totalsHost, totals.readAll<uint32_t>(dev));
@@ -616,9 +656,9 @@ Result<std::vector<uint8_t>> Encoder::encode(const image::Rgb8& image, const Opt
         return Error(ErrorCode::InternalError, "the layout produced an empty body");
     }
 
-    // The body: zero, then every item and blob ORs its bits in.
+    // The body: zero, then every section and blob ORs its bits in.
     SJXL_ASSIGN(auto body, gpu::Buffer::ofType<uint32_t>(dev, (bodyBytes + 3) / 4 + 1, "enc.body"));
-    itemPasses(2, body);
+    sectionPasses(2, body);
     blobEmit_.dispatch(batch, {numBlobRegions, 1, 1}, [&](rhi::ShaderCursor c) { bindLayout(c, body); });
     SJXL_TRY(batch.submit(true));
     SJXL_ASSIGN(const std::vector<uint32_t> bodyWords, body.readAll<uint32_t>(dev));
@@ -644,15 +684,12 @@ Result<std::vector<uint8_t>> Encoder::encode(const image::Rgb8& image, const Opt
 
 namespace {
 
-constexpr uint32_t kModTreeWords = 8;
-constexpr uint32_t kModPropGradient = 9;
-constexpr uint32_t kPredGradient = 5;
 
-/// libjxl MakeFixedTree(kGradientProp, cutoffs, Gradient): a balanced binary
-/// search over the gradient property, shallower for small images, in the
+/// libjxl MakeFixedTree(property, cutoffs, predictor): a balanced binary
+/// search over one property, shallower for small images, in the
 /// breadth-first order DecodeTree expects. Returns the nodes as words and the
 /// leaf count.
-std::vector<uint32_t> fixedGradientTree(uint64_t totalPixels, uint32_t& numLeaves) {
+std::vector<uint32_t> fixedTree(uint32_t property, uint32_t predictor, uint64_t totalPixels, uint32_t& numLeaves) {
     static constexpr int32_t kCutoffs[] = {-500, -392, -255, -191, -127, -95, -63, -47, -31, -23, -15, -11, -7, -4, -3, -1, 0,
                                            1, 3, 5, 7, 11, 15, 23, 31, 47, 63, 95, 127, 191, 255, 392, 500};
     constexpr size_t kNumCutoffs = sizeof(kCutoffs) / sizeof(kCutoffs[0]);
@@ -672,7 +709,7 @@ std::vector<uint32_t> fixedGradientTree(uint64_t totalPixels, uint32_t& numLeave
         const Pending info = queue[head];
         if (info.begin + minGap >= info.end) continue;
         const size_t split = (info.begin + info.end) / 2;
-        nodes[info.pos] = Node{static_cast<int32_t>(kModPropGradient), kCutoffs[split], static_cast<uint32_t>(nodes.size()),
+        nodes[info.pos] = Node{static_cast<int32_t>(property), kCutoffs[split], static_cast<uint32_t>(nodes.size()),
                                static_cast<uint32_t>(nodes.size() + 1)};
         queue.push_back({split + 1, info.end, nodes.size()});
         nodes.emplace_back();
@@ -688,8 +725,62 @@ std::vector<uint32_t> fixedGradientTree(uint64_t totalPixels, uint32_t& numLeave
         n[2] = nodes[i].left;
         n[3] = nodes[i].right;
         n[4] = nodes[i].prop < 0 ? numLeaves++ : 0;
-        n[5] = kPredGradient;
+        n[5] = predictor;
         n[6] = 0;
+    }
+    return words;
+}
+
+std::vector<uint32_t> fixedGradientTree(uint64_t totalPixels, uint32_t& numLeaves) {
+    return fixedTree(kModPropGradient, kPredGradient, totalPixels, numLeaves);
+}
+
+/// libjxl's kACMeta tree (enc_encoding.cc PredefinedTree): splits on the
+/// channel, the row (strategy or qf) and the left or top value; Gradient for
+/// the chroma-from-luma tiles, Left for the qf, Zero for the strategies and
+/// the EPF sharpness (whose leaves carry offset 4 here, so it costs nothing).
+/// Re-serialised in the breadth-first order DecodeTree expects.
+std::vector<uint32_t> acMetaTree(uint32_t& numLeaves) {
+    struct N {
+        int32_t prop, split;   // prop -1: a leaf
+        uint32_t left;         // right child = left + 1
+        uint32_t predictor;
+        int32_t offset;
+    };
+    // libjxl's table: node, Split(property, value, left child) or Leaf(predictor).
+    const std::vector<N> table = {
+        {0, 1, 1, 0, 0},  {0, 2, 3, 0, 0},  {0, 0, 5, 0, 0},   {6, 3, 21, 0, 0}, {2, 0, 7, 0, 0},
+        {-1, 0, 0, kPredGradient, 0}, {-1, 0, 0, kPredGradient, 0},
+        {7, 5, 9, 0, 0},  {7, 5, 15, 0, 0}, {7, 11, 11, 0, 0}, {7, 3, 13, 0, 0},
+        {-1, 0, 0, kPredLeft, 0}, {-1, 0, 0, kPredLeft, 0}, {-1, 0, 0, kPredLeft, 0}, {-1, 0, 0, kPredLeft, 0},
+        {7, 11, 17, 0, 0}, {7, 3, 19, 0, 0},
+        {-1, 0, 0, kPredZero, 0}, {-1, 0, 0, kPredZero, 0}, {-1, 0, 0, kPredZero, 0}, {-1, 0, 0, kPredZero, 0},
+        {7, 3, 23, 0, 0}, {7, 3, 25, 0, 0},
+        {-1, 0, 0, kPredZero, 4}, {-1, 0, 0, kPredZero, 4}, {-1, 0, 0, kPredZero, 4}, {-1, 0, 0, kPredZero, 4},
+    };
+    // Breadth-first renumbering: the decoder places a split's children after every pending node.
+    std::vector<uint32_t> order{0};
+    std::vector<uint32_t> newIndex(table.size(), 0);
+    for (size_t head = 0; head < order.size(); ++head) {
+        const N& n = table[order[head]];
+        newIndex[order[head]] = static_cast<uint32_t>(head);
+        if (n.prop >= 0) {
+            order.push_back(n.left);
+            order.push_back(n.left + 1);
+        }
+    }
+    std::vector<uint32_t> words(order.size() * kModTreeWords, 0);
+    numLeaves = 0;
+    for (size_t i = 0; i < order.size(); ++i) {
+        const N& n = table[order[i]];
+        uint32_t* w = &words[i * kModTreeWords];
+        w[0] = static_cast<uint32_t>(n.prop);
+        w[1] = static_cast<uint32_t>(n.split);
+        w[2] = n.prop >= 0 ? newIndex[n.left] : 0;
+        w[3] = n.prop >= 0 ? newIndex[n.left + 1] : 0;
+        w[4] = n.prop < 0 ? numLeaves++ : 0;
+        w[5] = n.predictor;
+        w[6] = static_cast<uint32_t>(n.offset);
     }
     return words;
 }
@@ -724,8 +815,10 @@ Result<std::vector<uint8_t>> Encoder::encodeLossless(const image::Rgb8& image, c
     SJXL_ASSIGN(auto ctxMapMtf, gpu::Buffer::ofType<uint32_t>(dev, numLeaves, "enc.ctxMapMtf"));
     SJXL_ASSIGN(auto hist, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{kAcClusters} * kCodeStride, "enc.hist"));
     SJXL_ASSIGN(auto codes, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{kAcClusters} * kCodeStride, "enc.codes"));
-    SJXL_ASSIGN(auto ansInfo, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{kAcClusters + 1} * 256, "enc.ansInfo"));
-    SJXL_ASSIGN(auto ansReverse, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{kAcClusters + 1} * 4096, "enc.ansReverse"));
+    // Regions: one set of clusters (the map's own code lands at (1 + 2 numDcGroups) * 32).
+    const uint32_t regions = (1 + 2 * numDcGroups) * kAcClusters + 1;
+    SJXL_ASSIGN(auto ansInfo, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{regions} * 256, "enc.ansInfo"));
+    SJXL_ASSIGN(auto ansReverse, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{regions} * 4096, "enc.ansReverse"));
     // The global blob holds the whole stream when the image fits a group.
     const uint64_t blobWords = kBlobStrideWords + (fitsGroup ? channels * pixels * (image.bitDepth / 8) + 1024 : 0);
     SJXL_ASSIGN(auto blobs, gpu::Buffer::ofType<uint32_t>(dev, blobWords, "enc.blobs"));
@@ -768,6 +861,9 @@ Result<std::vector<uint8_t>> Encoder::encodeLossless(const image::Rgb8& image, c
         c["clusterInfo"].setBinding(clusterInfo.rhi());
         c["params"]["numContexts"].setData(numLeaves);
         c["params"]["maxClusters"].setData(std::min<uint32_t>(options.acClusters, kAcClusters));
+        c["params"]["ctxBase"].setData(0u);
+        c["params"]["infoIndex"].setData(0u);
+        c["params"]["regionBase"].setData(0u);
     };
     clusterContexts_.dispatchGroups(batch, {1, 1, 1}, bindCluster);
     accumulateClusters_.dispatch(batch, {numLeaves, 1, 1}, bindCluster);
@@ -783,6 +879,8 @@ Result<std::vector<uint8_t>> Encoder::encodeLossless(const image::Rgb8& image, c
         c["ansReverse"].setBinding(ansReverse.rhi());
         c["planes"].setBinding(planes.rhi());
         c["treeNodes"].setBinding(treeNodes.rhi());
+        c["dcTree"].setBinding(dummy_.rhi());
+        c["metaTree"].setBinding(dummy_.rhi());
         c["codes"].setBinding(codes.rhi());
         c["blobs"].setBinding(blobs.rhi());
         c["blobBits"].setBinding(blobBits.rhi());
@@ -797,6 +895,11 @@ Result<std::vector<uint8_t>> Encoder::encodeLossless(const image::Rgb8& image, c
         c["params"]["numLeaves"].setData(numLeaves);
         c["params"]["numChannels"].setData(image.channels);
         c["params"]["bitDepth"].setData(image.bitDepth);
+        c["params"]["dcTreeNodes"].setData(0u);
+        c["params"]["dcLeaves"].setData(0u);
+        c["params"]["metaTreeNodes"].setData(0u);
+        c["params"]["metaLeaves"].setData(0u);
+        c["params"]["numAcContexts"].setData(numLeaves);
     };
     modularGlobalBlob_.dispatchGroups(batch, {1, 1, 1}, bindCodes);
     if (!fitsGroup) {
@@ -830,8 +933,8 @@ Result<std::vector<uint8_t>> Encoder::encodeLossless(const image::Rgb8& image, c
     blobEmit_.dispatch(batch, {1, 1, 1}, [&](rhi::ShaderCursor c) {
         c["blobBits"].setBinding(blobBits.rhi());
         c["acSectionBits"].setBinding(dummy_.rhi());
-        c["dcPrefix"].setBinding(dummy_.rhi());
-        c["metaPrefix"].setBinding(dummy_.rhi());
+        c["dcBits"].setBinding(dummy_.rhi());
+        c["metaBits"].setBinding(dummy_.rhi());
         c["blobs"].setBinding(blobs.rhi());
         c["sectionStart"].setBinding(sectionStart.rhi());
         c["sectionBits"].setBinding(dummy_.rhi());

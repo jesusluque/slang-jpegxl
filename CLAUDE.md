@@ -73,13 +73,16 @@ cjxl in.png ref.jxl -d 1 -e 5 ; djxl out.jxl check.png      # Homebrew oracle (/
   Numeric tables (quant weights, opsin matrices, EPF/Gaborish constants) are
   computed from libjxl's formulas at init and checked by tests against the
   extracted copies in `cujpegxl/src/*.h`.
-- **Encoder entropy coding**: the AC groups are ANS streams in libjxl's
-  coefficient contexts (`common/ac_context.slangh`), clustered on the device
-  (`enc/cluster.slang`, ≤ 32 clusters) and coded one thread per group
-  backwards (`enc/ac_sections.slang`, two passes: size, then placement from
-  the section's end); the context map is an MTF + ANS stream. DC and
-  AcMetadata stay prefix coded, one thread per token with lengths from the
-  code table and offsets from prefix sums. The decoder reads both.
+- **Encoder entropy coding**: every stream is ANS with contexts clustered on
+  the device (`enc/cluster.slang`, ≤ 32 clusters per histogram set): the AC
+  groups in libjxl's coefficient contexts (`common/ac_context.slangh`,
+  `enc/ac_sections.slang`), the DC groups' DC stream in the leaves of the
+  kWPFixedDC tree over the weighted predictor (`enc/wp.slangh`, serial per
+  group) and their AcMetadata in the kACMeta tree (`enc/dc_tokens.slang`).
+  Tokens are counted in parallel, then one thread per group runs each chain
+  twice (size, then placement backwards from the stream's end). Every token
+  must be in the stream, zero-cost ones included. Context maps over many
+  contexts are MTF + ANS streams; the headers' MA trees use prefix codes.
 - **One Slang and one slang-rhi** per process, the pinned ones.
 - **`docs/decisions.md`** records each subsystem's design, what was measured
   and what is not done. Update it with the change.
@@ -104,7 +107,7 @@ Modules are static libraries `sjxl_<name>` aliased `sjxl::<name>`
 | codestream | CPU-side syntax only: `BitWriter`, U32/U64/F16 field coders, SizeHeader, ImageMetadata, FrameHeader, LoopFilter, TOC (`Headers.h`); `Tables.h`: quantizer params from a distance, DCT8 dequant weights, natural order, computed from libjxl formulas |
 | image | file I/O only: PNG/PPM/JPEG via stb (`readRgb8` 8-bit RGB, `readImage8` keeps alpha, `readImage` keeps alpha and 16-bit depth; `Rgb8` has `channels` 3/4 and `bitDepth` 8/16; `writePng` writes 16-bit PNGs itself; `readFile`, `writeFile`) |
 | metrics | `metrics::compare`: PSNR, largest difference and where, measured by `shaders/sjxl/metrics/compare.slang`; what tests and `sjxl compare` use |
-| encoder | `enc::Encoder::encode(Rgb8, Options{lossless, distance, adaptiveQuant, chromaFromLuma, loopFilter, acClusters})`: lossless → `encodeLossless` (modular: rctYCoCg → modHist → cluster → buildModularGlobalBlob (tree, histograms, RCT header, the stream when the image fits a group) → modGroupSections (ANS per group)); lossy → the VarDCT pipeline (`shaders/sjxl/enc/`): xyb → aq (quant field) → gaborish (inverse) → cfl (dct, per-tile least squares) → quantize (AdjustQuantBlockAC, dead zones) → strategy + large (transform selection per 32×32 superblock, then the 64-pixel families per 64×64 region) → transform (adjustQuantField, dctRows/dctCols for any varblock, dcFromLlf, acTokenize) → cfl → quantize (per varblock) → items (DC/AcMetadata: modes 0 histogram, 1 count, 2 emit) → cluster → codes (ANS histograms + context map for AC, Huffman + headers per DC group) → ac_sections (ANS per group) → prefix sums → layout → emit |
+| encoder | `enc::Encoder::encode(Rgb8, Options{lossless, distance, adaptiveQuant, chromaFromLuma, loopFilter, acClusters})`: lossless → `encodeLossless` (modular: rctYCoCg → modHist → cluster → buildModularGlobalBlob (tree, histograms, RCT header, the stream when the image fits a group) → modGroupSections (ANS per group)); lossy → the VarDCT pipeline (`shaders/sjxl/enc/`): xyb → aq (quant field) → gaborish (inverse) → cfl (dct, per-tile least squares) → quantize (AdjustQuantBlockAC, dead zones) → strategy + large (transform selection per 32×32 superblock, then the 64-pixel families per 64×64 region) → transform (adjustQuantField, dctRows/dctCols for any varblock, dcFromLlf, acTokenize) → cfl → quantize (per varblock) → dc_tokens (dcTokenize: WP + kWPFixedDC per DC group; metaTokenize per item with kACMeta) → cluster per set → codes (trees, ANS histograms and context maps per set) → ac_sections + dcGroupSections (ANS per group, count then emit) → layout → emit |
 | decoder | `dec::Decoder::decode(bytes)`: `codestream::parse` on the CPU, then `shaders/sjxl/dec/`: sections (one thread per section: globals, DC groups, AC groups; libraries entropy/modular/frame/modframe .slangh over one `arena` buffer) → VarDCT: tables → dc_finalize → transforms; Modular: finalise (inverse transforms) → modular_out (channels to planes) → filters → output |
 | decoder (M2) | `dec::Decoder`: the GPU decode pipeline |
 
@@ -127,17 +130,16 @@ chroma-from-luma per 64 px tile (least squares on the scaled coefficients) →
 quantise per varblock (AdjustQuantBlockAC per channel, Y dead zones, CfL
 residuals, x_qm_scale) → AC tokens per varblock and channel (contexts from
 the firstBlock grid, `ctx << 18 | value` per coefficient slot) → DC gradient
-residual and AcMetadata tokens (YtoX, YtoB, strategy and qf per varblock,
-sharpness 4) → histograms (atomics; AC per coefficient context) → AC context
-clustering (one thread-group) → ANS histograms,
-alias/reverse tables and the context map stream for AC, 15-bit
-length-limited prefix codes + Brotli-style code-length serialisation for DC
-and AcMetadata → AC section sizes (ANS chain per group) and token bit
-lengths → prefix sums (section bit offsets, section byte sizes) → bit
-emission by `InterlockedOr` into a zeroed body buffer (ANS sections placed
-backwards by their thread) → readback of sizes and body; CPU writes headers
-(LoopFilter: Gaborish above d 0.5, EPF iterations by distance) + TOC and
-appends the body.
+residual and AcMetadata tokens (YtoX, YtoB, strategy and qf per varblock, sharpness 4) as tokens in the leaves of
+libjxl's fixed trees (DC: weighted predictor + kWPFixedDC, one thread per DC
+group; AcMetadata: kACMeta per item) → histograms (atomics, per context) →
+clustering per histogram set (one thread-group each) → ANS histograms,
+alias/reverse tables, context maps and the per-group headers with their
+trees → stream sizes (one ANS chain per AC group and two per DC group) →
+layout (section bit offsets and byte sizes) → bit emission by
+`InterlockedOr` into a zeroed body buffer (every chain placed backwards by
+its thread) → readback of sizes and body; CPU writes headers (LoopFilter:
+Gaborish above d 0.5, EPF iterations by distance) + TOC and appends the body.
 `sjxl encode --no-aq --no-cfl --no-filters --no-acs --lambda x --clusters n`
 switch the stages off or tune them for A/B runs (`--no-specials` drops the 8×8
 special transforms, `SJXL_ACS_MASK` limits the families); `SJXL_DEBUG=1`

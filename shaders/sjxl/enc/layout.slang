@@ -8,8 +8,6 @@ module enc_layout;
 
 #include "sjxl/common/bitio.slangh"
 
-static const uint kDcItemsPerGroup = 256 * 256 * 3;
-static const uint kMetaItemsPerGroup = 2 * 32 * 32 + 2 * 256 * 256;
 static const uint kBlobStrideWords = 8192;
 
 struct LayoutParams {
@@ -21,8 +19,8 @@ struct LayoutParams {
 
 StructuredBuffer<uint>      blobBits;
 StructuredBuffer<uint>      acSectionBits;   // bits of each AC group section (ANS)
-StructuredBuffer<uint>      dcPrefix;
-StructuredBuffer<uint>      metaPrefix;
+StructuredBuffer<uint>      dcBits;          // bits of each DC group's DC stream (ANS)
+StructuredBuffer<uint>      metaBits;        // bits of each DC group's AcMetadata stream
 StructuredBuffer<uint>      blobs;
 RWStructuredBuffer<uint>    sectionStart;   // bit offset
 RWStructuredBuffer<uint>    sectionBits;
@@ -52,9 +50,9 @@ void layoutSections(uint3 tid: SV_DispatchThreadID) {
     place(s++, blobBits[0], pos, start);
     for (uint g = 0; g < params.numDcGroups; ++g) {
         const uint pre = blobBits[2 + 2 * g];
-        const uint dcT = dcPrefix[(g + 1) * kDcItemsPerGroup] - dcPrefix[g * kDcItemsPerGroup];
+        const uint dcT = dcBits[g];
         const uint mid = blobBits[3 + 2 * g];
-        const uint metaT = metaPrefix[(g + 1) * kMetaItemsPerGroup] - metaPrefix[g * kMetaItemsPerGroup];
+        const uint metaT = metaBits[g];
         place(s++, pre + dcT + mid + metaT, pos, start);
         dcPartStart[g * 4 + 0] = start;
         dcPartStart[g * 4 + 1] = start + pre;

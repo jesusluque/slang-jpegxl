@@ -68,10 +68,20 @@ int info(int argc, char** argv) {
                         h.frameType == 2 ? (h.saveBeforeColorTransform ? ", saved before the colour transform" : ", saved after the colour transform")
                                          : h.frameType == 1 ? ", DC frame" : (h.flags & sjxl::codestream::FrameHeader::kUseDcFrame) ? ", DC from a DC frame" : "",
                         h.loopFilter.gab ? 1 : 0, h.loopFilter.epfIters, h.isLast ? ", last" : "");
-            if (f.sections.size() > 1 && f.sections.size() <= 64) {
-                std::printf("    section bytes:");
-                for (const auto& sct : f.sections) std::printf(" %u", sct.byteSize);
-                std::printf("\n");
+            if (f.sections.size() > 1) {
+                // DcGlobal, the DC groups, AcGlobal, the AC groups per pass.
+                const size_t ndc = f.dim.numDcGroups();
+                uint64_t dcSum = 0, acSum = 0;
+                for (size_t k = 1; k <= ndc && k < f.sections.size(); ++k) dcSum += f.sections[k].byteSize;
+                for (size_t k = ndc + 2; k < f.sections.size(); ++k) acSum += f.sections[k].byteSize;
+                std::printf("    sections: DcGlobal %u B, %zu DC groups %llu B, AcGlobal %u B, %zu AC groups %llu B\n", f.sections[0].byteSize, ndc,
+                            static_cast<unsigned long long>(dcSum), ndc + 1 < f.sections.size() ? f.sections[ndc + 1].byteSize : 0u,
+                            f.sections.size() - ndc - 2, static_cast<unsigned long long>(acSum));
+                if (f.sections.size() <= 64) {
+                    std::printf("    section bytes:");
+                    for (const auto& sct : f.sections) std::printf(" %u", sct.byteSize);
+                    std::printf("\n");
+                }
             }
             if (h.duration != 0 || h.customSizeOrOrigin || h.blending.mode != 0) {
                 const char* modes[5] = {"replace", "add", "blend", "alpha-weighted add", "multiply"};

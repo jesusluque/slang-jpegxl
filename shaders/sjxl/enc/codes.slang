@@ -28,7 +28,12 @@ static const uint kNumTreeContexts = 6;
 static const uint kPrefixMaxBits = 15;
 static const uint kCodeStride = 256;
 static const uint kBlobStrideWords = 8192;
-static const uint kAcClusters = 32;
+static const uint kAcClusters = 32;        // clusters per histogram set, and code regions per set
+static const uint kSetContexts = 64;       // contexts of the DC group sets (tree leaves)
+/// Histogram sets: 0 the AC contexts, 1 + 2g the DC group g's DC stream, 2 + 2g its AcMetadata.
+uint setCtxBase(uint set) { return set == 0 ? 0 : params.numAcContexts + (set - 1) * kSetContexts; }
+uint setRegionBase(uint set) { return set * kAcClusters; }
+uint mapRegion() { return (1 + 2 * params.numDcGroups) * kAcClusters; }   // the context-map stream's own code
 static const int kPredictorZero = 0;
 static const int kPredictorGradient = 5;
 static const int kEpfSharpness = 4;   // what libjxl writes at every speed up to wombat
@@ -46,7 +51,12 @@ struct CodeParams {
     uint numLeaves;
     uint numChannels;
     uint bitDepth;
-    uint pad0;
+    uint dcTreeNodes;
+    uint dcLeaves;
+    uint metaTreeNodes;
+    uint metaLeaves;
+    uint numAcContexts;   // the AC set's contexts (sets after it start at this index, kSetContexts each)
+    uint pad0, pad1, pad2;
 };
 
 StructuredBuffer<uint4>    dcGroups;   // bx0, by0, w, h in blocks
@@ -60,6 +70,8 @@ RWStructuredBuffer<uint>   ansInfo;    // ANS symbol info per code region (the c
 RWStructuredBuffer<uint>   ansReverse; // ANS reverse maps per code region
 StructuredBuffer<int>      planes;     // modular: 3 * width * height channel values
 StructuredBuffer<uint>     treeNodes;  // modular: the fixed tree, kModTreeWords per node
+StructuredBuffer<uint>     dcTree;     // VarDCT DC groups: the kWPFixedDC tree
+StructuredBuffer<uint>     metaTree;   // VarDCT DC groups: the kACMeta tree
 RWStructuredBuffer<uint>   codes;      // depth << 16 | bits
 RWStructuredBuffer<uint>   blobs;
 RWStructuredBuffer<uint>   blobBits;
@@ -413,23 +425,23 @@ void writePrefixHistograms(RWStructuredBuffer<uint> buf, inout SerialWriter w, u
 
 static const uint kAcLogAlpha = 6;    // 64-symbol ANS alphabet for the AC clusters
 static const uint kMapLogAlpha = 5;   // the context map's values are below 32
-static const uint kMapRegion = kAcClusters;
 
 /// The context map as a one-context ANS stream after the move-to-front
 /// transform (EncodeContextMap with use_mtf): its histogram set, then the
 /// tokens coded backwards and placed from the end as WriteTokens does.
-void writeContextMapStream(RWStructuredBuffer<uint> buf, inout SerialWriter w, uint numContexts, uint numClusters) {
+void writeContextMapStream(RWStructuredBuffer<uint> buf, inout SerialWriter w, uint numContexts, uint numClusters, uint ctxBase) {
     uint mtf[kAcClusters];
     for (uint i = 0; i < kAcClusters; ++i) mtf[i] = i;
     for (uint i = 0; i < kMaxAlphabet; ++i) gAnsCounts[i] = 0;
     uint length = 1;
+    const uint kMapRegion = mapRegion();
     for (uint ctx = 0; ctx < numContexts; ++ctx) {
-        const uint v = ctxMap[ctx];
+        const uint v = ctxMap[ctxBase + ctx];
         uint index = 0;
         while (mtf[index] != v) ++index;
         for (uint j = index; j > 0; --j) mtf[j] = mtf[j - 1];
         mtf[0] = v;
-        ctxMapMtf[ctx] = index;
+        ctxMapMtf[ctxBase + ctx] = index;
         uint tok, nbits, raw;
         hybridEncode(index, tok, nbits, raw);
         ++gAnsCounts[tok];
@@ -450,7 +462,7 @@ void writeContextMapStream(RWStructuredBuffer<uint> buf, inout SerialWriter w, u
         uint pos = w.pos + total;
         for (int ctx = int(numContexts) - 1; ctx >= 0; --ctx) {
             uint tok, nbits, raw;
-            hybridEncode(ctxMapMtf[uint(ctx)], tok, nbits, raw);
+            hybridEncode(ctxMapMtf[ctxBase + uint(ctx)], tok, nbits, raw);
             const uint e = ansInfo[kMapRegion * kAnsInfoStride + tok];
             if (pass == 2) {
                 pos -= nbits;
@@ -477,7 +489,9 @@ void writeContextMapStream(RWStructuredBuffer<uint> buf, inout SerialWriter w, u
 /// contexts, else coded through writeContextMapStream), ANS with a 1 <<
 /// logAlpha alphabet, then every cluster's hybrid-uint config and its
 /// normalised histogram, whose alias table is inverted for the section kernels.
-void writeHistogramSet(RWStructuredBuffer<uint> buf, inout SerialWriter w, uint numContexts, uint numClusters, uint logAlpha) {
+void writeHistogramSet(RWStructuredBuffer<uint> buf, inout SerialWriter w, uint numContexts, uint numClusters, uint logAlpha, uint set) {
+    const uint ctxBase = setCtxBase(set);
+    const uint regionBase = setRegionBase(set);
     serialWrite(buf, w, 1, 0);   // lz77.enabled
     if (numContexts > 1) {
         const uint entryBits = ceilLog2Nonzero(numClusters);
@@ -487,11 +501,11 @@ void writeHistogramSet(RWStructuredBuffer<uint> buf, inout SerialWriter w, uint 
         } else if (entryBits <= 3 && numContexts <= 64) {
             serialWrite(buf, w, 1, 1);   // is_simple
             serialWrite(buf, w, 2, entryBits);
-            for (uint ctx = 0; ctx < numContexts; ++ctx) serialWrite(buf, w, entryBits, ctxMap[ctx]);
+            for (uint ctx = 0; ctx < numContexts; ++ctx) serialWrite(buf, w, entryBits, ctxMap[ctxBase + ctx]);
         } else {
             serialWrite(buf, w, 1, 0);   // is_simple
             serialWrite(buf, w, 1, 1);   // use_mtf
-            writeContextMapStream(buf, w, numContexts, numClusters);
+            writeContextMapStream(buf, w, numContexts, numClusters, ctxBase);
         }
     }
     serialWrite(buf, w, 1, 0);       // use_prefix_code = 0
@@ -500,11 +514,11 @@ void writeHistogramSet(RWStructuredBuffer<uint> buf, inout SerialWriter w, uint 
         encodeUintConfig(buf, w, logAlpha);
     }
     for (uint c = 0; c < numClusters; ++c) {
-        const uint length = loadHistogram(c * kCodeStride);
+        const uint length = loadHistogram((regionBase + c) * kCodeStride);
         for (uint i = 0; i < kMaxAlphabet; ++i) gAnsCounts[i] = gHist[i];
         ansNormalize(length);
         ansWriteHistogram(buf, w, length);
-        ansBuildTables(ansInfo, ansReverse, c, length, logAlpha);
+        ansBuildTables(ansInfo, ansReverse, regionBase + c, length, logAlpha);
     }
 }
 
@@ -551,6 +565,13 @@ void writeModularTree(RWStructuredBuffer<uint> buf, inout SerialWriter w, uint t
     }
 }
 
+/// GroupHeader of a stream with its own tree: use_global_tree 0, default weighted header, no transforms.
+void writeLocalGroupHeader(RWStructuredBuffer<uint> buf, inout SerialWriter w) {
+    serialWrite(buf, w, 1, 0);
+    serialWrite(buf, w, 1, 1);
+    serialWrite(buf, w, 2, 0);
+}
+
 [shader("compute")]
 [numthreads(1, 1, 1)]
 void buildDcGroupBlobs(uint3 gid: SV_GroupID) {
@@ -560,58 +581,33 @@ void buildDcGroupBlobs(uint3 gid: SV_GroupID) {
     }
     const uint4 rect = dcGroups[g];
 
-    // "pre": extra_precision, DC modular header (single Gradient leaf), DC histogram.
+    // "pre": extra_precision, the DC stream's header: the kWPFixedDC tree and
+    // its clustered ANS histograms (set 1 + 2g).
     SerialWriter pre;
     pre.base = (2 + 2 * g) * kBlobStrideWords;
     pre.pos = 0;
     serialWrite(blobs, pre, 2, 0);
-    uint tokens[12];
-    uint count = 0;
-    appendLeaf(tokens, count, kPredictorGradient, 0);
-    writeModularTree(blobs, pre, tokens, count);
-    const uint dcRegion = kAcClusters + 2 * g;
-    const uint dcLen = loadHistogram(dcRegion * kCodeStride);
-    writePrefixHistograms(blobs, pre, dcLen, 1, dcRegion * kCodeStride);
+    writeLocalGroupHeader(blobs, pre);
+    writeTreeFromNodes(blobs, pre, dcTree, params.dcTreeNodes);
+    writeHistogramSet(blobs, pre, params.dcLeaves, clusterInfo[1 + 2 * g], 7, 1 + 2 * g);
     blobBits[2 + 2 * g] = pre.pos;
 
-    // "mid": count - 1, AcMetadata modular header. The tree's root splits on
-    // the channel (property 0 > 2): the EPF channel takes the first leaf
-    // (context 0, an alphabet of one symbol: every block is sharpness 4
-    // through the leaf's offset), the others the second.
+    // "mid": count - 1 (one AcMetadata entry per varblock), the AcMetadata
+    // stream's header: the kACMeta tree and its histograms (set 2 + 2g).
     SerialWriter mid;
     mid.base = (3 + 2 * g) * kBlobStrideWords;
     mid.pos = 0;
     const uint totalBlocks = rect.z * rect.w;
-    uint numVarblocks = 0;   // one AcMetadata entry each
+    uint numVarblocks = 0;
     for (uint by = 0; by < rect.w; ++by) {
         for (uint bx = 0; bx < rect.z; ++bx) {
             numVarblocks += acs[(rect.y + by) * params.blocksX + rect.x + bx] & 1;
         }
     }
     serialWrite(blobs, mid, ceilLog2Nonzero(totalBlocks), numVarblocks - 1);
-    count = 0;
-    tokens[count++] = 1;                 // property 0 + 1
-    tokens[count++] = packSigned(2);     // split value: channel > 2
-    appendLeaf(tokens, count, kPredictorZero, kEpfSharpness);
-    appendLeaf(tokens, count, kPredictorZero, 0);
-    writeModularTree(blobs, mid, tokens, count);
-    const uint metaRegion = kAcClusters + 1 + 2 * g;
-    const uint metaLen = loadHistogram(metaRegion * kCodeStride);
-    serialWrite(blobs, mid, 1, 0);       // lz77.enabled
-    serialWrite(blobs, mid, 1, 1);       // simple context map
-    serialWrite(blobs, mid, 2, 1);       // 1 bit per entry
-    serialWrite(blobs, mid, 1, 0);       // context 0 -> cluster 0 (EPF)
-    serialWrite(blobs, mid, 1, 1);       // context 1 -> cluster 1
-    serialWrite(blobs, mid, 1, 1);       // use_prefix_code
-    encodeUintConfig(blobs, mid, kPrefixMaxBits);
-    encodeUintConfig(blobs, mid, kPrefixMaxBits);
-    storeVarLenUint16(blobs, mid, 0);           // cluster 0: alphabet 1, no code
-    storeVarLenUint16(blobs, mid, metaLen - 1);
-    if (metaLen > 1) {
-        buildAndStoreCode(blobs, mid, metaLen, metaRegion * kCodeStride);
-    } else {
-        codes[metaRegion * kCodeStride] = 0;
-    }
+    writeLocalGroupHeader(blobs, mid);
+    writeTreeFromNodes(blobs, mid, metaTree, params.metaTreeNodes);
+    writeHistogramSet(blobs, mid, params.metaLeaves, clusterInfo[2 + 2 * g], 6, 2 + 2 * g);
     blobBits[3 + 2 * g] = mid.pos;
 }
 
@@ -644,7 +640,7 @@ void buildGlobalBlobs(uint3 gid: SV_GroupID) {
     serialWrite(blobs, ac, 1, 1);
     serialWrite(blobs, ac, ceilLog2Nonzero(params.numGroups), 0);
     serialWrite(blobs, ac, 2, 2);   // used_orders: Val(0) is the third distribution
-    writeHistogramSet(blobs, ac, kNumAcContexts, clusterInfo[0], kAcLogAlpha);
+    writeHistogramSet(blobs, ac, kNumAcContexts, clusterInfo[0], kAcLogAlpha, 0);
     blobBits[1] = ac.pos;
 }
 
@@ -658,20 +654,20 @@ groupshared uint gTreeTokens[kMaxModTreeTokens];
 /// The fixed tree's tokens as DecodeTree reads them, node by node: property + 1
 /// and the split value for a split, 0, predictor, offset, mul_log, mul_bits for
 /// a leaf. One prefix code over the six contexts (trivial context map).
-void writeTreeFromNodes(RWStructuredBuffer<uint> buf, inout SerialWriter w) {
+void writeTreeFromNodes(RWStructuredBuffer<uint> buf, inout SerialWriter w, StructuredBuffer<uint> tree, uint numNodes) {
     uint count = 0;
-    for (uint n = 0; n < params.numTreeNodes && count + 5 <= kMaxModTreeTokens; ++n) {
+    for (uint n = 0; n < numNodes && count + 5 <= kMaxModTreeTokens; ++n) {
         const uint base = n * kModTreeWords;
-        const int prop = int(treeNodes[base + 0]);
+        const int prop = int(tree[base + 0]);
         if (prop >= 0) {
             gTreeTokens[count++] = uint(prop) + 1;
-            gTreeTokens[count++] = packSigned(int(treeNodes[base + 1]));
+            gTreeTokens[count++] = packSigned(int(tree[base + 1]));
         } else {
             gTreeTokens[count++] = 0;
-            gTreeTokens[count++] = treeNodes[base + 5];                 // predictor
-            gTreeTokens[count++] = packSigned(int(treeNodes[base + 6]));   // offset
-            gTreeTokens[count++] = 0;                                   // mul_log
-            gTreeTokens[count++] = 0;                                   // mul_bits
+            gTreeTokens[count++] = tree[base + 5];                 // predictor
+            gTreeTokens[count++] = packSigned(int(tree[base + 6]));   // offset
+            gTreeTokens[count++] = 0;                              // mul_log
+            gTreeTokens[count++] = 0;                              // mul_bits
         }
     }
     for (uint i = 0; i < kMaxAlphabet; ++i) gHist[i] = 0;
@@ -741,8 +737,8 @@ void buildModularGlobalBlob(uint3 gid: SV_GroupID) {
     dc.pos = 0;
     serialWrite(blobs, dc, 1, 1);        // DequantMatrices DC all_default
     serialWrite(blobs, dc, 1, 1);        // has_tree
-    writeTreeFromNodes(blobs, dc);
-    writeHistogramSet(blobs, dc, params.numLeaves, clusterInfo[0], modLogAlpha());
+    writeTreeFromNodes(blobs, dc, treeNodes, params.numTreeNodes);
+    writeHistogramSet(blobs, dc, params.numLeaves, clusterInfo[0], modLogAlpha(), 0);
     // GroupHeader of the global stream.
     serialWrite(blobs, dc, 1, 1);        // use_global_tree
     serialWrite(blobs, dc, 1, 1);        // weighted::Header all_default

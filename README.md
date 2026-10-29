@@ -16,9 +16,10 @@ JPEG recompression and animation with blending. Pixels match within one 8-bit
 step (lossless bit-exact); the conformance tests in `tests/decoder` are the
 record. The encoder is VarDCT with transforms from 8×8 to 64×64 chosen by
 libjxl's entropy model, libjxl's adaptive quant field, chroma-from-luma,
-Gaborish + EPF, and ANS with clustered coefficient contexts for the AC
-groups: at the file size `cjxl -e 5` produces it scores within about one
-SSIMULACRA2 point of it on 4K photos (−0.4 to −1.3). `--lossless` writes a Modular frame
+Gaborish + EPF, the weighted predictor and fixed trees for the DC, and ANS
+with clustered contexts throughout: at the file size `cjxl -e 5` produces it
+scores slightly above it on 4K photos (+0.1 to +0.6 SSIMULACRA2) and within
+a point or two on 200-pixel images. `--lossless` writes a Modular frame
 (YCoCg, Gradient predictor, fixed tree, ANS; RGB or RGBA, 8 or 16 bits)
 8–26 % larger than `cjxl -d 0`. M3 continues with DC coding, the strategy
 and quant-field heuristics, and better lossless trees.
