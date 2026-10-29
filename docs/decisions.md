@@ -1504,3 +1504,42 @@ blending.cc), writing the ICC profile into the PNG (`UnpredictICC` is a
 filters on YCbCr VarDCT frames. Tiny files that expand to 1024 px modular
 groups (blendmodes, sunset_logo) take 14-20 s: the single-thread group decode
 is the M5 target.
+
+## M5: the decoder's serial chains (2026-10-29)
+
+`SJXL_TIMING=1` reports the time of every pipeline stage (`gpu::StageTimer`:
+each mark submits and waits), `SJXL_PERF_SKIP=<bits>` removes parts of the
+modular sample loop for timing experiments (1 the weighted predictor, 2 the
+tree walk, 4 the symbol reads, 8 the sample stores, 16 the LZ77 window). On
+a 1920x1080 lossy decode the DC group thread took 515 of 650 ms, the 40 AC
+group threads 129 ms, everything else (IDCT, filters, colour) 15 ms.
+
+What helped, measured one change at a time:
+
+- the code set's fields cached in the symbol reader instead of reloaded per
+  symbol (AC groups 129 → 26 ms, the DC group −20 ms);
+- the weighted predictor's rows in threadgroup memory, then the three
+  previous-row values each predictor needs carried in registers along the
+  row (one load and one store per row per sample instead of a dozen);
+- the MA tree packed into one uint4 per node in threadgroup memory; the
+  properties computed on demand at the node that tests them (no property
+  table);
+- a sliding window for the neighbours (two loads per sample instead of seven);
+- a 32-bit variant of the whole predictor and channel loop for samples up to
+  16 bits (`modular_channel.slangh`, included twice with PIXW = int / int64_t),
+  the 64-bit one kept for 24/32-bit samples: every intermediate fits, except
+  the weighted average's product, which stays 64-bit.
+
+What did not: alias tables, context maps and the divisor table in threadgroup
+memory, a cached word pair in the bit reader, unrolling the predictor loops,
+dropping struct copies from the accessors — each within noise. The remaining
+cost is the dependent instruction chain of a modular sample (weighted
+predictor, tree walk, ANS, hybrid uint, residual, error update: 150-200
+instructions in order on a single GPU thread, 4-8 cycles each, nothing to
+hide the latency), about 1200 cycles per sample against about 300 for an AC
+coefficient symbol. The format gives one ANS stream per DC group (2048 px) and
+djxl must read our files, so the chain cannot be split; the decoder stays at
+one thread per section.
+
+1920x1080 (M5 Pro, debug build): lossy decode 650 → 330 ms (DC group 285,
+AC groups 27); lossless decode 1350 → 580 ms. djxl: 90 / 100 ms.

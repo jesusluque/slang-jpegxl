@@ -58,6 +58,8 @@ struct SectionParams {
     int4  passMinA;       // modular: GetDownsamplingBracket per pass
     int4  passMinB;
     int4  passMinC;
+    uint  perfSkip;       // SJXL_PERF_SKIP timing experiments (entropy.slangh gPerfSkip)
+    uint  wideSamples;    // 1: samples beyond 16 bits (the 64-bit modular arithmetic)
     int4  passMaxA;
     int4  passMaxB;
     int4  passMaxC;
@@ -81,6 +83,7 @@ Dec makeDec(uint section, uint base, uint cap) {
     Dec d;
     d.br.pos = sections[section].x;
     d.br.end = sections[section].y;
+    d.br.cacheWord = 0xFFFFFFFFu;
     d.base = base;
     d.top = base;
     d.cap = cap;
@@ -181,6 +184,8 @@ uint modularAcStream(uint g, uint pass) { return 1 + 3 * params.numDcGroups + 17
 [shader("compute")]
 [numthreads(1, 1, 1)]
 void decodeGlobals(uint3 tid: SV_DispatchThreadID) {
+    gPerfSkip = params.perfSkip;
+    gWideSamples = params.wideSamples;
     if (tid.x != 0) return;
     for (uint i = 0; i < kGsHeaderSize; ++i) arena[i] = 0;
     arena[kGsHeaderSize - 1] = params.blocksX * params.blocksY;   // nblocks, read by the DC group body
@@ -199,6 +204,7 @@ void decodeGlobals(uint3 tid: SV_DispatchThreadID) {
         if (params.singleSection == 0) {
             d.br.pos = sections[1 + params.numDcGroups].x;
             d.br.end = sections[1 + params.numDcGroups].y;
+            d.br.cacheWord = 0xFFFFFFFFu;
         }
         decodeAcGlobal(d, params.numGroups, params.numDcGroups, params.numPasses, window);
         arena[kGsAcGlobalBits] = d.br.pos;
@@ -216,6 +222,8 @@ void decodeGlobals(uint3 tid: SV_DispatchThreadID) {
 [shader("compute")]
 [numthreads(1, 1, 1)]
 void decodeDcGroups(uint3 tid: SV_DispatchThreadID) {
+    gPerfSkip = params.perfSkip;
+    gWideSamples = params.wideSamples;
     const uint g = tid.x;
     if (g >= params.numDcGroups || params.singleSection != 0) return;
     if (arena[kGsError] != kErrNone) { status[1 + g] = arena[kGsError]; return; }
@@ -228,6 +236,8 @@ void decodeDcGroups(uint3 tid: SV_DispatchThreadID) {
 [shader("compute")]
 [numthreads(1, 1, 1)]
 void decodeAcGroups(uint3 tid: SV_DispatchThreadID) {
+    gPerfSkip = params.perfSkip;
+    gWideSamples = params.wideSamples;
     const uint g = tid.x;
     if (g >= params.numGroups || params.singleSection != 0) return;
     if (arena[kGsError] != kErrNone) { status[1 + params.numDcGroups + g] = arena[kGsError]; return; }
@@ -238,6 +248,7 @@ void decodeAcGroups(uint3 tid: SV_DispatchThreadID) {
     for (uint pass = 0; pass < params.numPasses && d.error == kErrNone; ++pass) {
         d.br.pos = sections[acSection(pass, g)].x;
         d.br.end = sections[acSection(pass, g)].y;
+        d.br.cacheWord = 0xFFFFFFFFu;
         decodeAcGroup(d, acGeom(g), pass, passShift(pass), windowFor(1 + params.numDcGroups + g));
         if (d.error == kErrNone) {   // the extra channels' modular group of this pass (ProcessACGroup)
             decodeModularGroup(d, x0, y0, w, h, passMinShift(pass), passMaxShift(pass), modularAcStream(g, pass), windowFor(1 + params.numDcGroups + g));
@@ -249,6 +260,8 @@ void decodeAcGroups(uint3 tid: SV_DispatchThreadID) {
 [shader("compute")]
 [numthreads(1, 1, 1)]
 void decodeModularGlobals(uint3 tid: SV_DispatchThreadID) {
+    gPerfSkip = params.perfSkip;
+    gWideSamples = params.wideSamples;
     if (tid.x != 0) return;
     for (uint i = 0; i < kGsHeaderSize; ++i) arena[i] = 0;
     Dec d = makeDec(0, kGsHeaderSize, params.globalsCap);
@@ -284,6 +297,8 @@ void decodeModularGlobals(uint3 tid: SV_DispatchThreadID) {
 [shader("compute")]
 [numthreads(1, 1, 1)]
 void decodeModularDcGroups(uint3 tid: SV_DispatchThreadID) {
+    gPerfSkip = params.perfSkip;
+    gWideSamples = params.wideSamples;
     const uint g = tid.x;
     if (g >= params.numDcGroups || params.singleSection != 0) return;
     if (arena[kGsError] != kErrNone) { status[1 + g] = arena[kGsError]; return; }
@@ -298,6 +313,8 @@ void decodeModularDcGroups(uint3 tid: SV_DispatchThreadID) {
 [shader("compute")]
 [numthreads(1, 1, 1)]
 void decodeModularAcGroups(uint3 tid: SV_DispatchThreadID) {
+    gPerfSkip = params.perfSkip;
+    gWideSamples = params.wideSamples;
     const uint g = tid.x;
     if (g >= params.numGroups || params.singleSection != 0) return;
     if (arena[kGsError] != kErrNone) { status[1 + params.numDcGroups + g] = arena[kGsError]; return; }
@@ -308,6 +325,7 @@ void decodeModularAcGroups(uint3 tid: SV_DispatchThreadID) {
     for (uint pass = 0; pass < params.numPasses && d.error == kErrNone; ++pass) {
         d.br.pos = sections[acSection(pass, g)].x;
         d.br.end = sections[acSection(pass, g)].y;
+        d.br.cacheWord = 0xFFFFFFFFu;
         decodeModularGroup(d, x0, y0, w, h, passMinShift(pass), passMaxShift(pass), modularAcStream(g, pass), windowFor(1 + params.numDcGroups + g));
     }
     status[1 + params.numDcGroups + g] = d.error;
@@ -325,6 +343,7 @@ void modularFinalizeFrame(uint3 tid: SV_DispatchThreadID) {
     Dec d;
     d.br.pos = 0;
     d.br.end = 0;
+    d.br.cacheWord = 0xFFFFFFFFu;
     d.base = params.acArenaBase;   // the AC groups' storage is free by now (palettes allocate full channels)
     d.top = d.base;
     d.cap = params.acArenaBase + params.numGroups * params.acArenaWords;

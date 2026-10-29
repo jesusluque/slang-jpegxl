@@ -16,6 +16,7 @@
 #include <bit>
 #include <cstdlib>
 #include "sjxl/gpu/CommandBatch.h"
+#include "sjxl/gpu/StageTimer.h"
 
 namespace sjxl::dec {
 namespace {
@@ -317,8 +318,11 @@ Result<Decoder::FrameOutput> Decoder::run(const codestream::Parsed& parsed, cons
     std::optional<gpu::Buffer> weightsKeep, ecWeightsKeep;   // upsampling weights live until the batch ran
 
     gpu::CommandBatch batch(dev);
+    gpu::StageTimer timer(batch, "decode");
 
     const auto bindSections = [&](rhi::ShaderCursor c) {
+        c["params"]["wideSamples"].setData(uint32_t{m.floatingPointSample || m.bitsPerSample > 16 ? 1u : 0u});
+        c["params"]["perfSkip"].setData(static_cast<uint32_t>(std::strtoul(platform::env("SJXL_PERF_SKIP").c_str(), nullptr, 0)));
         c["cs"].setBinding(cs.rhi());
         c["arena"].setBinding(arena.rhi());
         c["dc"].setBinding(dc.rhi());
@@ -436,6 +440,7 @@ Result<Decoder::FrameOutput> Decoder::run(const codestream::Parsed& parsed, cons
     } else {
     globals_.dispatch(batch, {1, 1, 1}, bindSections);
     dcGroups_.dispatch(batch, {numDcGroups, 1, 1}, bindSections);
+    timer.mark("globals + dc groups");
     tables_.dispatch(batch, {kDequantTableFloats, 1, 1}, [&](rhi::ShaderCursor c) {
         c["arena"].setBinding(arena.rhi());
         c["dequant"].setBinding(dequant.rhi());
@@ -465,6 +470,7 @@ Result<Decoder::FrameOutput> Decoder::run(const codestream::Parsed& parsed, cons
     if (useDcFrame) dcFromFrame_.dispatch(batch, {nblocks, 1, 1}, bindFinalize);   // no smoothing with a DC frame (FinalizeDC)
     else smoothDc_.dispatch(batch, {dim.xsizeBlocks, dim.ysizeBlocks, 1}, bindFinalize);
     computeSigma_.dispatch(batch, {nblocks, 1, 1}, bindFinalize);
+    timer.mark("dc finalize");
     acGroups_.dispatch(batch, {numGroups, 1, 1}, bindSections);
     if (numEc > 0) modularFinalize_.dispatch(batch, {1, 1, 1}, bindSections);   // the extra channels' inverse transforms
     const auto bindTransforms = [&](rhi::ShaderCursor c) {
@@ -491,6 +497,7 @@ Result<Decoder::FrameOutput> Decoder::run(const codestream::Parsed& parsed, cons
         c["params"]["bDm"].setData(static_cast<float>(std::pow(1.25, 2 - static_cast<int>(frame.header.bQmScale))));
         for (int i = 0; i < 4; ++i) c["params"]["quantBias"][i].setData(m.quantBiases[static_cast<size_t>(i)]);
     };
+    timer.mark("ac groups");
     dequantCoeffs_.dispatch(batch, {3 * nblocks * 64, 1, 1}, bindTransforms);
     llfFromDc_.dispatch(batch, {3 * nblocks, 1, 1}, bindTransforms);
     idctRows_.dispatch(batch, {static_cast<uint32_t>(3 * planePixels), 1, 1}, bindTransforms);
@@ -583,6 +590,7 @@ Result<Decoder::FrameOutput> Decoder::run(const codestream::Parsed& parsed, cons
             c["params"]["gabWeights"][ch * 4 + 3].setData(0.0f);
         }
     };
+    timer.mark("idct + ec");
     // Chroma upsampling first (render pipeline order), horizontal then vertical.
     for (uint32_t dir = 0; dir < 2 && ycbcr; ++dir) {
         bool any = false;
@@ -615,6 +623,7 @@ Result<Decoder::FrameOutput> Decoder::run(const codestream::Parsed& parsed, cons
         epf_.dispatch(batch, {dim.xsize, dim.ysize, 1}, [&](rhi::ShaderCursor c) { bindFilter(c, 2, lf.epfPass2SigmaScale * 1.65f); });
         std::swap(src, dst);
     }
+    timer.mark("filters");
     // Splines, after the loop filters at the frame's size (render pipeline order).
     if (frame.header.flags & codestream::FrameHeader::kSplines) {
         constexpr uint32_t kMaxSplines = 4096, kMaxControlPoints = 1u << 18, kMaxSegments = 1u << 16, kMaxRowEntries = 1u << 20, kSegWords = 10;
@@ -657,6 +666,7 @@ Result<Decoder::FrameOutput> Decoder::run(const codestream::Parsed& parsed, cons
         if (st[2] != 0) return Error::make(ErrorCode::Unsupported, "splines with {} segments over {} rows (capacity {} / {})", st[0], st[1], kMaxSegments, kMaxRowEntries);
         if (!platform::env("SJXL_DEBUG").empty()) log::info("dec debug: splines: {} segments, {} row entries", st[0], st[1]);
     }
+    timer.mark("splines");
     // Upsampling (after the loop filters, before patches: render pipeline order).
     std::optional<gpu::Buffer> upsampled;
     if (upsampling > 1) {
@@ -713,6 +723,7 @@ Result<Decoder::FrameOutput> Decoder::run(const codestream::Parsed& parsed, cons
         bucketPatches_.dispatch(batch, {1, 1, 1}, bindPatches);
         applyPatches_.dispatch(batch, {outWidth * outHeight, 1, 1}, bindPatches);
     }
+    timer.mark("upsample + patches");
     // Noise, after patches and before the colour transform.
     std::optional<gpu::Buffer> noiseA, noiseB;
     if (frame.header.flags & codestream::FrameHeader::kNoise) {
@@ -736,6 +747,7 @@ Result<Decoder::FrameOutput> Decoder::run(const codestream::Parsed& parsed, cons
         noiseConvolve_.dispatch(batch, {outWidth, outHeight, 1}, bindNoise);
         noiseAdd_.dispatch(batch, {outWidth, outHeight, 1}, bindNoise);
     }
+    timer.mark("noise");
     const auto bindOutput = [&](rhi::ShaderCursor c, bool fromCanvas) {
         c["xyb"].setBinding(fromCanvas ? canvas->rhi() : src->rhi());
         c["rgb8"].setBinding(rgb8.rhi());
@@ -834,6 +846,8 @@ Result<Decoder::FrameOutput> Decoder::run(const codestream::Parsed& parsed, cons
     SJXL_TRY(batch.submit(true));
 
     SJXL_ASSIGN(const std::vector<uint32_t> statusHost, status.readAll<uint32_t>(dev));
+    timer.mark("output + readback");
+    timer.report();
     for (uint32_t i = 0; i < numThreads; ++i) {
         const uint32_t code = statusHost[i] & 0xFF;
         const uint32_t stage = statusHost[i] >> 8;

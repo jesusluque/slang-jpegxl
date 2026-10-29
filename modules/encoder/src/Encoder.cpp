@@ -16,6 +16,7 @@
 #include <format>
 #include <cstdlib>
 #include "sjxl/gpu/CommandBatch.h"
+#include "sjxl/gpu/StageTimer.h"
 
 namespace sjxl::enc {
 namespace {
@@ -604,6 +605,7 @@ Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, cons
     SJXL_ASSIGN(auto totals, gpu::Buffer::ofType<uint32_t>(dev, 2, "enc.totals"));
 
     gpu::CommandBatch batch(dev);
+    gpu::StageTimer timer(batch, "encode");
 
     if (jpeg == nullptr) rgbToXyb_.dispatch(batch, {dim.xsizePadded, dim.ysizePadded, 1}, [&](rhi::ShaderCursor c) {
         c["rgb8"].setBinding(rgb.rhi());
@@ -637,12 +639,14 @@ Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, cons
         c["params"]["scale"].setData(fieldScale);
     };
     if (options.adaptiveQuant) {
+        timer.mark("upload + xyb");
         if (jpeg == nullptr) aqDiff_.dispatch(batch, {cellsX * cellsY, 1, 1}, bindAq);
     }
     if (jpeg == nullptr) aqMap_.dispatch(batch, {nblocks, 1, 1}, bindAq);
     if (jpeg == nullptr) aqRawField_.dispatch(batch, {nblocks, 1, 1}, bindAq);
 
     // Pre-sharpening for the decoder's Gaborish, then the DCT of every block.
+    timer.mark("adaptive quant");
     const gpu::Buffer& planes = frame.gaborish ? xybSharp : xyb;
     if (frame.gaborish) {
         if (jpeg == nullptr) gaborishInverse_.dispatch(batch, {dim.xsizePadded, dim.ysizePadded, 1}, [&](rhi::ShaderCursor c) {
@@ -722,6 +726,7 @@ Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, cons
     SJXL_ASSIGN(auto largeY, gpu::Buffer::ofType<float>(dev, static_cast<uint64_t>(planePixels), "enc.largeY"));
     uint32_t familyMask = 0x3FF;
     if (const std::string m = platform::env("SJXL_ACS_MASK"); !m.empty()) familyMask = static_cast<uint32_t>(std::strtoul(m.c_str(), nullptr, 0));
+    timer.mark("inverse gaborish");
     const uint32_t threeChannels = platform::env("SJXL_ACS_YONLY").empty() ? 1u : 0u;
     const uint32_t acsDeadZone = platform::env("SJXL_ACS_ROUND").empty() ? 1u : 0u;   // the coder's dead zones in the estimate (+0.3 SSIMULACRA2 over libjxl's rounding)
     const auto bindStrategy = [&](rhi::ShaderCursor c, bool enabled) {
@@ -757,8 +762,10 @@ Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, cons
         dctCols_.dispatch(batch, {static_cast<uint32_t>(3 * planePixels), 1, 1}, bindTransform);
         cflTile_.dispatch(batch, {tilesX * tilesY, 1, 1}, bindCfl);
     }
+    timer.mark("first cfl pass");
     if (jpeg == nullptr) selectStrategies_.dispatchGroups(batch, {superblocksX * superblocksY, 1, 1}, [&](rhi::ShaderCursor c) { bindStrategy(c, true); });
     // The 64-pixel families against the superblocks' layouts.
+    timer.mark("strategy 8..32");
     if (options.acStrategy && (familyMask >> 7) != 0) {
         const auto bindLarge = [&](rhi::ShaderCursor c, uint32_t family, uint32_t channelPass) {
             c["xyb"].setBinding(planes.rhi());
@@ -801,6 +808,7 @@ Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, cons
         }
         if (jpeg == nullptr) mergeLarge_.dispatch(batch, {regionsX * regionsY, 1, 1}, [&](rhi::ShaderCursor c) { bindLarge(c, 0, 0); });
     }
+    timer.mark("strategy 64");
     if (jpeg == nullptr) adjustQuantField_.dispatch(batch, {nblocks, 1, 1}, bindTransform);
     // Oracle experiment: another encoder's quant field and strategy map (as the
     // decoder's SJXL_DEBUG_MAPS dumps them) replace ours.
@@ -830,11 +838,13 @@ Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, cons
     }
     if (jpeg == nullptr) dctRows_.dispatch(batch, {static_cast<uint32_t>(3 * planePixels), 1, 1}, bindTransform);
     if (jpeg == nullptr) dctCols_.dispatch(batch, {static_cast<uint32_t>(3 * planePixels), 1, 1}, bindTransform);
+    timer.mark("dct");
     if (jpeg == nullptr) specialTransform_.dispatch(batch, {3 * nblocks, 1, 1}, bindTransform);
     if (jpeg == nullptr) dcFromLlf_.dispatch(batch, {3 * nblocks, 1, 1}, bindTransform);
     if (options.chromaFromLuma) {
         if (jpeg == nullptr) cflTile_.dispatch(batch, {tilesX * tilesY, 1, 1}, bindCfl);
     }
+    timer.mark("cfl");
     if (jpeg == nullptr) quantize_.dispatch(batch, {nblocks, 1, 1}, [&](rhi::ShaderCursor c) {
         c["coeffs"].setBinding(coeffs.rhi());
         c["dcValue"].setBinding(dcValue.rhi());
@@ -1047,6 +1057,7 @@ Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, cons
         c["params"]["hshift"].setData(hshift);
         c["params"]["vshift"].setData(vshift);
     };
+    timer.mark("quantize + ac tokens");
     if (!frame.useDcFrame) dcTokenize_.dispatch(batch, {numDcGroups, 1, 1}, [&](rhi::ShaderCursor c) { bindDc(c, 0, dummy_); });
     metaTokenize_.dispatch(batch, {metaItems, 1, 1}, [&](rhi::ShaderCursor c) { bindDc(c, 0, dummy_); });
     if (hasAlpha) {
@@ -1192,6 +1203,7 @@ Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, cons
         c["params"]["hshift"].setData(hshift);
         c["params"]["vshift"].setData(vshift);
     };
+    timer.mark("dc + meta tokens");
     // The ANS sections (one thread per AC group, one per DC group) measured in mode 1 and emitted in mode 2.
     const auto sectionPasses = [&](uint32_t mode, const gpu::Buffer& body) {
         acSections_.dispatch(batch, {numGroups * numPasses, 1, 1}, [&](rhi::ShaderCursor c) { bindSections(c, mode, body); });
@@ -1291,6 +1303,7 @@ Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, cons
         c["params"]["numChannels"].setData(1u);
         c["params"]["bitDepth"].setData(image.bitDepth);
     };
+    timer.mark("sections + cluster");
     dcGroupPre_.dispatchGroups(batch, {numDcGroups, 1, 1}, bindCodes);
     dcGroupMid_.dispatchGroups(batch, {numDcGroups, 1, 1}, bindCodes);
     globalBlobs_.dispatchGroups(batch, {1, 1, 1}, bindCodes);
@@ -1318,6 +1331,7 @@ Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, cons
         c["params"]["acPostRegion"].setData(acPostRegion);
         c["params"]["numBlobRegions"].setData(numBlobRegions);
     };
+    timer.mark("codes");
     layout_.dispatch(batch, {1, 1, 1}, [&](rhi::ShaderCursor c) { bindLayout(c, dummy_); });
     SJXL_TRY(batch.submit(true));
     SJXL_ASSIGN(const std::vector<uint32_t> clusterInfoHost, clusterInfo.readAll<uint32_t>(dev));
@@ -1410,9 +1424,12 @@ Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, cons
     // The body: zero, then every section and blob ORs its bits in.
     SJXL_ASSIGN(auto body, gpu::Buffer::ofType<uint32_t>(dev, (bodyBytes + 3) / 4 + 1, "enc.body"));
     sectionPasses(2, body);
+    timer.mark("layout + size readback");
     blobEmit_.dispatch(batch, {numBlobRegions, 1, 1}, [&](rhi::ShaderCursor c) { bindLayout(c, body); });
     SJXL_TRY(batch.submit(true));
     SJXL_ASSIGN(const std::vector<uint32_t> bodyWords, body.readAll<uint32_t>(dev));
+    timer.mark("emit + body readback");
+    timer.report();
 
     // The frame header and TOC on the CPU, then the body.
     codestream::BitWriter head;

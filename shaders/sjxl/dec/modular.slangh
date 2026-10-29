@@ -138,158 +138,26 @@ static const uint kWpDivLookup[64] = {
     299593, 294337, 289262, 284359, 279620, 275036, 270600, 266305, 262144};
 
 static const int kWpExtraBits = 3;
-static const int64_t kWpRound = ((1 << kWpExtraBits) >> 1) - 1;
 
-/// weighted::State: four prediction error rows and the error row, in the arena.
-struct WpState {
-    WpHeader header;
-    uint xsize;
-    uint predErrors;   // 4 * (xsize + 2) * 2 uints
-    uint error;        // (xsize + 2) * 2 ints
-    int64_t prediction[4];
-    int64_t pred;
-};
+static const uint kWpSharedWords = 2600;   // 10 KB: 5 rows of 2 x (xsize + 2), channels up to 258 wide (DC groups, 256 px modular groups)
+groupshared uint gWp[kWpSharedWords];
+/// The MA tree's nodes copied into threadgroup memory when they fit (a tree walk
+/// reads three or four words per node visited, for every sample).
+static const uint kTreeSharedNodes = 256;   // 8 KB: one uint4 per node (split: property, split value, children; leaf: -1, offset, multiplier, predictor | context << 8)
+groupshared uint4 gTree4[kTreeSharedNodes];
+/// kWpDivLookup in threadgroup memory (a dynamically indexed constant array is a
+/// device memory load; this one is in every sample's dependent chain, five times).
+groupshared uint gWpDiv[64];
 
-WpState wpCreate(inout Dec d, WpHeader header, uint xsize) {
-    WpState s;
-    s.header = header;
-    s.xsize = xsize;
-    const uint rowLen = (xsize + 2) * 2;
-    s.predErrors = alloc(d, 4 * rowLen);
-    s.error = alloc(d, rowLen);
-    for (uint i = 0; i < 4 * rowLen; ++i) arena[s.predErrors + i] = 0;
-    for (uint i = 0; i < rowLen; ++i) arena[s.error + i] = 0;
-    s.prediction[0] = s.prediction[1] = s.prediction[2] = s.prediction[3] = 0;
-    s.pred = 0;
-    return s;
-}
-
-/// ErrorWeight: FloorLog2Nonzero of the 64-bit sum (three 32-bit errors can exceed 2^32 with 32-bit samples).
-uint wpErrorWeight(uint64_t x, uint maxweight) {
-    const uint64_t x1 = x + 1;
-    const uint hi = uint(x1 >> 32), lo = uint(x1);
-    int shift = int(hi != 0 ? 32 + firstbithigh(hi) : firstbithigh(lo)) - 5;
+/// ErrorWeight: libjxl sums the three uint32 errors (wrapping) and takes FloorLog2Nonzero
+/// of the 64-bit x + 1; x itself fits 32 bits, so only x = 0xFFFFFFFF needs the wide case.
+uint wpErrorWeight(uint x, uint maxweight) {
+    int shift = (x == 0xFFFFFFFFu ? 32 : int(firstbithigh(x + 1))) - 5;
     if (shift < 0) shift = 0;
-    return 4 + uint((uint64_t(maxweight) * uint64_t(kWpDivLookup[uint(x >> shift)])) >> shift);
+    const uint div = gWpDiv[shift >= 32 ? 0 : (x >> shift)];
+    return 4 + uint((uint64_t(maxweight) * uint64_t(div)) >> shift);
 }
-
-int64_t wpWeightedAverage(int64_t p[4], uint w[4]) {
-    uint weightSum = 0;
-    for (uint i = 0; i < 4; ++i) weightSum += w[i];
-    const uint logWeight = firstbithigh(weightSum);
-    weightSum = 0;
-    for (uint i = 0; i < 4; ++i) {
-        w[i] >>= (logWeight - 4);
-        weightSum += w[i];
-    }
-    int64_t sum = int64_t(weightSum >> 1) - 1;
-    for (uint i = 0; i < 4; ++i) sum += p[i] * int64_t(w[i]);
-    return (sum * int64_t(kWpDivLookup[weightSum - 1])) >> 24;
-}
-
-int64_t wpAddBits(int64_t x) { return x << kWpExtraBits; }
-
-/// Predict<compute_properties=true>: the prediction, and the WP property.
-int64_t wpPredict(inout WpState s, uint x, uint y, int64_t N, int64_t W, int64_t NE, int64_t NW, int64_t NN, out int wpProp) {
-    const uint xsize = s.xsize;
-    const uint curRow = (y & 1) != 0 ? 0 : (xsize + 2);
-    const uint prevRow = (y & 1) != 0 ? (xsize + 2) : 0;
-    const uint posN = prevRow + x;
-    const uint posNE = x < xsize - 1 ? posN + 1 : posN;
-    const uint posNW = x > 0 ? posN - 1 : posN;
-    const uint rowLen = (xsize + 2) * 2;
-    uint weights[4];
-    const uint hw[4] = {s.header.w0, s.header.w1, s.header.w2, s.header.w3};
-    for (uint i = 0; i < 4; ++i) {
-        // libjxl sums the three error rows in uint32 (wrapping), then widens.
-        const uint sum = arena[s.predErrors + i * rowLen + posN] + arena[s.predErrors + i * rowLen + posNE] + arena[s.predErrors + i * rowLen + posNW];
-        weights[i] = wpErrorWeight(uint64_t(sum), hw[i]);
-    }
-    N = wpAddBits(N);
-    W = wpAddBits(W);
-    NE = wpAddBits(NE);
-    NW = wpAddBits(NW);
-    NN = wpAddBits(NN);
-    const int64_t teW = x == 0 ? 0 : int64_t(int(arena[s.error + curRow + x - 1]));
-    const int64_t teN = int64_t(int(arena[s.error + posN]));
-    const int64_t teNW = int64_t(int(arena[s.error + posNW]));
-    const int64_t sumWN = teN + teW;
-    const int64_t teNE = int64_t(int(arena[s.error + posNE]));
-    {
-        int64_t p = teW;
-        if (abs(teN) > abs(p)) p = teN;
-        if (abs(teNW) > abs(p)) p = teNW;
-        if (abs(teNE) > abs(p)) p = teNE;
-        wpProp = int(p);
-    }
-    s.prediction[0] = W + NE - N;
-    s.prediction[1] = N - (((sumWN + teNE) * int64_t(s.header.p1C)) >> 5);
-    s.prediction[2] = W - (((sumWN + teNW) * int64_t(s.header.p2C)) >> 5);
-    s.prediction[3] = N - ((teNW * int64_t(s.header.p3Ca) + teN * int64_t(s.header.p3Cb) + teNE * int64_t(s.header.p3Cc) +
-                            (NN - N) * int64_t(s.header.p3Cd) + (NW - W) * int64_t(s.header.p3Ce)) >> 5);
-    s.pred = wpWeightedAverage(s.prediction, weights);
-    if (((teN ^ teW) | (teN ^ teNW)) > 0) {
-        return (s.pred + kWpRound) >> kWpExtraBits;
-    }
-    const int64_t mx = max(W, max(NE, N));
-    const int64_t mn = min(W, min(NE, N));
-    s.pred = max(mn, min(mx, s.pred));
-    return (s.pred + kWpRound) >> kWpExtraBits;
-}
-
-void wpUpdateErrors(inout WpState s, int64_t val, uint x, uint y) {
-    const uint xsize = s.xsize;
-    const uint curRow = (y & 1) != 0 ? 0 : (xsize + 2);
-    const uint prevRow = (y & 1) != 0 ? (xsize + 2) : 0;
-    const uint rowLen = (xsize + 2) * 2;
-    val = wpAddBits(val);
-    arena[s.error + curRow + x] = uint(int(s.pred - val));
-    for (uint i = 0; i < 4; ++i) {
-        const uint err = uint((abs(s.prediction[i] - val) + kWpRound) >> kWpExtraBits);
-        arena[s.predErrors + i * rowLen + curRow + x] = err;
-        arena[s.predErrors + i * rowLen + prevRow + x + 1] += err;
-    }
-}
-
-// --- predictors ------------------------------------------------------------------------
-
-/// ClampedGradient in libjxl's 64-bit pixel arithmetic (pixel_type_w): 32-bit samples
-/// (float bit patterns) overflow the 32-bit form, and the result is truncated only when stored.
-int64_t clampedGradient(int64_t n, int64_t w, int64_t l) {
-    const int64_t m = min(n, w);
-    const int64_t M = max(n, w);
-    const int64_t grad = n + w - l;
-    const int64_t gradClampM = (l < m) ? M : grad;
-    return (l > M) ? m : gradClampM;
-}
-
-int64_t selectPredictor(int64_t a, int64_t b, int64_t c) {
-    const int64_t p = a + b - c;
-    const int64_t pa = abs(p - a);
-    const int64_t pb = abs(p - b);
-    return pa < pb ? a : b;
-}
-
-int64_t predictOne(uint p, int64_t left, int64_t top, int64_t toptop, int64_t topleft, int64_t topright, int64_t leftleft,
-                   int64_t toprightright, int64_t wpPred) {
-    switch (p) {
-    case kPredZero: return 0;
-    case kPredLeft: return left;
-    case kPredTop: return top;
-    case kPredSelect: return selectPredictor(left, top, topleft);
-    case kPredWeighted: return wpPred;
-    case kPredGradient: return clampedGradient(left, top, topleft);
-    case kPredTopLeft: return topleft;
-    case kPredTopRight: return topright;
-    case kPredLeftLeft: return leftleft;
-    case kPredAverage0: return (left + top) / 2;
-    case kPredAverage1: return (left + topleft) / 2;
-    case kPredAverage2: return (topleft + top) / 2;
-    case kPredAverage3: return (top + topright) / 2;
-    case kPredAverage4: return (6 * top - 2 * toptop + 7 * left + 1 * leftleft + 1 * toprightright + 3 * topright + 8) / 16;
-    default: return 0;
-    }
-}
+static const int kWpRound = ((1 << kWpExtraBits) >> 1) - 1;
 
 // --- MA tree --------------------------------------------------------------------------
 
@@ -655,106 +523,24 @@ struct ChannelDecodeArgs {
     uint streamId;
 };
 
-/// DecodeModularChannelMAANS in its general form.
+
+/// Samples beyond 16 bits (floats, 24/32-bit ints) take the 64-bit variant (set per kernel from its params).
+groupshared uint gWideSamples;
+
+#define PIXW int
+#define WPX(name) name##32
+#include "sjxl/dec/modular_channel.slangh"
+#undef PIXW
+#undef WPX
+#define PIXW int64_t
+#define WPX(name) name##64
+#include "sjxl/dec/modular_channel.slangh"
+#undef PIXW
+#undef WPX
+
 void decodeChannel(inout Dec d, inout SymReader r, Tree tree, WpHeader wpHeader, ChannelDecodeArgs a) {
-    const Channel ch = loadChannel(a.chansOff, a.chan);
-    if (ch.w == 0 || ch.h == 0) return;
-    const uint ctxMapOff = csField(tree.codeSet, kCsCtxMapOff);
-    // Reference channels: earlier ones with the same shape, nearest first.
-    uint refs[kMaxChannels];
-    uint numRefs = 0;
-    for (int j = int(a.chan) - 1; j >= 0; --j) {
-        const Channel cj = loadChannel(a.chansOff, uint(j));
-        if (cj.w == ch.w && cj.h == ch.h && cj.hshift == ch.hshift && cj.vshift == ch.vshift) {
-            refs[numRefs++] = uint(j);
-        }
-    }
-    // Which properties the tree reads, so the per-pixel work is only what it needs.
-    uint maxProp = 0;
-    for (uint n = 0; n < tree.numNodes; ++n) {
-        const int p = int(arena[tree.nodes + n * kTreeWords]);
-        if (p >= 0) maxProp = max(maxProp, uint(p) + 1);
-    }
-    const bool singleLeaf = tree.numNodes == 1;
-    WpState wp;
-    if (tree.usesWp) {
-        wp = wpCreate(d, wpHeader, ch.w);
-        if (d.error != kErrNone) return;
-    }
-    const uint propsOff = alloc(d, kMaxProperties);
-    if (d.error != kErrNone) return;
-    arena[propsOff + 0] = a.chan;
-    arena[propsOff + 1] = a.streamId;
-    for (uint y = 0; y < ch.h; ++y) {
-        arena[propsOff + 2] = y;
-        arena[propsOff + 9] = 0;
-        for (uint x = 0; x < ch.w; ++x) {
-            const int left = x > 0 ? px(ch, x - 1, y) : (y > 0 ? px(ch, x, y - 1) : 0);
-            const int top = y > 0 ? px(ch, x, y - 1) : left;
-            const int topleft = (x > 0 && y > 0) ? px(ch, x - 1, y - 1) : left;
-            const int topright = (x + 1 < ch.w && y > 0) ? px(ch, x + 1, y - 1) : top;
-            const int leftleft = x > 1 ? px(ch, x - 2, y) : left;
-            const int toptop = y > 1 ? px(ch, x, y - 2) : top;
-            const int toprightright = (x + 2 < ch.w && y > 0) ? px(ch, x + 2, y - 1) : topright;
-            if (!singleLeaf) {
-                arena[propsOff + 3] = x;
-                arena[propsOff + 4] = uint(int(abs(int64_t(top))));
-                arena[propsOff + 5] = uint(int(abs(int64_t(left))));
-                arena[propsOff + 6] = uint(top);
-                arena[propsOff + 7] = uint(left);
-                arena[propsOff + 8] = uint(left - int(arena[propsOff + 9]));
-                arena[propsOff + 9] = uint(left + top - topleft);
-                arena[propsOff + 10] = uint(left - topleft);
-                arena[propsOff + 11] = uint(topleft - top);
-                arena[propsOff + 12] = uint(top - topright);
-                arena[propsOff + 13] = uint(top - toptop);
-                arena[propsOff + 14] = uint(left - leftleft);
-            }
-            int64_t wpPred = 0;
-            if (tree.usesWp) {
-                int wpProp;
-                wpPred = wpPredict(wp, x, y, int64_t(top), int64_t(left), int64_t(topright), int64_t(topleft), int64_t(toptop), wpProp);
-                arena[propsOff + 15] = uint(wpProp);
-            }
-            if (!singleLeaf && maxProp > kNumNonrefProperties) {
-                uint off = kNumNonrefProperties;
-                for (uint k = 0; k < numRefs && off + 4 <= kMaxProperties; ++k) {
-                    const Channel cj = loadChannel(a.chansOff, refs[k]);
-                    const int v = px(cj, x, y);
-                    const int vleft = x > 0 ? px(cj, x - 1, y) : 0;
-                    const int vtop = y > 0 ? px(cj, x, y - 1) : vleft;
-                    const int vtopleft = (x > 0 && y > 0) ? px(cj, x - 1, y - 1) : vleft;
-                    const int64_t vpred = clampedGradient(int64_t(vleft), int64_t(vtop), int64_t(vtopleft));   // PrecomputeReferences: 64-bit, truncated when stored
-                    arena[propsOff + off + 0] = uint(int(abs(int64_t(v))));
-                    arena[propsOff + off + 1] = uint(v);
-                    arena[propsOff + off + 2] = uint(int(abs(int64_t(v) - vpred)));
-                    arena[propsOff + off + 3] = uint(int(int64_t(v) - vpred));
-                    off += 4;
-                }
-            }
-            // Tree walk: property > splitval takes the left child.
-            uint node = 0;
-            for (;;) {
-                const uint n = tree.nodes + node * kTreeWords;
-                const int p = int(arena[n]);
-                if (p < 0) break;
-                const int v = uint(p) < kMaxProperties ? int(arena[propsOff + uint(p)]) : 0;
-                node = v > int(arena[n + 1]) ? arena[n + 2] : arena[n + 3];
-            }
-            const uint n = tree.nodes + node * kTreeWords;
-            const uint predictor = arena[n + 4];
-            const int offset = int(arena[n + 5]);
-            const int multiplier = int(arena[n + 6]);
-            const uint ctx = arena[n + 7];
-            const int64_t guess = int64_t(offset) + predictOne(predictor, int64_t(left), int64_t(top), int64_t(toptop), int64_t(topleft),
-                                                               int64_t(topright), int64_t(leftleft), int64_t(toprightright), wpPred);
-            const uint token = readHybridUint(d, r, ctx);
-            const int64_t value = int64_t(unpackSignedInt(token)) * int64_t(multiplier) + guess;
-            setPx(ch, x, y, int(value));
-            if (tree.usesWp) wpUpdateErrors(wp, int64_t(int(value)), x, y);   // the stored (truncated) sample, as libjxl's UpdateErrors(r[x])
-            if (d.error != kErrNone) return;
-        }
-    }
+    if (gWideSamples != 0) decodeChannel64(d, r, tree, wpHeader, a);
+    else decodeChannel32(d, r, tree, wpHeader, a);
 }
 
 // --- inverse transforms ----------------------------------------------------------------
@@ -889,9 +675,9 @@ void invPalette(inout Dec d, uint off, uint chansOff, inout uint numChannels, in
         for (uint i = 0; i < w * h; ++i) arena[idx.data + i] = arena[indices.data + i];
         for (uint c = 0; c < nb; ++c) {
             const Channel channel = loadChannel(chansOff, c0 + c);
-            WpState wp;
+            WpState64 wp;
             if (predictor == kPredWeighted) {
-                wp = wpCreate(d, wpHeader, w);
+                wp = wpCreate64(d, wpHeader, w);
                 if (d.error != kErrNone) return;
             }
             for (uint y = 0; y < h; ++y) {
@@ -908,15 +694,15 @@ void invPalette(inout Dec d, uint off, uint chansOff, inout uint numChannels, in
                     int64_t wpPred = 0;
                     if (predictor == kPredWeighted) {
                         int unused;
-                        wpPred = wpPredict(wp, x, y, int64_t(top), int64_t(left), int64_t(topright), int64_t(topleft), int64_t(toptop), unused);
+                        wpPred = wpPredict64(wp, x, y, int64_t(top), int64_t(left), int64_t(topright), int64_t(topleft), int64_t(toptop), unused);
                     }
                     int64_t val = entry;
                     if (index < int(nbDeltas)) {
-                        val += predictOne(predictor, int64_t(left), int64_t(top), int64_t(toptop), int64_t(topleft), int64_t(topright),
+                        val += predictOne64(predictor, int64_t(left), int64_t(top), int64_t(toptop), int64_t(topleft), int64_t(topright),
                                           int64_t(leftleft), int64_t(toprightright), wpPred);
                     }
                     setPx(channel, x, y, int(val));
-                    if (predictor == kPredWeighted) wpUpdateErrors(wp, val, x, y);
+                    if (predictor == kPredWeighted) wpUpdateErrors64(wp, val, x, y);
                 }
             }
         }

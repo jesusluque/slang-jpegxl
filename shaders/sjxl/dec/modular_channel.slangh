@@ -1,0 +1,343 @@
+// Copyright (c) 2026 jesus luque.
+//
+// The weighted predictor, the predictors and the channel decode loop, written
+// once over PIXW (libjxl's pixel_type_w) and included twice by modular.slangh:
+// PIXW = int for samples up to 16 bits (every intermediate fits, and 32-bit
+// arithmetic is several times cheaper on a GPU thread), PIXW = int64_t for
+// 24/32-bit samples (float bit patterns), exactly libjxl's semantics. WPX(name)
+// suffixes the variant's names.
+/// weighted::State: four prediction error rows and the error row. They live in
+/// threadgroup memory when they fit (channels up to 766 wide: every sample reads
+/// and writes them a dozen times, and a single thread pays each global access in
+/// full), else in the arena.
+
+struct WPX(WpState) {
+    WpHeader header;
+    uint xsize;
+    uint rowLen;       // (xsize + 2) * 2
+    bool shared;       // rows in gWp: predErrors at [0, 4 rowLen), error at [4 rowLen, 5 rowLen)
+    uint predErrors;   // arena offsets when not shared
+    uint error;
+    PIXW prediction[4];
+    PIXW pred;
+    uint wpw[4], wp0[4], wp1[4];   // the previous row's prediction errors at x - 1, x, x + 1
+    int  wew, we0, we1;            // the previous row's errors at x - 1, x, x + 1
+    int  teWprev;                  // this row's error at x - 1
+};
+
+// The row accessors take scalars, not the state (a struct passed by value is copied at every call).
+uint WPX(wpPe)(bool shared, uint base, uint idx) { return shared ? gWp[idx] : arena[base + idx]; }
+void WPX(wpPeSet)(bool shared, uint base, uint idx, uint v) { if (shared) gWp[idx] = v; else arena[base + idx] = v; }
+void WPX(wpPeAdd)(bool shared, uint base, uint idx, uint v) { if (shared) gWp[idx] += v; else arena[base + idx] += v; }
+int WPX(wpErr)(bool shared, uint errBase, uint idx) { return int(shared ? gWp[errBase + idx] : arena[errBase + idx]); }
+void WPX(wpErrSet)(bool shared, uint errBase, uint idx, int v) { if (shared) gWp[errBase + idx] = uint(v); else arena[errBase + idx] = uint(v); }
+
+WPX(WpState) WPX(wpCreate)(inout Dec d, WpHeader header, uint xsize) {
+    WPX(WpState) s;
+    s.header = header;
+    s.xsize = xsize;
+    const uint rowLen = (xsize + 2) * 2;
+    s.rowLen = rowLen;
+    s.shared = 5 * rowLen <= kWpSharedWords;
+    s.predErrors = 0;
+    s.error = 0;
+    if (s.shared) {
+        for (uint i = 0; i < 5 * rowLen; ++i) gWp[i] = 0;
+    } else {
+        s.predErrors = alloc(d, 4 * rowLen);
+        s.error = alloc(d, rowLen);
+        for (uint i = 0; i < 4 * rowLen; ++i) arena[s.predErrors + i] = 0;
+        for (uint i = 0; i < rowLen; ++i) arena[s.error + i] = 0;
+    }
+    for (uint i = 0; i < 64; ++i) gWpDiv[i] = kWpDivLookup[i];
+    s.prediction[0] = s.prediction[1] = s.prediction[2] = s.prediction[3] = 0;
+    s.pred = 0;
+    return s;
+}
+
+/// ErrorWeight: FloorLog2Nonzero of the 64-bit sum (three 32-bit errors can exceed 2^32 with 32-bit samples).
+
+PIXW WPX(wpWeightedAverage)(PIXW p[4], uint w[4]) {
+    uint weightSum = 0;
+    [ForceUnroll]
+    for (uint i = 0; i < 4; ++i) weightSum += w[i];
+    const uint logWeight = firstbithigh(weightSum);
+    weightSum = 0;
+    [ForceUnroll]
+    for (uint i = 0; i < 4; ++i) {
+        w[i] >>= (logWeight - 4);
+        weightSum += w[i];
+    }
+    PIXW sum = PIXW(weightSum >> 1) - 1;
+    [ForceUnroll]
+    for (uint i = 0; i < 4; ++i) sum += p[i] * PIXW(w[i]);
+    return PIXW((int64_t(sum) * int64_t(gWpDiv[weightSum - 1])) >> 24);   // the one product beyond 32 bits
+}
+
+PIXW WPX(wpAddBits)(PIXW x) { return x << kWpExtraBits; }
+
+/// Predict<compute_properties=true>: the prediction, and the WP property. The
+/// three previous-row values each predictor error row and the error row need
+/// (x - 1, x, x + 1) ride in registers along the row; one value per row is loaded
+/// per pixel and the current row's values are only stored.
+PIXW WPX(wpPredict)(inout WPX(WpState) s, uint x, uint y, PIXW N, PIXW W, PIXW NE, PIXW NW, PIXW NN, out int wpProp) {
+    const uint xsize = s.xsize;
+    const uint rowLen = s.rowLen;
+    const bool sh = s.shared;
+    const uint peBase = s.predErrors, errBase = sh ? 4 * rowLen : s.error;
+    const uint prevRow = (y & 1) != 0 ? (xsize + 2) : 0;
+    if (x == 0) {   // the row's windows: prev[0] and prev[1]
+        [ForceUnroll]
+        for (uint i = 0; i < 4; ++i) {
+            s.wp0[i] = WPX(wpPe)(sh, peBase, i * rowLen + prevRow);
+            s.wp1[i] = WPX(wpPe)(sh, peBase, i * rowLen + prevRow + 1);
+            s.wpw[i] = 0;
+        }
+        s.we0 = WPX(wpErr)(sh, errBase, prevRow);
+        s.we1 = WPX(wpErr)(sh, errBase, prevRow + 1);
+        s.wew = 0;
+        s.teWprev = 0;
+    }
+    const bool hasNE = x < xsize - 1;
+    uint weights[4];
+    [ForceUnroll]
+    for (uint i = 0; i < 4; ++i) {
+        // libjxl sums the three error rows in uint32 (wrapping), then widens.
+        const uint pNW = x > 0 ? s.wpw[i] : s.wp0[i];
+        const uint pNE = hasNE ? s.wp1[i] : s.wp0[i];
+        const uint sum = s.wp0[i] + pNE + pNW;
+        weights[i] = wpErrorWeight(sum, i == 0 ? s.header.w0 : i == 1 ? s.header.w1 : i == 2 ? s.header.w2 : s.header.w3);
+    }
+    N = WPX(wpAddBits)(N);
+    W = WPX(wpAddBits)(W);
+    NE = WPX(wpAddBits)(NE);
+    NW = WPX(wpAddBits)(NW);
+    NN = WPX(wpAddBits)(NN);
+    const PIXW teW = x == 0 ? PIXW(0) : PIXW(s.teWprev);
+    const PIXW teN = PIXW(s.we0);
+    const PIXW teNW = PIXW(x > 0 ? s.wew : s.we0);
+    const PIXW sumWN = teN + teW;
+    const PIXW teNE = PIXW(hasNE ? s.we1 : s.we0);
+    {
+        PIXW p = teW;
+        if (abs(teN) > abs(p)) p = teN;
+        if (abs(teNW) > abs(p)) p = teNW;
+        if (abs(teNE) > abs(p)) p = teNE;
+        wpProp = int(p);
+    }
+    s.prediction[0] = W + NE - N;
+    s.prediction[1] = N - (((sumWN + teNE) * PIXW(s.header.p1C)) >> 5);
+    s.prediction[2] = W - (((sumWN + teNW) * PIXW(s.header.p2C)) >> 5);
+    s.prediction[3] = N - ((teNW * PIXW(s.header.p3Ca) + teN * PIXW(s.header.p3Cb) + teNE * PIXW(s.header.p3Cc) +
+                            (NN - N) * PIXW(s.header.p3Cd) + (NW - W) * PIXW(s.header.p3Ce)) >> 5);
+    s.pred = WPX(wpWeightedAverage)(s.prediction, weights);
+    if (((teN ^ teW) | (teN ^ teNW)) > 0) {
+        return (s.pred + kWpRound) >> kWpExtraBits;
+    }
+    const PIXW mx = max(W, max(NE, N));
+    const PIXW mn = min(W, min(NE, N));
+    s.pred = max(mn, min(mx, s.pred));
+    return (s.pred + kWpRound) >> kWpExtraBits;
+}
+
+void WPX(wpUpdateErrors)(inout WPX(WpState) s, PIXW val, uint x, uint y) {
+    const uint xsize = s.xsize;
+    const uint rowLen = s.rowLen;
+    const bool sh = s.shared;
+    const uint peBase = s.predErrors, errBase = sh ? 4 * rowLen : s.error;
+    const uint curRow = (y & 1) != 0 ? 0 : (xsize + 2);
+    const uint prevRow = (y & 1) != 0 ? (xsize + 2) : 0;
+    val = WPX(wpAddBits)(val);
+    const int curErr = int(s.pred - val);
+    WPX(wpErrSet)(sh, errBase, curRow + x, curErr);
+    [ForceUnroll]
+    for (uint i = 0; i < 4; ++i) {
+        const uint err = uint((abs(s.prediction[i] - val) + kWpRound) >> kWpExtraBits);
+        WPX(wpPeSet)(sh, peBase, i * rowLen + curRow + x, err);
+        // prev[x + 1] += err: only this row reads it again, through the window.
+        s.wp1[i] += err;
+        s.wpw[i] = s.wp0[i];
+        s.wp0[i] = s.wp1[i];
+        s.wp1[i] = WPX(wpPe)(sh, peBase, i * rowLen + prevRow + x + 2);
+    }
+    s.wew = s.we0;
+    s.we0 = s.we1;
+    s.we1 = WPX(wpErr)(sh, errBase, prevRow + x + 2);
+    s.teWprev = curErr;
+}
+
+// --- predictors ------------------------------------------------------------------------
+
+/// ClampedGradient in libjxl's 64-bit pixel arithmetic (pixel_type_w): 32-bit samples
+/// (float bit patterns) overflow the 32-bit form, and the result is truncated only when stored.
+PIXW WPX(clampedGradient)(PIXW n, PIXW w, PIXW l) {
+    const PIXW m = min(n, w);
+    const PIXW M = max(n, w);
+    const PIXW grad = n + w - l;
+    const PIXW gradClampM = (l < m) ? M : grad;
+    return (l > M) ? m : gradClampM;
+}
+
+PIXW WPX(selectPredictor)(PIXW a, PIXW b, PIXW c) {
+    const PIXW p = a + b - c;
+    const PIXW pa = abs(p - a);
+    const PIXW pb = abs(p - b);
+    return pa < pb ? a : b;
+}
+
+PIXW WPX(predictOne)(uint p, PIXW left, PIXW top, PIXW toptop, PIXW topleft, PIXW topright, PIXW leftleft,
+                   PIXW toprightright, PIXW wpPred) {
+    switch (p) {
+    case kPredZero: return 0;
+    case kPredLeft: return left;
+    case kPredTop: return top;
+    case kPredSelect: return WPX(selectPredictor)(left, top, topleft);
+    case kPredWeighted: return wpPred;
+    case kPredGradient: return WPX(clampedGradient)(left, top, topleft);
+    case kPredTopLeft: return topleft;
+    case kPredTopRight: return topright;
+    case kPredLeftLeft: return leftleft;
+    case kPredAverage0: return (left + top) / 2;
+    case kPredAverage1: return (left + topleft) / 2;
+    case kPredAverage2: return (topleft + top) / 2;
+    case kPredAverage3: return (top + topright) / 2;
+    case kPredAverage4: return (6 * top - 2 * toptop + 7 * left + 1 * leftleft + 1 * toprightright + 3 * topright + 8) / 16;
+    default: return 0;
+    }
+}
+
+
+/// DecodeModularChannelMAANS in its general form.
+void WPX(decodeChannel)(inout Dec d, inout SymReader r, Tree tree, WpHeader wpHeader, ChannelDecodeArgs a) {
+    const Channel ch = loadChannel(a.chansOff, a.chan);
+    if (ch.w == 0 || ch.h == 0) return;
+    const uint ctxMapOff = csField(tree.codeSet, kCsCtxMapOff);
+    // Reference channels: earlier ones with the same shape, nearest first.
+    uint refs[kMaxChannels];
+    uint numRefs = 0;
+    for (int j = int(a.chan) - 1; j >= 0; --j) {
+        const Channel cj = loadChannel(a.chansOff, uint(j));
+        if (cj.w == ch.w && cj.h == ch.h && cj.hshift == ch.hshift && cj.vshift == ch.vshift) {
+            refs[numRefs++] = uint(j);
+        }
+    }
+    const bool singleLeaf = tree.numNodes == 1;
+    const bool treeShared = tree.numNodes <= kTreeSharedNodes;
+    if (treeShared) {
+        for (uint n = 0; n < tree.numNodes; ++n) {
+            const uint b = tree.nodes + n * kTreeWords;
+            const int p = int(arena[b]);
+            gTree4[n] = p >= 0 ? uint4(uint(p), arena[b + 1], arena[b + 2] | (arena[b + 3] << 16), 0u)
+                               : uint4(uint(p), arena[b + 5], arena[b + 6], arena[b + 4] | (arena[b + 7] << 8));
+        }
+    }
+    WPX(WpState) wp;
+    if (tree.usesWp) {
+        wp = WPX(wpCreate)(d, wpHeader, ch.w);
+        if (d.error != kErrNone) return;
+    }
+    for (uint y = 0; y < ch.h; ++y) {
+        int prevGrad = 0;   // property 9 of the previous pixel (property 8 is left minus it)
+        // The neighbourhood slides along the row: the two samples decoded before (left,
+        // leftleft) and three of the row above (T = top, TR, TRR) move over; one sample of
+        // the row above and one of the row two up are loaded per pixel.
+        int cur = 0, curPrev = 0;
+        int T = y > 0 ? px(ch, 0, y - 1) : 0;
+        int TR = (y > 0 && ch.w > 1) ? px(ch, 1, y - 1) : T;
+        int TRR = (y > 0 && ch.w > 2) ? px(ch, 2, y - 1) : TR;
+        int Tprev = 0;
+        for (uint x = 0; x < ch.w; ++x) {
+            const int left = x > 0 ? cur : (y > 0 ? T : 0);
+            const int top = y > 0 ? T : left;
+            const int topleft = (x > 0 && y > 0) ? Tprev : left;
+            const int topright = (x + 1 < ch.w && y > 0) ? TR : top;
+            const int leftleft = x > 1 ? curPrev : left;
+            const int toptop = y > 1 ? px(ch, x, y - 2) : top;
+            const int toprightright = (x + 2 < ch.w && y > 0) ? TRR : topright;
+            PIXW wpPred = 0;
+            int wpProp = 0;
+            if (tree.usesWp && (gPerfSkip & 1) == 0) {
+                wpPred = WPX(wpPredict)(wp, x, y, PIXW(top), PIXW(left), PIXW(topright), PIXW(topleft), PIXW(toptop), wpProp);
+            }
+            // Tree walk: property > splitval takes the left child. Properties are computed
+            // on demand for the node at hand (no property table in memory); the ones over
+            // kNumNonrefProperties come from the reference channels (PrecomputeReferences,
+            // 64-bit arithmetic truncated when stored).
+            uint node = 0;
+            uint4 nd;
+            for (;;) {
+                nd = treeShared ? gTree4[node] : uint4(arena[tree.nodes + node * kTreeWords], arena[tree.nodes + node * kTreeWords + 1],
+                                                       arena[tree.nodes + node * kTreeWords + 2] | (arena[tree.nodes + node * kTreeWords + 3] << 16), 0u);
+                const int p = int(nd.x);
+                if (p < 0) break;
+                if ((gPerfSkip & 2) != 0) { node = nd.z & 0xFFFFu; continue; }
+                int v = 0;
+                switch (uint(p)) {
+                case 0: v = int(a.chan); break;
+                case 1: v = int(a.streamId); break;
+                case 2: v = int(y); break;
+                case 3: v = int(x); break;
+                case 4: v = int(abs(PIXW(top))); break;
+                case 5: v = int(abs(PIXW(left))); break;
+                case 6: v = top; break;
+                case 7: v = left; break;
+                case 8: v = left - prevGrad; break;
+                case 9: v = left + top - topleft; break;
+                case 10: v = left - topleft; break;
+                case 11: v = topleft - top; break;
+                case 12: v = top - topright; break;
+                case 13: v = top - toptop; break;
+                case 14: v = left - leftleft; break;
+                case 15: v = wpProp; break;
+                default: {
+                    const uint k = (uint(p) - kNumNonrefProperties) / 4;
+                    if (k < numRefs) {
+                        const Channel cj = loadChannel(a.chansOff, refs[k]);
+                        const int rv = px(cj, x, y);
+                        const uint which = (uint(p) - kNumNonrefProperties) % 4;
+                        if (which == 0) v = int(abs(PIXW(rv)));
+                        else if (which == 1) v = rv;
+                        else {
+                            const int vleft = x > 0 ? px(cj, x - 1, y) : 0;
+                            const int vtop = y > 0 ? px(cj, x, y - 1) : vleft;
+                            const int vtopleft = (x > 0 && y > 0) ? px(cj, x - 1, y - 1) : vleft;
+                            const PIXW vpred = WPX(clampedGradient)(PIXW(vleft), PIXW(vtop), PIXW(vtopleft));
+                            v = which == 2 ? int(abs(PIXW(rv) - vpred)) : int(PIXW(rv) - vpred);
+                        }
+                    }
+                }
+                }
+                node = v > int(nd.y) ? (nd.z & 0xFFFFu) : (nd.z >> 16);
+            }
+            prevGrad = left + top - topleft;
+            uint predictor, ctx;
+            int offset, multiplier;
+            if (treeShared) {
+                predictor = nd.w & 0xFFu;
+                offset = int(nd.y);
+                multiplier = int(nd.z);
+                ctx = nd.w >> 8;
+            } else {
+                const uint n = tree.nodes + node * kTreeWords;
+                predictor = arena[n + 4];
+                offset = int(arena[n + 5]);
+                multiplier = int(arena[n + 6]);
+                ctx = arena[n + 7];
+            }
+            const PIXW guess = PIXW(offset) + WPX(predictOne)(predictor, PIXW(left), PIXW(top), PIXW(toptop), PIXW(topleft),
+                                                               PIXW(topright), PIXW(leftleft), PIXW(toprightright), wpPred);
+            const uint token = (gPerfSkip & 4) != 0 ? 0 : readHybridUint(d, r, ctx);
+            const PIXW value = PIXW(unpackSignedInt(token)) * PIXW(multiplier) + guess;
+            if ((gPerfSkip & 8) == 0) setPx(ch, x, y, int(value));
+            if (tree.usesWp && (gPerfSkip & 1) == 0) WPX(wpUpdateErrors)(wp, PIXW(int(value)), x, y);   // the stored (truncated) sample, as libjxl's UpdateErrors(r[x])
+            if (d.error != kErrNone) return;
+            curPrev = cur;
+            cur = int(value);
+            Tprev = T;
+            T = TR;
+            TR = TRR;
+            if (y > 0 && x + 3 < ch.w) TRR = px(ch, x + 3, y - 1);
+        }
+    }
+}
+

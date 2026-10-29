@@ -36,18 +36,27 @@ static const uint kErrAcLeftover = 6;     // an AC block ended with non-zeros ou
 static const uint kErrAnsState = 7;       // an ANS stream's final state is not the signature
 
 struct BitReader {
-    uint pos;   // absolute bit position in cs
-    uint end;   // one past the last readable bit
+    uint pos;        // absolute bit position in cs
+    uint end;        // one past the last readable bit
+    uint cacheWord;  // the word pair cs[cacheWord], cs[cacheWord + 1] held in c0, c1 (0xFFFFFFFF: none)
+    uint c0, c1;
 };
 
-/// n <= 32 bits at the reader, without consuming. Past the end reads zeros.
-uint brPeek(BitReader br, uint n) {
+/// n <= 32 bits at the reader, without consuming. Past the end reads zeros. The
+/// two words under the position are cached: a serial thread pays every load in
+/// full, and most reads stay within the cached pair.
+uint brPeek(inout BitReader br, uint n) {
     if (n == 0) return 0;
     const uint w = br.pos >> 5;
+    if (w != br.cacheWord) {
+        br.cacheWord = w;
+        br.c0 = cs[w];
+        br.c1 = cs[w + 1];
+    }
     const uint s = br.pos & 31;
-    uint v = cs[w] >> s;
+    uint v = br.c0 >> s;
     if (s + n > 32) {
-        v |= cs[w + 1] << (32 - s);
+        v |= br.c1 << (32 - s);
     }
     return n < 32 ? (v & ((1u << n) - 1)) : v;
 }
@@ -734,6 +743,23 @@ void inverseMtf(inout Dec d, uint mapOff, uint n) {
     }
 }
 
+/// SJXL_PERF_SKIP (timing experiments only, the output is wrong): bit 1 skips the
+/// weighted predictor, 2 the tree walk, 4 the symbol reads, 8 the sample stores,
+/// 16 the LZ77 window stores. Set by each section kernel from its params.
+groupshared uint gPerfSkip;
+
+/// A code set's context map, table offsets and uint configs in threadgroup memory
+/// when they fit: a single thread pays the full latency of every global load in a
+/// symbol's dependent chain, so the three per-symbol lookups move next to the ALU.
+static const uint kSharedCtxMap = 512, kSharedClusters = 32;
+groupshared uint gCtxMap[kSharedCtxMap];
+groupshared uint gTables[kSharedClusters];
+groupshared uint gConfigs[kSharedClusters];
+/// The ANS alias tables themselves (2 << logAlpha words per cluster) when the set's fit:
+/// the one load per symbol whose address depends on the state.
+static const uint kSharedAliasWords = 3584;
+groupshared uint gAlias[kSharedAliasWords];
+
 struct SymReader {
     uint codeSet;
     uint state;
@@ -741,6 +767,13 @@ struct SymReader {
     uint logEntrySize;
     uint entryMask;
     uint usePrefix;
+    // The code set's fields, read once (every symbol would otherwise reload them).
+    uint tablesOff;
+    uint configsOff;
+    uint ctxMapOff;
+    uint lz77;
+    uint sharedMaps;   // 1: the map, tables and configs are in gCtxMap / gTables / gConfigs
+    uint sharedAlias;  // 1: gTables holds offsets into gAlias, where the alias tables are
     // LZ77
     uint windowOff;    // arena offset of a kLz77WindowSize window, or 0xFFFFFFFF
     uint numDecoded;
@@ -927,6 +960,28 @@ SymReader makeSymReader(inout Dec d, uint codeSet, uint windowOff, uint distMul)
     r.codeSet = codeSet;
     r.usePrefix = csField(codeSet, kCsUsePrefix);
     r.logAlpha = csField(codeSet, kCsLogAlpha);
+    r.tablesOff = csField(codeSet, kCsTablesOff);
+    r.configsOff = csField(codeSet, kCsConfigsOff);
+    r.ctxMapOff = csField(codeSet, kCsCtxMapOff);
+    r.lz77 = csField(codeSet, kCsLz77Enabled);
+    const uint numContexts = csField(codeSet, kCsNumContexts), numClusters = csField(codeSet, kCsNumClusters);
+    r.sharedMaps = (numContexts <= kSharedCtxMap && numClusters <= kSharedClusters) ? 1u : 0u;
+    r.sharedAlias = 0;
+    if (r.sharedMaps != 0) {
+        for (uint i = 0; i < numContexts; ++i) gCtxMap[i] = arena[r.ctxMapOff + i];
+        const uint tableWords = 2u << r.logAlpha;
+        r.sharedAlias = (r.usePrefix == 0 && numClusters * tableWords <= kSharedAliasWords) ? 1u : 0u;
+        for (uint c = 0; c < numClusters; ++c) {
+            const uint tableOff = arena[r.tablesOff + c];
+            gConfigs[c] = arena[r.configsOff + c];
+            if (r.sharedAlias != 0) {
+                for (uint i = 0; i < tableWords; ++i) gAlias[c * tableWords + i] = arena[tableOff + i];
+                gTables[c] = c * tableWords;
+            } else {
+                gTables[c] = tableOff;
+            }
+        }
+    }
     if (r.usePrefix == 0) {
         r.state = brRead(d.br, 32);
         r.logEntrySize = kAnsLogTabSize - r.logAlpha;
@@ -948,15 +1003,15 @@ SymReader makeSymReader(inout Dec d, uint codeSet, uint windowOff, uint distMul)
 }
 
 uint readSymbol(inout Dec d, inout SymReader r, uint cluster) {
-    const uint tableOff = arena[csField(r.codeSet, kCsTablesOff) + cluster];
+    const uint tableOff = r.sharedMaps != 0 ? gTables[cluster] : arena[r.tablesOff + cluster];
     if (r.usePrefix != 0) {
         return readPrefixSymbol(d, tableOff);
     }
     const uint res = r.state & (kAnsTabSize - 1);
     const uint i = res >> r.logEntrySize;
     const uint pos = res & r.entryMask;
-    const uint w0 = arena[tableOff + 2 * i];
-    const uint w1 = arena[tableOff + 2 * i + 1];
+    const uint w0 = r.sharedAlias != 0 ? gAlias[tableOff + 2 * i] : arena[tableOff + 2 * i];
+    const uint w1 = r.sharedAlias != 0 ? gAlias[tableOff + 2 * i + 1] : arena[tableOff + 2 * i + 1];
     const uint cutoff = w0 & 0xFF;
     const uint right = (w0 >> 8) & 0xFF;
     const uint freq0 = w0 >> 16;
@@ -976,19 +1031,19 @@ uint readSymbol(inout Dec d, inout SymReader r, uint cluster) {
 
 /// ReadHybridUintClustered, LZ77 included.
 uint readHybridUintClustered(inout Dec d, inout SymReader r, uint cluster) {
-    const bool lz77 = csField(r.codeSet, kCsLz77Enabled) != 0;
+    const bool lz77 = r.lz77 != 0;
     if (lz77) {
         if (r.numToCopy > 0) {
             const uint ret = arena[r.windowOff + (r.copyPos & (kLz77WindowSize - 1))];
             ++r.copyPos;
             --r.numToCopy;
-            arena[r.windowOff + (r.numDecoded & (kLz77WindowSize - 1))] = ret;
+            if ((gPerfSkip & 16) == 0) arena[r.windowOff + (r.numDecoded & (kLz77WindowSize - 1))] = ret;
             ++r.numDecoded;
             return ret;
         }
     }
     const uint token = readSymbol(d, r, cluster);
-    const uint configsOff = csField(r.codeSet, kCsConfigsOff);
+    const uint configsOff = r.configsOff;
     if (lz77) {
         const uint threshold = csField(r.codeSet, kCsMinSymbol);
         if (token >= threshold) {
@@ -1018,21 +1073,21 @@ uint readHybridUintClustered(inout Dec d, inout SymReader r, uint cluster) {
             const uint ret = arena[r.windowOff + (r.copyPos & (kLz77WindowSize - 1))];
             ++r.copyPos;
             --r.numToCopy;
-            arena[r.windowOff + (r.numDecoded & (kLz77WindowSize - 1))] = ret;
+            if ((gPerfSkip & 16) == 0) arena[r.windowOff + (r.numDecoded & (kLz77WindowSize - 1))] = ret;
             ++r.numDecoded;
             return ret;
         }
     }
-    const uint ret = readHybridUintConfig(d, arena[configsOff + cluster], token);
+    const uint ret = readHybridUintConfig(d, (r.sharedMaps != 0 ? gConfigs[cluster] : arena[configsOff + cluster]), token);
     if (lz77) {
-        arena[r.windowOff + (r.numDecoded & (kLz77WindowSize - 1))] = ret;
+        if ((gPerfSkip & 16) == 0) arena[r.windowOff + (r.numDecoded & (kLz77WindowSize - 1))] = ret;
         ++r.numDecoded;
     }
     return ret;
 }
 
 uint readHybridUint(inout Dec d, inout SymReader r, uint ctx) {
-    return readHybridUintClustered(d, r, arena[csField(r.codeSet, kCsCtxMapOff) + ctx]);
+    return readHybridUintClustered(d, r, r.sharedMaps != 0 ? gCtxMap[ctx] : arena[r.ctxMapOff + ctx]);
 }
 
 bool checkFinalState(SymReader r) {

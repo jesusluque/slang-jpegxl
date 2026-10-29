@@ -38,7 +38,8 @@ cjxl in.png ref.jxl -d 1 -e 5 ; djxl out.jxl check.png      # Homebrew oracle (/
 - **Tests** are `sjxl_<area>_tests` (Catch2, `tests/CMakeLists.txt`, `sjxl_test`).
   They SKIP when no device opens and never fall back. `tests/support/TestDevice.h`
   gives one device and shader library per process.
-- **Environment**: `SJXL_BACKEND=metal,cuda,vulkan` (order to try),
+- **Environment**: `SJXL_TIMING=1` (per-stage times, encoder and decoder),
+  `SJXL_PERF_SKIP=bits` (decoder timing experiments), `SJXL_BACKEND=metal,cuda,vulkan` (order to try),
   `SJXL_GPU_VALIDATION=1` (debug layers), `SJXL_SHADER_DIR`, `SJXL_SHADER_CACHE`
   (default `~/Library/Caches/sjxl/shaders`).
 - **Toolchain**: Slang 2026.14.1 at `~/tools/slang` (`SLANG_ROOT`), slang-rhi

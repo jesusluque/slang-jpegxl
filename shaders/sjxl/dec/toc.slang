@@ -30,6 +30,7 @@ void decodeTocPermutation(uint3 tid: SV_DispatchThreadID) {
     Dec d;
     d.br.pos = params.tocBit;
     d.br.end = 0xFFFFFFFFu;
+    d.br.cacheWord = 0xFFFFFFFFu;
     d.base = kGsHeaderSize;
     d.top = d.base;
     d.cap = params.arenaCap - kLz77WindowSize;   // an LZ77 window at the top of the arena
@@ -72,6 +73,7 @@ void decodeIcc(uint3 tid: SV_DispatchThreadID) {
     Dec d;
     d.br.pos = params.tocBit;
     d.br.end = 0xFFFFFFFFu;
+    d.br.cacheWord = 0xFFFFFFFFu;
     d.base = kGsHeaderSize;
     d.top = d.base;
     d.cap = params.arenaCap - kLz77WindowSize;   // an LZ77 window at the top of the arena

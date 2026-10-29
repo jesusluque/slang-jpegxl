@@ -32,6 +32,7 @@ void decodeStream(uint3 tid: SV_DispatchThreadID) {
     Dec d;
     d.br.pos = params.startBit;
     d.br.end = params.endBit;
+    d.br.cacheWord = 0xFFFFFFFFu;
     d.base = 0;
     d.top = 0;
     d.cap = params.arenaWords;
