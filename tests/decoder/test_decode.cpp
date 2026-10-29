@@ -691,3 +691,63 @@ TEST_CASE("the encoder's DC frame feeds the VarDCT frame like djxl", "[encoder][
     CHECK(vsDjxl->maxAbsDiff <= 1);
     CHECK(vsSource->psnr >= 30.0);
 }
+
+namespace {
+
+/// A few-colour image: `numColors` colours in small blocks (what a palette is for).
+image::Rgb8 fewColourImage(uint32_t width, uint32_t height, uint32_t numColors, bool alpha) {
+    image::Rgb8 img;
+    img.width = width;
+    img.height = height;
+    img.channels = alpha ? 4 : 3;
+    img.bitDepth = 8;
+    img.pixels.resize(size_t{width} * height * img.channels);
+    uint32_t seed = 12345;
+    std::vector<std::array<uint8_t, 4>> colours(numColors);
+    for (auto& c : colours) {
+        for (uint8_t& v : c) { seed = seed * 1664525u + 1013904223u; v = static_cast<uint8_t>(seed >> 24); }
+        c[3] = (seed & 1) ? 255 : 128;
+    }
+    for (uint32_t y = 0; y < height; ++y) {
+        for (uint32_t x = 0; x < width; ++x) {
+            const auto& c = colours[((x / 7) * 3 + (y / 5) * 5 + (x * y) / 300) % numColors];
+            for (uint32_t k = 0; k < img.channels; ++k) img.pixels[(size_t{y} * width + x) * img.channels + k] = c[k];
+        }
+    }
+    return img;
+}
+
+}   // namespace
+
+TEST_CASE("lossless palettes decode bit-exact", "[encoder][decoder][conformance][lossless][palette]") {
+    const std::filesystem::path djxl = test::findTool("djxl");
+    if (djxl.empty()) SKIP("djxl is not installed");
+    // 16 colours over two groups (the palette in the global stream, the indices in the groups), 200 colours in one
+    // group, and 16 colours with alpha (a four-channel palette).
+    const auto [numColors, width, height, alpha] =
+        GENERATE(table<uint32_t, uint32_t, uint32_t, bool>({{16, 600, 300, false}, {200, 100, 80, false}, {16, 300, 200, true}}));
+    CAPTURE(numColors, width, height, alpha);
+    const image::Rgb8 source = fewColourImage(width, height, numColors, alpha);
+    enc::Options options;
+    options.lossless = true;
+    auto encoded = encoder().encode(source, options);
+    REQUIRE(encoded);
+    CHECK(encoder().stats().palette >= 2);
+    const std::filesystem::path jxl = test::scratchDir() / std::format("palette_{}_{}_{}.jxl", numColors, width, alpha);
+    const std::filesystem::path out = test::scratchDir() / std::format("palette_{}_{}_{}.djxl.png", numColors, width, alpha);
+    REQUIRE(image::writeFile(jxl, *encoded));
+    REQUIRE(test::run(std::format("\"{}\" \"{}\" \"{}\" >/dev/null 2>&1", djxl.string(), jxl.string(), out.string())));
+    auto reference = image::readImage(out);
+    REQUIRE(reference);
+    REQUIRE(reference->channels == source.channels);
+    auto vsDjxl = test::compare(source, *reference);
+    REQUIRE(vsDjxl);
+    auto ours = decoder().decode(*encoded);
+    REQUIRE(ours);
+    auto vsOurs = test::compare(source, *ours);
+    REQUIRE(vsOurs);
+    WARN(std::format("palette {} colours {}x{} alpha {}: {} bytes, {} palette entries", numColors, width, height, alpha, encoded->size(),
+                     encoder().stats().palette));
+    CHECK(vsDjxl->maxAbsDiff == 0);
+    CHECK(vsOurs->maxAbsDiff == 0);
+}

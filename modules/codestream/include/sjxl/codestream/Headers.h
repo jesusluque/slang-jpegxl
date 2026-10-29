@@ -49,7 +49,16 @@ void writeCodestreamHeadersRgb(BitWriter& w, uint32_t xsize, uint32_t ysize, uin
 /// A single-pass, full-frame, last Modular frame in RGB (no colour transform,
 /// group_size_shift 1, LoopFilter off) with `numExtraChannels` unsampled extra
 /// channels. Not byte-aligned on exit.
-void writeModularFrameHeader(BitWriter& w, uint32_t numExtraChannels, const FrameInfo& info = FrameInfo{});
+void writeModularFrameHeader(BitWriter& w, uint32_t numExtraChannels, const FrameInfo& info = FrameInfo{}, uint32_t groupSizeShift = 1);
+
+/// libjxl's modular group size (enc_frame.cc GetGroupSizeShift): 128 px groups
+/// up to 128 px, 256 up to 256, 512 up to 400 px, 256 beyond.
+[[nodiscard]] constexpr uint32_t modularGroupSizeShift(uint32_t xsize, uint32_t ysize) {
+    if (xsize <= 128 && ysize <= 128) return 0;
+    if (xsize <= 256 && ysize <= 256) return 1;
+    if (xsize <= 400 && ysize <= 400) return 2;
+    return 1;
+}
 
 struct FrameParams {
     bool     gaborish = true;      ///< LoopFilter.gab
@@ -70,7 +79,7 @@ struct FrameParams {
 
 /// The DC frame of a VarDCT frame: a Modular frame in XYB at 1/8 size (frame
 /// type kDCFrame, dc_level 1), no filters, not displayed. Not byte-aligned on exit.
-void writeDcFrameHeader(BitWriter& w);
+void writeDcFrameHeader(BitWriter& w, uint32_t groupSizeShift = 1);
 
 /// A single-pass, full-frame, last VarDCT frame in XYB. Not byte-aligned on exit.
 void writeFrameHeader(BitWriter& w, const FrameParams& params, uint32_t numExtraChannels = 0, const FrameInfo& info = FrameInfo{});

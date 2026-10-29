@@ -68,6 +68,8 @@ struct Stats {
     uint32_t              epfIters = 0;
     uint32_t              alphaPredictor = 0;   ///< lossy with alpha: 0 weighted, 1 gradient
     uint32_t              dcFrameBytes = 0;     ///< progressive DC: the DC frame (header, TOC, body)
+    uint32_t              palette = 0;          ///< lossless: colours of the palette over every channel (0: none)
+    uint32_t              compacted = 0;        ///< lossless: channels given a compaction palette
 };
 
 class Encoder {
@@ -91,11 +93,27 @@ private:
     /// already on the device): the frame header, TOC and body. `rct` writes the
     /// YCoCg RCT over channels 0..2 (the planes must hold its output); a DC frame
     /// (`dcQuant` set) is an XYB frame at 1/8 size scaled by those factors.
+    struct ModularChannel {
+        uint32_t width = 0, height = 0, offset = 0;   ///< samples in the planes buffer
+        bool     grouped = false;                     ///< coded in the group streams (else the global stream)
+    };
+    struct ModularTransform {
+        uint32_t id = 1, beginC = 0, numC = 1, nbColors = 0;   ///< id 1: palette (nb_deltas 0, predictor Zero)
+    };
     struct ModularSpec {
-        uint32_t width = 0, height = 0, channels = 3, bitDepth = 8;
-        bool     rct = true;
+        uint32_t width = 0, height = 0, bitDepth = 8;   ///< the image (the grouped channels' size)
+        uint32_t groupSizeShift = 1;                    ///< groups of 128 << shift px
+        std::vector<ModularChannel>  channels;          ///< meta channels first
+        std::vector<ModularTransform> transforms;       ///< the global transforms (palettes), in order
+        uint32_t nbMeta = 0;
+        bool     rct = false;          ///< an RCT per group over channels nbMeta..+2 (groupRct)
         bool     dcFrame = false;
         std::array<float, 3> dcQuant{};
+        [[nodiscard]] uint32_t totalSamples() const {
+            uint32_t n = 0;
+            for (const ModularChannel& c : channels) n += c.width * c.height;
+            return n;
+        }
     };
     [[nodiscard]] Result<std::vector<uint8_t>> encodeModularFrame(const ModularSpec& spec, const gpu::Buffer& planes, const Options& options,
                                                                   const codestream::FrameInfo& info, const gpu::Buffer* groupRct = nullptr);
@@ -107,7 +125,10 @@ private:
     gpu::ComputeKernel                  tables_, buildOrders_, selectStrategies_, largeQf_, largeRows_, largeCols_, mergeLarge_, adjustQuantField_, dctRows_, dctCols_, dcFromLlf_, specialTransform_, passNonZeroCount_, acTokenize_;
     gpu::ComputeKernel                  dcTokenize_, metaTokenize_, dcGroupSections_, clusterContexts_, accumulateClusters_, acSections_;
     gpu::ComputeKernel                  propStats_, propThresholds_, treeHistograms_, treeSplit_, treeAssign_, modSamples_, modTokenizeTree_;
-    gpu::ComputeKernel                  rctCost_, rctApply_, dcFramePlanes_, modTokenize_, extractAlpha_, channelEntropy_, remapTokens_, modGroupSections_, modularGlobalBlob_;
+    gpu::ComputeKernel                  unpackPlanes_, rctCost_, rctApply_, dcFramePlanes_, modTokenize_;
+    gpu::ComputeKernel                  paletteCount_, paletteBuild_, paletteIndex_, paletteVerify_, compactStats_, compactBuild_, compactApply_;
+    gpu::ComputeKernel                  rleScan_, rleHistograms_, uintConfigHist_, uintConfigChoose_;
+    gpu::ComputeKernel                  extractAlpha_, channelEntropy_, remapTokens_, modGroupSections_, modularGlobalBlob_;
     gpu::ComputeKernel                  dcGroupBlobs_, globalBlobs_, layout_, blobEmit_;
     gpu::PrefixSum                      prefixSum_;
     gpu::Buffer                         dequantAll_;   // every quant table kind, 3 channels each (kTableBase layout)

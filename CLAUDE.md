@@ -171,7 +171,10 @@ frame the alpha channel is the extra channel: a one-channel modular image
 tokenised like the lossless one, its global part at the end of DcGlobal
 (`codes.slang writeExtraChannelGlobal`) and its groups after the AC stream in
 every AC group section (`ac_sections.slang`), in its own histogram set after
-the DC groups' sets. Lossless (`--lossless`): a Modular frame, the RCT per group among libjxl's four candidates
+the DC groups' sets. Lossless (`--lossless`): a Modular frame over a channel table (meta channels first, in the
+global stream; image channels in group rectangles; libjxl's group size by image size): a
+palette over every channel when the colours fit libjxl's limit (`enc/palette.slang`), else
+compaction palettes per channel plus the RCT per group among libjxl's four candidates
 (`rctCost` entropy estimate, `rctApply`; alpha is the fourth modular channel and an extra
 channel in the headers), an MA tree
 learned as libjxl's ComputeBestTree (`enc/tree.slang`: property thresholds,
@@ -179,7 +182,10 @@ learned as libjxl's ComputeBestTree (`enc/tree.slang`: property thresholds,
 per level histograms → split decision per node → sample assignment; the host
 orders the nodes breadth first) and `modTokenizeTree` over all 16 properties
 (`--fixed-tree`: per channel libjxl's fixed WP or gradient tree, whichever
-`channelEntropy` estimates cheaper, joined under channel splits),
+`channelEntropy` estimates cheaper, joined under channel splits), then
+`enc/lz77.slang`: run-length LZ77 per stream into compact token lists when
+libjxl's rule accepts it, and the hybrid-uint configuration per cluster
+(`uintConfigChoose`),
 residual tokens kept per sample (`enc/modular.slangh` `modTreeLeaf`, the
 decoder's group-local edge rules), clustered ANS histograms,
 the global section by one thread (`codes.slang buildModularGlobalBlob`; it

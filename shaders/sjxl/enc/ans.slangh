@@ -229,26 +229,27 @@ float ansDataBits(uint length) {
     return bits;
 }
 
-/// ANSEncodingHistogram::ComputeBest (the fast strategy): the raw counts in
-/// gAnsCounts[0..length) normalised at precisions 0, 6 and 11 and as the flat
-/// histogram, the cheapest (description plus data) written; gAnsCounts holds
-/// its normalised counts on exit for the alias tables.
-void ansWriteBestHistogram(RWStructuredBuffer<uint> buf, inout SerialWriter w, uint length) {
-    uint numSymbols = 0;
-    for (uint s = 0; s < 256; ++s) {
-        gAnsRaw[s] = s < length ? gAnsCounts[s] : 0;
-        if (gAnsRaw[s] != 0) ++numSymbols;
-    }
+/// ANSEncodingHistogram::ComputeBest (libjxl's approximate strategy, what its
+/// modular streams use at the hare tier): the raw counts in gAnsRaw[0..length)
+/// normalised at the even precisions 0..10 and 11 and as the flat histogram;
+/// the cheapest description (a dry run) plus data bits, with the choice in
+/// `bestShift` / `bestFlat`. Leaves gAnsCounts at the last candidate tried.
+/// `numTries` is a runtime value on purpose: a constant trip count gets the loop
+/// unrolled around the large writer and the GPU backend compiler never finishes.
+float ansBestHistogramChoice(RWStructuredBuffer<uint> buf, uint length, uint numSymbols, uint numTries, out uint bestShift, out bool bestFlat) {
+    bestShift = kAnsLogTabSize - 1;
+    bestFlat = false;
     if (numSymbols <= 2) {
         ansNormalizeShift(length, kAnsLogTabSize - 1);
-        ansWriteHistogramAt(buf, w, length, kAnsLogTabSize - 1, false, false);
-        return;
+        SerialWriter dryW;
+        dryW.base = 0;
+        dryW.pos = 0;
+        ansWriteHistogramAt(buf, dryW, length, kAnsLogTabSize - 1, false, true);
+        return float(dryW.pos) + ansDataBits(length);
     }
-    const uint shifts[3] = {0, kAnsLogTabSize / 2, kAnsLogTabSize - 1};
+    const uint shifts[7] = {0, 2, 4, 6, 8, 10, kAnsLogTabSize - 1};
     float bestCost = 3.4e38f;
-    uint bestShift = kAnsLogTabSize - 1;
-    bool bestFlat = false;
-    for (uint k = 0; k < 3; ++k) {
+    for (uint k = 0; k < min(numTries, 7u); ++k) {
         ansNormalizeShift(length, shifts[k]);
         SerialWriter dryW;
         dryW.base = 0;
@@ -267,6 +268,38 @@ void ansWriteBestHistogram(RWStructuredBuffer<uint> buf, inout SerialWriter w, u
         ansWriteHistogramAt(buf, dryW, length, 0, true, true);
         const float cost = float(dryW.pos) + ansDataBits(length);
         if (cost < bestCost) { bestCost = cost; bestFlat = true; }
+    }
+    return bestCost;
+}
+
+/// The cost (description plus data bits) of the raw counts in gAnsCounts[0..length)
+/// under their cheapest histogram form (ANSPopulationCost).
+float ansBestHistogramCost(RWStructuredBuffer<uint> buf, uint length, uint numTries) {
+    uint numSymbols = 0;
+    for (uint s = 0; s < 256; ++s) {
+        gAnsRaw[s] = s < length ? gAnsCounts[s] : 0;
+        if (gAnsRaw[s] != 0) ++numSymbols;
+    }
+    uint shift;
+    bool flat;
+    return ansBestHistogramChoice(buf, length, numSymbols, numTries, shift, flat);
+}
+
+/// The raw counts in gAnsCounts[0..length) written in their cheapest form;
+/// gAnsCounts holds the normalised counts on exit for the alias tables.
+void ansWriteBestHistogram(RWStructuredBuffer<uint> buf, inout SerialWriter w, uint length, uint numTries) {
+    uint numSymbols = 0;
+    for (uint s = 0; s < 256; ++s) {
+        gAnsRaw[s] = s < length ? gAnsCounts[s] : 0;
+        if (gAnsRaw[s] != 0) ++numSymbols;
+    }
+    uint bestShift;
+    bool bestFlat;
+    ansBestHistogramChoice(buf, length, numSymbols, numTries, bestShift, bestFlat);
+    if (numSymbols <= 2) {
+        ansNormalizeShift(length, kAnsLogTabSize - 1);
+        ansWriteHistogramAt(buf, w, length, kAnsLogTabSize - 1, false, false);
+        return;
     }
     if (bestFlat) {
         const uint base = kAnsTabSize / length, rem = kAnsTabSize % length;

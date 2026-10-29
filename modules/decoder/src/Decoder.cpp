@@ -779,6 +779,16 @@ Result<Decoder::FrameOutput> Decoder::run(const codestream::Parsed& parsed, cons
     stats_.usedAcs = header[47];
     if (modular && !platform::env("SJXL_DEBUG").empty()) {
         log::info("decoder: modular global tree {} nodes", header[kGsTreeNumNodesIndex]);
+        if (!platform::env("SJXL_DEBUG_TREE").empty()) {
+            // The nodes: property (-1 leaf), split value, children, predictor, offset, multiplier, leaf id.
+            const uint32_t numNodes = header[kGsTreeNumNodesIndex];
+            SJXL_ASSIGN(const std::vector<uint32_t> nodes, arena.readRange<uint32_t>(dev, header[kGsTreeNumNodesIndex - 1], uint64_t{numNodes} * 8));
+            for (uint32_t n = 0; n < numNodes && n < 400; ++n) {
+                const int32_t prop = static_cast<int32_t>(nodes[n * 8]);
+                if (prop < 0) log::info("  node {}: leaf {} predictor {} offset {} mul {}", n, nodes[n * 8 + 7], nodes[n * 8 + 4], static_cast<int32_t>(nodes[n * 8 + 5]), nodes[n * 8 + 6]);
+                else log::info("  node {}: property {} > {} ? {} : {}", n, prop, static_cast<int32_t>(nodes[n * 8 + 1]), nodes[n * 8 + 2], nodes[n * 8 + 3]);
+            }
+        }
     }
     if (referenceOnly || dcFrame) {
         // Saved before the colour transform: the XYB planes as they are after the filters

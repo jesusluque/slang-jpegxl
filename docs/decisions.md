@@ -63,10 +63,12 @@ per subsystem or milestone, appended to as the work goes. Dates are absolute.
   the per-channel predictor choice; alpha and 16-bit in the lossy path;
   animations of full frames; progressive AC passes and DC frames; a learned
   MA tree and libjxl's histogram precision search for lossless.)
-  The RCT is chosen per group among libjxl's four hare-tier candidates.)
-  Next: per-cluster hybrid-uint configurations, palette and Squeeze,
-  three-channel strategy costs, frames that reference the previous one in
-  animations, encoder speed (the serial ANS and WP passes).
+  The RCT is chosen per group among libjxl's four hare-tier candidates;
+  palettes, run-length LZ77 and per-cluster hybrid-uint configurations as
+  libjxl's hare tier; its modular group sizes.)
+  Next: Squeeze (lossy modular), three-channel strategy costs, frames that
+  reference the previous one in animations, encoder speed (the serial ANS and
+  WP passes).
 - **M4 decoder completeness**: splines, grey JPEG transcodes, loop filters
   on YCbCr frames, extra channel blending in patches, writing the ICC
   profile into the output file, float samples. (16-bit output, animation
@@ -1207,3 +1209,66 @@ Measured: the test images keep YCoCg nearly everywhere (sizes within a byte
 or two), the 4K photo as RGB encodes to 5338472 B against cjxl's 5579965
 (−4.3 %), bit-exact in djxl and our decoder, in 2.0 s on the M5 Pro (cjxl
 -e 5: about 1 s).
+
+## Palettes, run-length LZ77 and hybrid-uint configurations (2026-10-29)
+
+The modular encoder now works over a channel table (`chanTable`: width,
+height, offset in the planes, grouped): meta channels of any size come first
+and belong to the global stream, image channels larger than a group are split
+into group rectangles; a group stream numbers its channels from the first
+non-meta one (the channel property), the global stream from 0. The global
+header carries the global transforms (palettes) and, when the image is one
+stream, the RCT; group headers carry each group's RCT.
+
+Palettes (`enc/palette.slang`, libjxl's `try_palettes` at the hare tier,
+which applies them without a cost check): `paletteCount` hashes every colour
+(up to four 16-bit channels) into a table with counts, claiming a slot with
+one compare-exchange on a 32-bit fingerprint and publishing the full key after
+it: a spin-wait on another thread's slot never ends inside a SIMD group (the
+first version did that and the 200-colour image lost its palette), so
+`paletteVerify` checks each pixel's full key afterwards and a fingerprint
+collision drops the palette. Within libjxl's colour limit (min(cost × 0.0005
++ pixels / 128 + 128, 1024) with the flat 0.2 bits × depth × channels
+estimate) `paletteBuild` orders the colours as libjxl does (frequent ones by
+descending luma, then the rest ascending) and `paletteIndex` writes the index
+channel; the frame is then [palette (colours × channels), indices] with the
+Palette transform (nb_deltas 0, predictor Zero) and no RCT. Otherwise each
+channel using fewer than 95 % of its range (and under pixels / 16 values) gets
+a compaction palette (`compactStats` / `compactBuild` / `compactApply`: the
+used values in order, the samples their ranks), inserted at the front in
+application order as the decoder does, and the RCT candidates run over the
+compacted channels. Implicit (cube) palette entries are not used.
+
+Run-length LZ77 (`enc/lz77.slang rleScan`, libjxl's `ApplyLZ77_RLE`): one
+thread per stream (the groups', then the global one) walks its tokens in
+order into a compact list; a run of tokens repeating the previous value
+becomes a length token (the run's first context, value run − 3) plus a
+distance token (value 1, the special distance (1, 0) of modular streams) in
+an extra context when the symbols' cost under the pre-LZ77 statistics beats
+CeilLog2Nonzero(len + 1) + 1 bits; the frame takes LZ77 when the total saving
+beats 0.2 × symbols + 16 bits, else the lists are rewritten plain. The section
+writers read the lists backwards; the header gets min_symbol 224, min_length
+3 and the (4, 2, 0) length configuration at alphabet 8. On the test images
+the rule never fires (residual runs are already cheap), as with cjxl.
+
+Hybrid-uint configurations (`uintConfigHist` / `uintConfigChoose`, libjxl's
+`ChooseUintConfigs` with its fast candidates (4, 2, 0), (4, 1, 2), (0, 0, 0),
+(2, 0, 1)): per cluster, the histogram of its tokens under each candidate; the
+cheapest by `ANSPopulationCost` (the best histogram form's description plus
+data, `ansBestHistogramCost`) plus raw bits plus the configuration's bits
+wins, its counts become the cluster's code region and its configuration is
+written per cluster; the set's alphabet size follows the largest symbol. The
+ANS histogram search now tries libjxl's approximate set of precisions (0, 2,
+…, 10, 11). Loop trip counts around the histogram writer are runtime values:
+with constants the GPU backend compiler unrolls the writer several times and
+never finishes.
+
+Modular frames take libjxl's group size (`GetGroupSizeShift`: 128 px groups up
+to 128 px, 256 up to 256, 512 up to 400, 256 beyond), DC frames included.
+
+Measured lossless (bytes, this encoder vs `cjxl -d 0 -e 5`): sveti_stefan_320
+78411 vs 78385, sveti_crop 40662 vs 40975, berlin_200 27805 vs 27684, sveti_64
+3531 vs 3707, the 4K photo 5334390 vs 5579965 (−4.4 %); synthetic palette
+images: 200 colours 100×80 2243 vs 2253, 16 colours 300×200 11650 vs 10764
+(+8 %: libjxl's tree has 179 nodes there to our 133). All bit-exact in djxl
+and our decoder, 16-bit and RGBA included.

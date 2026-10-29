@@ -67,7 +67,13 @@ struct CodeParams {
     uint ecInGlobal;      // 1: the alpha channel fits a group and its stream goes into DcGlobal
     uint ecLogAlpha;      // the alpha stream's ANS alphabet (6 at 8 bits, 7 at 16)
     uint numAcSets;       // AC passes (one histogram set each); 1 for a lossless frame's layout
-    uint rct;             // modular frames: 1 writes the YCoCg RCT over channels 0..2 in the GroupHeader
+    uint rct;             // modular frames: 1 when the frame has an RCT (groupRct; in the global header when the image is one stream)
+    uint rctBeginC;       // the RCT's first channel
+    uint numTransforms;   // modular frames: global transforms in `transforms`
+    uint totalSamples;    // modular frames: samples over every channel
+    uint lz77Modular;     // modular frames: the set carries run-length tokens (an extra distance context)
+    uint modLogAlpha;     // modular frames: the set's log_alpha_size
+    uint histogramTries;  // ANS histogram precisions tried (7: libjxl's approximate strategy); runtime so no unrolling
     uint dcQuantCustom;   // modular frames: 1 writes dc_quant (DequantMatrices::DecodeDC) as the three F16s below
     uint useDcFrame;      // VarDCT frames: 1 leaves the DC groups' DC stream out (kUseDcFrame)
     float dcQuantX;       // the custom dc_quant per channel (X, Y, B)
@@ -84,6 +90,12 @@ StructuredBuffer<uint>     hist;
 StructuredBuffer<uint>     quantizer;  // [0] global_scale, [1] quant_dc
 StructuredBuffer<uint>     ctxMap;     // AC context -> cluster
 StructuredBuffer<uint>     groupRct;   // modular frames: the RCT type of each group (rct != 0)
+StructuredBuffer<uint4>    chanTable;  // modular frames: per channel w, h, offset, grouped
+StructuredBuffer<uint4>    transforms; // modular frames: the global transforms (palettes): id, begin_c, num_c, nb_colors
+StructuredBuffer<uint>     streamTokens;  // modular frames: the compact per-stream token lists
+StructuredBuffer<uint>     streamStart;   // per stream (groups, then the global one)
+StructuredBuffer<uint>     streamLen;
+StructuredBuffer<uint>     clusterCfg;    // per code region: hybrid-uint config split | msb << 8 | lsb << 16
 StructuredBuffer<uint>     clusterInfo;   // [0] number of AC clusters
 RWStructuredBuffer<uint>   ctxMapMtf;  // scratch: the context map after the move-to-front transform
 RWStructuredBuffer<uint>   ansInfo;    // ANS symbol info per code region (the context map's code is region kAcClusters)
@@ -395,13 +407,17 @@ void buildAndStoreCode(RWStructuredBuffer<uint> buf, inout SerialWriter w, uint 
 
 // --- histogram descriptions (dec_ans.cc DecodeHistograms, prefix path) ---------
 
-void encodeUintConfig(RWStructuredBuffer<uint> buf, inout SerialWriter w, uint logAlphaSize) {
-    serialWrite(buf, w, ceilLog2Nonzero(logAlphaSize + 1), kHybridSplitExponent);
-    if (kHybridSplitExponent == logAlphaSize) {
+void encodeUintConfigAt(RWStructuredBuffer<uint> buf, inout SerialWriter w, uint logAlphaSize, uint split, uint msb, uint lsb) {
+    serialWrite(buf, w, ceilLog2Nonzero(logAlphaSize + 1), split);
+    if (split == logAlphaSize) {
         return;
     }
-    serialWrite(buf, w, ceilLog2Nonzero(kHybridSplitExponent + 1), kHybridMsbInToken);
-    serialWrite(buf, w, ceilLog2Nonzero(kHybridSplitExponent - kHybridMsbInToken + 1), kHybridLsbInToken);
+    serialWrite(buf, w, ceilLog2Nonzero(split + 1), msb);
+    serialWrite(buf, w, ceilLog2Nonzero(split - msb + 1), lsb);
+}
+
+void encodeUintConfig(RWStructuredBuffer<uint> buf, inout SerialWriter w, uint logAlphaSize) {
+    encodeUintConfigAt(buf, w, logAlphaSize, kHybridSplitExponent, kHybridMsbInToken, kHybridLsbInToken);
 }
 
 void storeVarLenUint16(RWStructuredBuffer<uint> buf, inout SerialWriter w, uint n) {
@@ -473,7 +489,7 @@ void writeContextMapStream(RWStructuredBuffer<uint> buf, inout SerialWriter w, u
     serialWrite(buf, w, 1, 0);                     // use_prefix_code = 0
     serialWrite(buf, w, 2, kMapLogAlpha - 5);
     encodeUintConfig(buf, w, kMapLogAlpha);
-    ansWriteBestHistogram(buf, w, length);
+    ansWriteBestHistogram(buf, w, length, params.histogramTries);
     ansBuildTables(ansInfo, ansReverse, kMapRegion, length, kMapLogAlpha);
     // Two passes over the tokens backwards: the size, then the placement.
     uint total = 32;
@@ -509,10 +525,18 @@ void writeContextMapStream(RWStructuredBuffer<uint> buf, inout SerialWriter w, u
 /// contexts, else coded through writeContextMapStream), ANS with a 1 <<
 /// logAlpha alphabet, then every cluster's hybrid-uint config and its
 /// normalised histogram, whose alias table is inverted for the section kernels.
-void writeHistogramSet(RWStructuredBuffer<uint> buf, inout SerialWriter w, uint numContexts, uint numClusters, uint logAlpha, uint set) {
+/// `lz77`: the set's streams carry run-length tokens: LZ77Params min_symbol 224,
+/// min_length 3, the length config (4, 2, 0) at alphabet 8; numContexts then
+/// includes the distance context.
+void writeHistogramSetLz77(RWStructuredBuffer<uint> buf, inout SerialWriter w, uint numContexts, uint numClusters, uint logAlpha, uint set, bool lz77) {
     const uint ctxBase = setCtxBase(set);
     const uint regionBase = setRegionBase(set);
-    serialWrite(buf, w, 1, 0);   // lz77.enabled
+    serialWrite(buf, w, 1, lz77 ? 1 : 0);   // lz77.enabled
+    if (lz77) {
+        serialWrite(buf, w, 2, 0);   // min_symbol: Val(224)
+        serialWrite(buf, w, 2, 0);   // min_length: Val(3)
+        encodeUintConfigAt(buf, w, 8, 4, 2, 0);
+    }
     if (numContexts > 1) {
         const uint entryBits = ceilLog2Nonzero(numClusters);
         if (numClusters == 1) {
@@ -531,14 +555,19 @@ void writeHistogramSet(RWStructuredBuffer<uint> buf, inout SerialWriter w, uint 
     serialWrite(buf, w, 1, 0);       // use_prefix_code = 0
     serialWrite(buf, w, 2, logAlpha - 5);
     for (uint c = 0; c < numClusters; ++c) {
-        encodeUintConfig(buf, w, logAlpha);
+        const uint cfg = clusterCfg[regionBase + c];
+        encodeUintConfigAt(buf, w, logAlpha, cfg & 0xFFu, (cfg >> 8) & 0xFFu, (cfg >> 16) & 0xFFu);
     }
     for (uint c = 0; c < numClusters; ++c) {
         const uint length = loadHistogram((regionBase + c) * kCodeStride);
         for (uint i = 0; i < kMaxAlphabet; ++i) gAnsCounts[i] = gHist[i];
-        ansWriteBestHistogram(buf, w, length);
+        ansWriteBestHistogram(buf, w, length, params.histogramTries);
         ansBuildTables(ansInfo, ansReverse, regionBase + c, length, logAlpha);
     }
+}
+
+void writeHistogramSet(RWStructuredBuffer<uint> buf, inout SerialWriter w, uint numContexts, uint numClusters, uint logAlpha, uint set) {
+    writeHistogramSetLz77(buf, w, numContexts, numClusters, logAlpha, set, false);
 }
 
 /// Last used symbol + 1 of the histogram region at histBase (at least 1), and
@@ -688,35 +717,47 @@ void writeTreeFromNodes(RWStructuredBuffer<uint> buf, inout SerialWriter w, Stru
 /// The whole image's three channels as one ANS stream inside the blob (the
 /// global modular stream of an image no larger than a group): two passes, the
 /// size then the placement from the end.
+/// The global stream's tokens (its compact list is the last stream, index
+/// numGroups) as one ANS stream inside the blob: two passes, the size then the
+/// placement from the end. Length tokens take kMinSymbol + their (4, 2, 0)
+/// token; the others their cluster's configuration.
+static const uint kLengthFlag = 0x80000000u;
+static const uint kLz77MinSymbol = 224;
+
 void writeModularImageStream(RWStructuredBuffer<uint> buf, inout SerialWriter w, uint set) {
     const uint ctxBase = setCtxBase(set);
     const uint regionBase = setRegionBase(set);
+    const uint stream = params.numGroups;
+    const uint base = streamStart[stream];
+    const uint n = streamLen[stream];
     uint total = 32;
     for (uint pass = 1; pass <= 2; ++pass) {
         uint state = kAnsSignature << 16;
         uint pos = w.pos + total;
-        for (int c = int(params.numChannels) - 1; c >= 0; --c) {
-            for (int y = int(params.height) - 1; y >= 0; --y) {
-                for (int x = int(params.width) - 1; x >= 0; --x) {
-                    const uint t = modTokens[uint(c) * params.width * params.height + uint(y) * params.width + uint(x)];
-                    const uint ctx = t >> 18, value = t & 0x3FFFFu;
-                    uint tok, nbits, raw;
-                    hybridEncode(value, tok, nbits, raw);
-                    const uint cluster = regionBase + ctxMap[ctxBase + ctx];
-                    const uint e = ansInfo[cluster * kAnsInfoStride + tok];
-                    if (pass == 2) {
-                        pos -= nbits;
-                        serialWriteAt(buf, w.base, pos, nbits, raw);
-                    }
-                    uint ansBits, ansN;
-                    ansPut(state, e & 0xFFFFu, e >> 16, ansReverse, cluster * kAnsReverseStride, ansN, ansBits);
-                    if (pass == 2) {
-                        pos -= ansN;
-                        serialWriteAt(buf, w.base, pos, ansN, ansBits);
-                    } else {
-                        total += nbits + ansN;
-                    }
-                }
+        for (int i = int(n) - 1; i >= 0; --i) {
+            const uint t = streamTokens[base + uint(i)];
+            const uint ctx = (t & ~kLengthFlag) >> 18, value = t & 0x3FFFFu;
+            const uint cluster = regionBase + ctxMap[ctxBase + ctx];
+            uint tok, nbits, raw;
+            if ((t & kLengthFlag) != 0) {
+                hybridEncode(value, tok, nbits, raw);
+                tok += kLz77MinSymbol;
+            } else {
+                const uint cfg = clusterCfg[cluster];
+                hybridEncodeCfg(value, cfg & 0xFFu, (cfg >> 8) & 0xFFu, (cfg >> 16) & 0xFFu, tok, nbits, raw);
+            }
+            const uint e = ansInfo[cluster * kAnsInfoStride + tok];
+            if (pass == 2) {
+                pos -= nbits;
+                serialWriteAt(buf, w.base, pos, nbits, raw);
+            }
+            uint ansBits, ansN;
+            ansPut(state, e & 0xFFFFu, e >> 16, ansReverse, cluster * kAnsReverseStride, ansN, ansBits);
+            if (pass == 2) {
+                pos -= ansN;
+                serialWriteAt(buf, w.base, pos, ansN, ansBits);
+            } else {
+                total += nbits + ansN;
             }
         }
         if (pass == 2) serialWriteAt(buf, w.base, w.pos, 32, state);
@@ -800,25 +841,37 @@ void buildModularGlobalBlob(uint3 gid: SV_GroupID) {
     }
     serialWrite(blobs, dc, 1, 1);        // has_tree
     writeTreeFromNodes(blobs, dc, treeNodes, params.numTreeNodes);
-    writeHistogramSet(blobs, dc, params.numLeaves, clusterInfo[0], modLogAlpha(), 0);
+    writeHistogramSetLz77(blobs, dc, params.numLeaves + (params.lz77Modular != 0 ? 1 : 0), clusterInfo[0], params.modLogAlpha, 0, params.lz77Modular != 0);
     // GroupHeader of the global stream.
     serialWrite(blobs, dc, 1, 1);        // use_global_tree
     serialWrite(blobs, dc, 1, 1);        // weighted::Header all_default
-    // The global stream's transforms apply to the whole image: the RCT goes here
-    // only when the image is the global stream (it fits a group); otherwise every
-    // group's own header carries its RCT.
+    // The global stream's transforms apply to the whole image: the palettes, and
+    // the RCT when the image is the global stream (it fits a group); otherwise
+    // every group's own header carries its RCT.
     const bool imageInGlobal = params.width <= params.groupDim && params.height <= params.groupDim;
     const uint rctType = (params.rct != 0 && imageInGlobal) ? groupRct[0] : 0;
-    if (rctType != 0) {
-        serialWrite(blobs, dc, 2, 1);    // num_transforms: U32 Val(1)
-        serialWrite(blobs, dc, 2, 0);    // Transform id: RCT
-        serialWrite(blobs, dc, 2, 0);    // begin_c: BitsOffset(3, 0) ...
-        serialWrite(blobs, dc, 3, 0);    // ... = 0
-        serialWriteU32(blobs, dc, distrVal(6), distrBitsOffset(2, 0), distrBitsOffset(4, 2), distrBitsOffset(6, 10), rctType);
-    } else {
-        serialWrite(blobs, dc, 2, 0);    // num_transforms: U32 Val(0)
+    const uint numTransforms = params.numTransforms + (rctType != 0 ? 1 : 0);
+    serialWriteU32(blobs, dc, distrVal(0), distrVal(1), distrBitsOffset(4, 2), distrBitsOffset(8, 18), numTransforms);
+    for (uint t = 0; t < params.numTransforms; ++t) {
+        const uint4 tr = transforms[t];   // id, begin_c, num_c, nb_colors
+        serialWriteU32(blobs, dc, distrVal(0), distrVal(1), distrVal(2), distrVal(3), tr.x);
+        serialWriteU32(blobs, dc, distrBitsOffset(3, 0), distrBitsOffset(6, 8), distrBitsOffset(10, 72), distrBitsOffset(13, 1096), tr.y);
+        if (tr.x == 1) {   // palette: num_c, nb_colors, nb_deltas 0, predictor 0
+            serialWriteU32(blobs, dc, distrVal(1), distrVal(3), distrVal(4), distrBitsOffset(13, 1), tr.z);
+            serialWriteU32(blobs, dc, distrBitsOffset(8, 0), distrBitsOffset(10, 256), distrBitsOffset(12, 1280), distrBitsOffset(16, 5376), tr.w);
+            serialWriteU32(blobs, dc, distrVal(0), distrBitsOffset(8, 1), distrBitsOffset(10, 257), distrBitsOffset(16, 1281), 0);
+            serialWrite(blobs, dc, 4, 0);
+        }
     }
-    if (params.width <= params.groupDim && params.height <= params.groupDim) {
+    if (rctType != 0) {
+        serialWrite(blobs, dc, 2, 0);    // Transform id: RCT
+        serialWriteU32(blobs, dc, distrBitsOffset(3, 0), distrBitsOffset(6, 8), distrBitsOffset(10, 72), distrBitsOffset(13, 1096), params.rctBeginC);
+        serialWriteU32(blobs, dc, distrVal(6), distrBitsOffset(2, 0), distrBitsOffset(4, 2), distrBitsOffset(6, 10), rctType);
+    }
+    // The channels of the global stream (all of them when the image fits a group, the meta channels otherwise).
+    bool anyGlobal = false;
+    for (uint c = 0; c < params.numChannels; ++c) anyGlobal = anyGlobal || chanTable[c].w == 0;
+    if (anyGlobal) {
         writeModularImageStream(blobs, dc, 0);
     }
     blobBits[0] = dc.pos;

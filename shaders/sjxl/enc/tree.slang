@@ -34,9 +34,10 @@ struct TreeParams {
     uint  maxSlots;        // nodes a level may hold (counts buffer)
     float threshold;       // splitting_heuristics_node_threshold
     float fastDecodeMul;   // fast_decode_multiplier
-    uint  width;           // propStats: the planes
+    uint  width;           // the image
     uint  height;
-    uint  numChannels;
+    uint  numChannels;     // channels in chanTable
+    uint  totalSamples;    // propStats: samples over every channel
     uint  numGroups;
     uint  groupDim;
     uint  groupsX;
@@ -46,6 +47,7 @@ struct TreeParams {
 };
 
 StructuredBuffer<int>       planes;        // propStats
+StructuredBuffer<uint4>     chanTable;     // propStats: per channel w, h, offset, grouped
 RWStructuredBuffer<uint>    stats;         // [0, kHistBins) pixel samples at value + kRange, [kHistBins, 2 kHistBins) differences
 RWStructuredBuffer<int>     thresholds;    // [16][kThreshStride] per property; thresholds[16 * kThreshStride + p] = count
 StructuredBuffer<uint2>     samples;       // x: tokW | nbitsW << 8 | tokG << 16 | nbitsG << 24; y: quantised property values, 8 bits each
@@ -66,15 +68,17 @@ uint hash32(uint x) {
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void propStats(uint3 tid: SV_DispatchThreadID) {
-    const uint n = params.width * params.height * params.numChannels;
-    if (tid.x >= n) return;
+    if (tid.x >= params.totalSamples) return;
     if (float(hash32(tid.x * 2654435761u + 7u) & 0xFFFFFFu) >= params.sampleFraction * 16777216.0f) return;
-    const uint plane = params.width * params.height;
-    const uint i = tid.x % plane;
-    const uint x = i % params.width;
+    uint c = 0;
+    for (; c + 1 < params.numChannels; ++c) {
+        if (tid.x < chanTable[c + 1].z) break;
+    }
+    const uint4 ch = chanTable[c];
+    const uint i = tid.x - ch.z;
+    const uint x = i % ch.x;
     const int v = planes[tid.x];
-    const uint xp = x == 0 ? 1 : x - 1;
-    const int left = x == 0 ? (params.width > 1 ? planes[tid.x + 1] : v) : planes[tid.x - 1];
+    const int left = x == 0 ? (ch.x > 1 ? planes[tid.x + 1] : v) : planes[tid.x - 1];
     const int d = v - left;
     uint before;
     InterlockedAdd(stats[uint(clamp(v, -int(kRange), int(kRange)) + int(kRange))], 1u, before);
