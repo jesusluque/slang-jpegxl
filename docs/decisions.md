@@ -55,9 +55,10 @@ per subsystem or milestone, appended to as the work goes. Dates are absolute.
 - **M3 encoder quality**: (done 2026-10-29: inverse Gaborish + LoopFilter as
   libjxl chooses it, EPF sharpness 4, CfL per tile, adaptive quant field,
   AdjustQuantBlockAC; ANS for the AC groups with clustered coefficient
-  contexts; lossless Modular encoding.) Next: alpha and 16-bit input (modular
-  extra channels and bit depth), DCT16/32 strategy search, DC and AcMetadata
-  coding (ANS, better trees), a learned or WP-based tree for lossless.
+  contexts; lossless Modular encoding of RGB and RGBA at 8 and 16 bits.)
+  Next: DCT16/32 strategy search, DC and AcMetadata coding (ANS, better
+  trees), a learned or WP-based tree and transforms for lossless, alpha and
+  16-bit in the lossy path.
 - **M4 decoder completeness**: splines, grey JPEG transcodes, loop filters
   on YCbCr frames, extra channel blending in patches, writing the ICC
   profile into the output file, float samples. (16-bit output, animation
@@ -324,6 +325,26 @@ serial per-group pass for the residuals, as the error state propagates),
 Squeeze/palette choices for flat or few-colour images, and the LZ77 RLE cjxl
 uses at this effort. Encode time is dominated by the serial ANS chain (270 ms
 Debug for 320×180 as the two groups' threads each walk 29k tokens twice).
+
+**Alpha and 16 bits.** The same path takes RGBA and 16-bit input
+(`image::readImage` keeps both): the alpha channel is the modular image's
+fourth channel, declared as an unassociated alpha extra channel
+(`ExtraChannelInfo` all_default at 8 bits, explicit type/depth at 16) with
+its `ec_upsampling` and `BlendingInfo` fields in the frame header (the
+missing per-channel BlendingInfo shifted every later field, which showed as
+a 128 px group size in `sjxl info`); the RCT covers channels 0..2 only.
+16-bit samples make the residual tokens reach 71, so the modular ANS
+alphabet is 128 (log_alpha 7) at that depth and the context histograms have
+128 bins throughout; the clustering kernel keeps its distances over those
+bins but no longer accumulates the cluster histograms in threadgroup memory
+(two 32 × 128 tables would exceed Metal's 32 KB): `accumulateClusters` adds
+every context's histogram into its cluster's code region with atomics.
+`modular_16_bit_buffer_sufficient` is false at 16 bits (the RCT of 16-bit
+samples exceeds int16). Bit-exact through djxl and our decoder; on
+berlin_200 variants: alpha 32 767 B (cjxl 27 797), 16-bit 88 150 B (cjxl
+74 386), both 93 953 B (cjxl 74 741): cjxl's learned tree and transforms
+matter more as the alphabet grows. The lossy path still takes 8-bit RGB only
+(alpha and 16-bit input return Unsupported there).
 
 ## M2 decoder, VarDCT (2026-10-29)
 

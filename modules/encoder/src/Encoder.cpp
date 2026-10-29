@@ -27,7 +27,7 @@ constexpr uint32_t kCodeStride = 256;
 constexpr uint32_t kBlobStrideWords = 8192;
 constexpr uint32_t kAcClusters = 32;
 constexpr uint32_t kNumAcContexts = 15 * (37 + 458);
-constexpr uint32_t kAcAlphabet = 64;
+constexpr uint32_t kHistBins = 128;
 
 struct Uint4 {
     uint32_t x, y, z, w;
@@ -85,6 +85,7 @@ Result<std::unique_ptr<Encoder>> Encoder::create(std::shared_ptr<gpu::ShaderLibr
     SJXL_ASSIGN(enc->dcItems_, gpu::ComputeKernel::create(lib, "sjxl/enc/items", "dcItems"));
     SJXL_ASSIGN(enc->metaItems_, gpu::ComputeKernel::create(lib, "sjxl/enc/items", "metaItems"));
     SJXL_ASSIGN(enc->clusterContexts_, gpu::ComputeKernel::create(lib, "sjxl/enc/cluster", "clusterContexts"));
+    SJXL_ASSIGN(enc->accumulateClusters_, gpu::ComputeKernel::create(lib, "sjxl/enc/cluster", "accumulateClusters"));
     SJXL_ASSIGN(enc->acSections_, gpu::ComputeKernel::create(lib, "sjxl/enc/ac_sections", "acSections"));
     SJXL_ASSIGN(enc->rctYCoCg_, gpu::ComputeKernel::create(lib, "sjxl/enc/modular", "rctYCoCg"));
     SJXL_ASSIGN(enc->modHist_, gpu::ComputeKernel::create(lib, "sjxl/enc/modular", "modHist"));
@@ -106,11 +107,16 @@ Result<std::unique_ptr<Encoder>> Encoder::create(std::shared_ptr<gpu::ShaderLibr
 }
 
 Result<std::vector<uint8_t>> Encoder::encode(const image::Rgb8& image, const Options& options) {
-    if (image.width == 0 || image.height == 0 || image.pixels.size() != size_t{image.width} * image.height * 3) {
+    if (image.width == 0 || image.height == 0 || (image.channels != 3 && image.channels != 4) ||
+        (image.bitDepth != 8 && image.bitDepth != 16) ||
+        image.pixels.size() != size_t{image.width} * image.height * image.channels * (image.bitDepth / 8)) {
         return Error(ErrorCode::InvalidArgument, "empty image or pixel count does not match its size");
     }
     if (options.lossless) {
         return encodeLossless(image, options);
+    }
+    if (image.channels != 3 || image.bitDepth != 8) {
+        return Error(ErrorCode::Unsupported, "lossy encoding of alpha or 16-bit input (use --lossless)");
     }
     if (!(options.distance > 0.0f) || options.distance > 25.0f) {
         return Error::make(ErrorCode::InvalidArgument, "distance {} is not in (0, 25]", options.distance);
@@ -167,7 +173,7 @@ Result<std::vector<uint8_t>> Encoder::encode(const image::Rgb8& image, const Opt
     SJXL_ASSIGN(auto codes, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{numCodeRegions} * kCodeStride, "enc.codes"));
     SJXL_ASSIGN(auto blobs, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{numBlobRegions} * kBlobStrideWords, "enc.blobs"));
     SJXL_ASSIGN(auto blobBits, gpu::Buffer::ofType<uint32_t>(dev, numBlobRegions, "enc.blobBits"));
-    SJXL_ASSIGN(auto ctxHist, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{kNumAcContexts} * kAcAlphabet, "enc.ctxHist"));
+    SJXL_ASSIGN(auto ctxHist, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{kNumAcContexts} * kHistBins, "enc.ctxHist"));
     SJXL_ASSIGN(auto ctxMap, gpu::Buffer::ofType<uint32_t>(dev, kNumAcContexts, "enc.ctxMap"));
     SJXL_ASSIGN(auto ctxTotal, gpu::Buffer::ofType<float>(dev, kNumAcContexts, "enc.ctxTotal"));
     SJXL_ASSIGN(auto ctxEntropy, gpu::Buffer::ofType<float>(dev, kNumAcContexts, "enc.ctxEntropy"));
@@ -337,7 +343,7 @@ Result<std::vector<uint8_t>> Encoder::encode(const image::Rgb8& image, const Opt
     itemPasses(0, dummy_);   // histograms
 
     // The AC contexts' histograms clustered into the codes' histograms.
-    clusterContexts_.dispatchGroups(batch, {1, 1, 1}, [&](rhi::ShaderCursor c) {
+    const auto bindCluster = [&](rhi::ShaderCursor c) {
         c["ctxHist"].setBinding(ctxHist.rhi());
         c["ctxTotal"].setBinding(ctxTotal.rhi());
         c["ctxEntropy"].setBinding(ctxEntropy.rhi());
@@ -348,7 +354,9 @@ Result<std::vector<uint8_t>> Encoder::encode(const image::Rgb8& image, const Opt
         c["clusterInfo"].setBinding(clusterInfo.rhi());
         c["params"]["numContexts"].setData(kNumAcContexts);
         c["params"]["maxClusters"].setData(std::min<uint32_t>(options.acClusters, kAcClusters));
-    });
+    };
+    clusterContexts_.dispatchGroups(batch, {1, 1, 1}, bindCluster);
+    accumulateClusters_.dispatch(batch, {kNumAcContexts, 1, 1}, bindCluster);
 
     const auto bindCodes = [&](rhi::ShaderCursor c) {
         c["dcGroups"].setBinding(dcGroups.rhi());
@@ -512,17 +520,18 @@ Result<std::vector<uint8_t>> Encoder::encodeLossless(const image::Rgb8& image, c
     const uint32_t numDcGroups = dim.numDcGroups();
     const bool fitsGroup = image.width <= dim.groupDim && image.height <= dim.groupDim;
     const uint64_t pixels = uint64_t{image.width} * image.height;
+    const uint32_t channels = image.channels;
 
     uint32_t numLeaves = 0;
-    const std::vector<uint32_t> treeWords = fixedGradientTree(3 * pixels, numLeaves);
+    const std::vector<uint32_t> treeWords = fixedGradientTree(channels * pixels, numLeaves);
     const uint32_t numTreeNodes = static_cast<uint32_t>(treeWords.size() / kModTreeWords);
     SJXL_ASSIGN(auto treeNodes, gpu::Buffer::fromSpan<uint32_t>(dev, treeWords, "enc.treeNodes"));
 
     std::vector<uint32_t> rgbWords((image.pixels.size() + 3) / 4, 0);
     std::memcpy(rgbWords.data(), image.pixels.data(), image.pixels.size());
     SJXL_ASSIGN(auto rgb, gpu::Buffer::fromSpan<uint32_t>(dev, rgbWords, "enc.rgb8"));
-    SJXL_ASSIGN(auto planes, gpu::Buffer::ofType<int32_t>(dev, 3 * pixels, "enc.planes"));
-    SJXL_ASSIGN(auto ctxHist, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{numLeaves} * kAcAlphabet, "enc.ctxHist"));
+    SJXL_ASSIGN(auto planes, gpu::Buffer::ofType<int32_t>(dev, channels * pixels, "enc.planes"));
+    SJXL_ASSIGN(auto ctxHist, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{numLeaves} * kHistBins, "enc.ctxHist"));
     SJXL_ASSIGN(auto ctxMap, gpu::Buffer::ofType<uint32_t>(dev, numLeaves, "enc.ctxMap"));
     SJXL_ASSIGN(auto ctxTotal, gpu::Buffer::ofType<float>(dev, numLeaves, "enc.ctxTotal"));
     SJXL_ASSIGN(auto ctxEntropy, gpu::Buffer::ofType<float>(dev, numLeaves, "enc.ctxEntropy"));
@@ -535,7 +544,7 @@ Result<std::vector<uint8_t>> Encoder::encodeLossless(const image::Rgb8& image, c
     SJXL_ASSIGN(auto ansInfo, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{kAcClusters + 1} * 256, "enc.ansInfo"));
     SJXL_ASSIGN(auto ansReverse, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{kAcClusters + 1} * 4096, "enc.ansReverse"));
     // The global blob holds the whole stream when the image fits a group.
-    const uint64_t blobWords = kBlobStrideWords + (fitsGroup ? 3 * pixels + 1024 : 0);
+    const uint64_t blobWords = kBlobStrideWords + (fitsGroup ? channels * pixels * (image.bitDepth / 8) + 1024 : 0);
     SJXL_ASSIGN(auto blobs, gpu::Buffer::ofType<uint32_t>(dev, blobWords, "enc.blobs"));
     SJXL_ASSIGN(auto blobBits, gpu::Buffer::ofType<uint32_t>(dev, 2, "enc.blobBits"));
     SJXL_ASSIGN(auto groupBits, gpu::Buffer::ofType<uint32_t>(dev, numGroups, "enc.groupBits"));
@@ -560,10 +569,12 @@ Result<std::vector<uint8_t>> Encoder::encodeLossless(const image::Rgb8& image, c
         c["params"]["numGroups"].setData(numGroups);
         c["params"]["numLeaves"].setData(numLeaves);
         c["params"]["mode"].setData(mode);
+        c["params"]["numChannels"].setData(channels);
+        c["params"]["bitDepth"].setData(image.bitDepth);
     };
     rctYCoCg_.dispatch(batch, {image.width, image.height, 1}, [&](rhi::ShaderCursor c) { bindMod(c, 0, dummy_, dummy_); });
-    modHist_.dispatch(batch, {static_cast<uint32_t>(3 * pixels), 1, 1}, [&](rhi::ShaderCursor c) { bindMod(c, 0, dummy_, dummy_); });
-    clusterContexts_.dispatchGroups(batch, {1, 1, 1}, [&](rhi::ShaderCursor c) {
+    modHist_.dispatch(batch, {static_cast<uint32_t>(channels * pixels), 1, 1}, [&](rhi::ShaderCursor c) { bindMod(c, 0, dummy_, dummy_); });
+    const auto bindCluster = [&](rhi::ShaderCursor c) {
         c["ctxHist"].setBinding(ctxHist.rhi());
         c["ctxTotal"].setBinding(ctxTotal.rhi());
         c["ctxEntropy"].setBinding(ctxEntropy.rhi());
@@ -574,7 +585,9 @@ Result<std::vector<uint8_t>> Encoder::encodeLossless(const image::Rgb8& image, c
         c["clusterInfo"].setBinding(clusterInfo.rhi());
         c["params"]["numContexts"].setData(numLeaves);
         c["params"]["maxClusters"].setData(std::min<uint32_t>(options.acClusters, kAcClusters));
-    });
+    };
+    clusterContexts_.dispatchGroups(batch, {1, 1, 1}, bindCluster);
+    accumulateClusters_.dispatch(batch, {numLeaves, 1, 1}, bindCluster);
     const auto bindCodes = [&](rhi::ShaderCursor c) {
         c["dcGroups"].setBinding(dummy_.rhi());
         c["hist"].setBinding(hist.rhi());
@@ -598,6 +611,8 @@ Result<std::vector<uint8_t>> Encoder::encodeLossless(const image::Rgb8& image, c
         c["params"]["groupDim"].setData(dim.groupDim);
         c["params"]["numTreeNodes"].setData(numTreeNodes);
         c["params"]["numLeaves"].setData(numLeaves);
+        c["params"]["numChannels"].setData(image.channels);
+        c["params"]["bitDepth"].setData(image.bitDepth);
     };
     modularGlobalBlob_.dispatchGroups(batch, {1, 1, 1}, bindCodes);
     if (!fitsGroup) {
@@ -652,8 +667,8 @@ Result<std::vector<uint8_t>> Encoder::encodeLossless(const image::Rgb8& image, c
     SJXL_ASSIGN(const std::vector<uint32_t> clusterInfoHost, clusterInfo.readAll<uint32_t>(dev));
 
     codestream::BitWriter head;
-    codestream::writeCodestreamHeadersRgb(head, image.width, image.height);
-    codestream::writeModularFrameHeader(head);
+    codestream::writeCodestreamHeadersRgb(head, image.width, image.height, image.bitDepth, channels == 4);
+    codestream::writeModularFrameHeader(head, channels == 4 ? 1 : 0);
     codestream::writeToc(head, sizes);
     std::vector<uint8_t> out = head.take();
     stats_ = Stats{};
@@ -662,8 +677,8 @@ Result<std::vector<uint8_t>> Encoder::encodeLossless(const image::Rgb8& image, c
     stats_.sectionBytes = sizes;
     stats_.numAcClusters = clusterInfoHost[0];
     if (!platform::env("SJXL_DEBUG").empty()) {
-        log::info("enc debug: lossless {}x{}, {} tree nodes, {} leaves, {} clusters, DcGlobal {} bits, {} groups", image.width,
-                  image.height, numTreeNodes, numLeaves, clusterInfoHost[0], blobBitsHost[0], numGroups);
+        log::info("enc debug: lossless {}x{} x{} {}-bit, {} tree nodes, {} leaves, {} clusters, DcGlobal {} bits, {} groups", image.width,
+                  image.height, channels, image.bitDepth, numTreeNodes, numLeaves, clusterInfoHost[0], blobBitsHost[0], numGroups);
     }
     const auto* bodyBytesPtr = reinterpret_cast<const uint8_t*>(bodyWords.data());
     out.insert(out.end(), bodyBytesPtr, bodyBytesPtr + bodyBytes);

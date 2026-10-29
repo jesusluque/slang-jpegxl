@@ -115,16 +115,31 @@ void writeCodestreamHeaders(BitWriter& w, uint32_t xsize, uint32_t ysize) {
     w.zeroPadToByte();
 }
 
-void writeCodestreamHeadersRgb(BitWriter& w, uint32_t xsize, uint32_t ysize) {
+void writeCodestreamHeadersRgb(BitWriter& w, uint32_t xsize, uint32_t ysize, uint32_t bitDepth, bool alpha) {
+    const U32Enc kBitsEnc{{Val(8), Val(10), Val(12), BitsOffset(6, 1)}};
     w.write(8, 0xFF);
     w.write(8, 0x0A);
     writeSizeHeader(w, xsize, ysize);
     w.writeBool(false);   // ImageMetadata all_default
     w.writeBool(false);   // extra_fields
     w.writeBool(false);   // bit_depth.floating_point_sample
-    writeU32(w, U32Enc{{Val(8), Val(10), Val(12), BitsOffset(6, 1)}}, 8);   // bits_per_sample
-    w.writeBool(true);    // modular_16_bit_buffer_sufficient
-    writeU32(w, U32Enc{{Val(0), Val(1), BitsOffset(4, 2), BitsOffset(12, 1)}}, 0);   // num_extra_channels
+    writeU32(w, kBitsEnc, bitDepth);   // bits_per_sample
+    w.writeBool(bitDepth <= 8);        // modular_16_bit_buffer_sufficient: the RCT of 16-bit samples needs more
+    writeU32(w, U32Enc{{Val(0), Val(1), BitsOffset(4, 2), BitsOffset(12, 1)}}, alpha ? 1 : 0);   // num_extra_channels
+    if (alpha) {
+        // ExtraChannelInfo: all_default is an 8-bit unassociated alpha.
+        if (bitDepth == 8) {
+            w.writeBool(true);
+        } else {
+            w.writeBool(false);
+            writeU32(w, U32Enc{{Val(0), Val(1), BitsOffset(4, 2), BitsOffset(6, 18)}}, 0);   // type: alpha
+            w.writeBool(false);                                                              // floating_point_sample
+            writeU32(w, kBitsEnc, bitDepth);
+            writeU32(w, U32Enc{{Val(0), Val(3), Val(4), BitsOffset(3, 1)}}, 0);              // dim_shift
+            writeU32(w, U32Enc{{Val(0), Bits(4), BitsOffset(5, 16), BitsOffset(10, 48)}}, 0);   // name length
+            w.writeBool(false);                                                              // alpha_associated
+        }
+    }
     w.writeBool(false);   // xyb_encoded
     w.writeBool(true);    // ColorEncoding all_default: sRGB
     writeU64(w, 0);       // extensions
@@ -132,17 +147,23 @@ void writeCodestreamHeadersRgb(BitWriter& w, uint32_t xsize, uint32_t ysize) {
     w.zeroPadToByte();
 }
 
-void writeModularFrameHeader(BitWriter& w) {
+void writeModularFrameHeader(BitWriter& w, uint32_t numExtraChannels) {
     w.writeBool(false);                                            // all_default
     writeU32(w, U32Enc{{Val(0), Val(1), Val(2), Val(3)}}, 0);      // frame_type = kRegularFrame
     w.writeBool(true);                                             // encoding = kModular
     writeU64(w, 0);                                                // flags
     w.writeBool(false);                                            // color_transform: kNone (not YCbCr)
     writeU32(w, U32Enc{{Val(1), Val(2), Val(4), Val(8)}}, 1);      // upsampling = 1
+    for (uint32_t i = 0; i < numExtraChannels; ++i) {
+        writeU32(w, U32Enc{{Val(1), Val(2), Val(4), Val(8)}}, 1);  // ec_upsampling = 1
+    }
     w.write(2, 1);                                                 // group_size_shift = 1: 256 px groups
     writeU32(w, U32Enc{{Val(1), Val(2), Val(3), BitsOffset(3, 4)}}, 1);   // num_passes = 1
     w.writeBool(false);                                            // custom_size_or_origin
     writeU32(w, U32Enc{{Val(0), Val(1), Val(2), BitsOffset(2, 3)}}, 0);   // blending mode kReplace
+    for (uint32_t i = 0; i < numExtraChannels; ++i) {
+        writeU32(w, U32Enc{{Val(0), Val(1), Val(2), BitsOffset(2, 3)}}, 0);   // the extra channel's BlendingInfo: kReplace
+    }
     w.writeBool(true);                                             // is_last
     writeU32(w, U32Enc{{Val(0), Bits(4), BitsOffset(5, 16), BitsOffset(10, 48)}}, 0);   // name length
     w.writeBool(false);                                            // LoopFilter all_default

@@ -18,7 +18,7 @@ build/macos-arm64-debug/bin/sjxl_gpu_tests "prefix sum*"    # one Catch2 case by
 cmake --build build/macos-arm64-debug --target sjxl_gpu_tests   # one binary
 build/macos-arm64-debug/bin/sjxl info [in.jxl]              # device info, or a file's headers and frame list
 build/macos-arm64-debug/bin/sjxl encode in.png out.jxl --distance 1.0 [--no-aq] [--no-cfl] [--no-filters] [--clusters n]
-build/macos-arm64-debug/bin/sjxl encode in.png out.jxl --lossless   # Modular frame, bit-exact
+build/macos-arm64-debug/bin/sjxl encode in.png out.jxl --lossless   # Modular frame, bit-exact; RGB/RGBA, 8/16-bit
 build/macos-arm64-debug/bin/sjxl decode in.jxl out.png                  # every stage on the GPU; animations write out_000.png, ...
 build/macos-arm64-debug/bin/sjxl compare a.png b.png                    # PSNR + largest diff, on the GPU
 build/macos-arm64-debug/bin/sjxl pixel a.png x y ; sjxl convert in.png out.png   # one pixel; re-save as RGB8
@@ -133,8 +133,11 @@ appends the body.
 or limit the clusters for A/B runs; `SJXL_DEBUG=1` prints the quantizer,
 cluster count, blob bits and section bytes.
 
-Lossless (`--lossless`): a Modular frame, YCoCg RCT, Gradient predictor and
-libjxl's fixed gradient tree (built on the host from the pixel count, uploaded),
+Lossless (`--lossless`, RGB or RGBA at 8 or 16 bits; the lossy path takes
+8-bit RGB): a Modular frame, YCoCg RCT over the colour channels (alpha is the
+fourth modular channel and an extra channel in the headers), Gradient
+predictor and libjxl's fixed gradient tree (built on the host from the pixel
+count, uploaded),
 residual tokens and contexts per pixel in parallel (`enc/modular.slangh`
 `modToken`, the decoder's group-local edge rules), clustered ANS histograms,
 the global section by one thread (`codes.slang buildModularGlobalBlob`; it

@@ -10,8 +10,8 @@
 // against the growing clusters in context order; against the fixed seeds the
 // assignment is parallel). Clusters are renumbered by their first context,
 // and a context without tokens takes the previous context's cluster, which
-// keeps the coded context map cheap. The cluster histograms land in the code
-// regions 0..numClusters-1 of `hist`, where the prefix codes are built.
+// keeps the coded context map cheap. accumulateClusters then sums every
+// context's histogram into its cluster's code region of `hist`.
 module enc_cluster;
 
 #include "sjxl/common/ac_context.slangh"
@@ -19,6 +19,7 @@ module enc_cluster;
 static const uint kMaxClusters = 32;
 static const uint kThreads = 256;
 static const uint kCodeStride = 256;
+static const uint kHistBins = 128;   // bins per context histogram (tokens of values below 2^32 with 16-bit residuals)
 static const float kMinDistanceForDistinct = 48.0f;
 static const float kFar = 3.0e38f;
 
@@ -29,7 +30,7 @@ struct ClusterParams {
     uint pad1;
 };
 
-StructuredBuffer<uint>      ctxHist;      // numContexts * kAcAlphabet
+StructuredBuffer<uint>      ctxHist;      // numContexts * kHistBins
 RWStructuredBuffer<float>   ctxTotal;     // scratch, numContexts
 RWStructuredBuffer<float>   ctxEntropy;   // scratch
 RWStructuredBuffer<float>   ctxDist;      // scratch: distance to the nearest seed
@@ -39,12 +40,11 @@ RWStructuredBuffer<uint>    hist;         // code regions: cluster c's histogram
 RWStructuredBuffer<uint>    clusterInfo;  // [0] number of clusters
 ConstantBuffer<ClusterParams> params;
 
-groupshared uint  gSeedHist[kMaxClusters * kAcAlphabet];
+groupshared uint  gSeedHist[kMaxClusters * kHistBins];
 groupshared float gSeedTotal[kMaxClusters];
 groupshared float gSeedEntropy[kMaxClusters];
 groupshared uint  gSeedSingle[kMaxClusters];
 groupshared uint  gSeedCtx[kMaxClusters];
-groupshared uint  gClusterHist[kMaxClusters * kAcAlphabet];
 groupshared uint  gRank[kMaxClusters];
 groupshared float gRedVal[kThreads];
 groupshared uint  gRedIdx[kThreads];
@@ -57,7 +57,7 @@ float xlog2x(float x) { return x > 0.0f ? x * log2(x) : 0.0f; }
 float entropyOf(uint base) {
     float total = 0.0f;
     float sum = 0.0f;
-    for (uint s = 0; s < kAcAlphabet; ++s) {
+    for (uint s = 0; s < kHistBins; ++s) {
         const float c = float(ctxHist[base + s]);
         total += c;
         sum += xlog2x(c);
@@ -70,11 +70,11 @@ float clusterDistance(uint ctx, uint j) {
     const float ta = ctxTotal[ctx];
     const float tb = gSeedTotal[j];
     if (ta == 0.0f || tb == 0.0f) return 0.0f;
-    const uint base = ctx * kAcAlphabet;
+    const uint base = ctx * kHistBins;
     float sum = 0.0f;
     uint symbols = 0;
-    for (uint s = 0; s < kAcAlphabet; ++s) {
-        const uint c = ctxHist[base + s] + gSeedHist[j * kAcAlphabet + s];
+    for (uint s = 0; s < kHistBins; ++s) {
+        const uint c = ctxHist[base + s] + gSeedHist[j * kHistBins + s];
         sum += xlog2x(float(c));
         symbols += c != 0 ? 1 : 0;
     }
@@ -108,8 +108,8 @@ void argmaxReduce(uint tid, float val, uint idx) {
 }
 
 void addSeed(uint tid, uint j, uint ctx) {
-    for (uint s = tid; s < kAcAlphabet; s += kThreads) {
-        gSeedHist[j * kAcAlphabet + s] = ctxHist[ctx * kAcAlphabet + s];
+    for (uint s = tid; s < kHistBins; s += kThreads) {
+        gSeedHist[j * kHistBins + s] = ctxHist[ctx * kHistBins + s];
     }
     if (tid == 0) {
         gSeedTotal[j] = ctxTotal[ctx];
@@ -126,19 +126,17 @@ void addSeed(uint tid, uint j, uint ctx) {
 void clusterContexts(uint3 gtid: SV_GroupThreadID) {
     const uint tid = gtid.x;
     const uint n = params.numContexts;
-    for (uint i = tid; i < kMaxClusters * kAcAlphabet; i += kThreads) gClusterHist[i] = 0;
-
     // Per-context statistics.
     for (uint ctx = tid; ctx < n; ctx += kThreads) {
         float total = 0.0f;
         uint symbols = 0;
-        for (uint s = 0; s < kAcAlphabet; ++s) {
-            const uint c = ctxHist[ctx * kAcAlphabet + s];
+        for (uint s = 0; s < kHistBins; ++s) {
+            const uint c = ctxHist[ctx * kHistBins + s];
             total += float(c);
             symbols += c != 0 ? 1 : 0;
         }
         ctxTotal[ctx] = total;
-        ctxEntropy[ctx] = entropyOf(ctx * kAcAlphabet);
+        ctxEntropy[ctx] = entropyOf(ctx * kHistBins);
         ctxSingle[ctx] = symbols <= 1 ? 1 : 0;
         ctxDist[ctx] = total == 0.0f ? 0.0f : kFar;
         ctxMap[ctx] = 0xFFFFFFFFu;
@@ -188,25 +186,17 @@ void clusterContexts(uint3 gtid: SV_GroupThreadID) {
     }
     const uint numSeeds = gNumSeeds;
 
-    // Every context with tokens to its nearest seed; the cluster histograms.
+    // Every context with tokens to its nearest seed.
     for (uint ctx = tid; ctx < n; ctx += kThreads) {
         if (ctxTotal[ctx] == 0.0f) continue;
-        uint best = ctxMap[ctx];   // a seed is its own cluster
-        if (best == 0xFFFFFFFFu) {
-            float bestDist = kFar;
-            for (uint j = 0; j < numSeeds; ++j) {
-                const float d = clusterDistance(ctx, j);
-                if (d < bestDist) { bestDist = d; best = j; }
-            }
-            ctxMap[ctx] = best;
+        if (ctxMap[ctx] != 0xFFFFFFFFu) continue;   // a seed is its own cluster
+        uint best = 0;
+        float bestDist = kFar;
+        for (uint j = 0; j < numSeeds; ++j) {
+            const float d = clusterDistance(ctx, j);
+            if (d < bestDist) { bestDist = d; best = j; }
         }
-        for (uint s = 0; s < kAcAlphabet; ++s) {
-            const uint c = ctxHist[ctx * kAcAlphabet + s];
-            if (c != 0) {
-                uint before;
-                InterlockedAdd(gClusterHist[best * kAcAlphabet + s], c, before);
-            }
-        }
+        ctxMap[ctx] = best;
     }
     AllMemoryBarrierWithGroupSync();
 
@@ -227,12 +217,20 @@ void clusterContexts(uint3 gtid: SV_GroupThreadID) {
         }
         clusterInfo[0] = next;
     }
-    AllMemoryBarrierWithGroupSync();
-    for (uint i = tid; i < numSeeds * kAcAlphabet; i += kThreads) {
-        const uint j = i / kAcAlphabet;
-        const uint s = i % kAcAlphabet;
-        if (gRank[j] != 0xFFFFFFFFu) {
-            hist[gRank[j] * kCodeStride + s] = gClusterHist[i];
+}
+
+/// One thread per context: its histogram added to its cluster's code region.
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void accumulateClusters(uint3 tid: SV_DispatchThreadID) {
+    const uint ctx = tid.x;
+    if (ctx >= params.numContexts) return;
+    const uint cluster = ctxMap[ctx];
+    for (uint s = 0; s < kHistBins; ++s) {
+        const uint c = ctxHist[ctx * kHistBins + s];
+        if (c != 0) {
+            uint before;
+            InterlockedAdd(hist[cluster * kCodeStride + s], c, before);
         }
     }
 }

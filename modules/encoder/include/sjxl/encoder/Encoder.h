@@ -21,7 +21,8 @@ namespace sjxl::enc {
 
 struct Options {
     /// Lossless: a Modular frame (YCoCg RCT, Gradient predictor, fixed MA tree,
-    /// ANS); the distance and the VarDCT options are ignored.
+    /// ANS) of the image's channels (RGB or RGBA) at its bit depth (8 or 16);
+    /// the distance and the VarDCT options are ignored.
     bool lossless = false;
     /// Butteraugli distance: smaller is higher quality (1.0 ~ libjxl quality 90).
     float distance = 1.0f;
@@ -63,7 +64,7 @@ private:
     gpu::Device*                        device_ = nullptr;
     gpu::ComputeKernel                  rgbToXyb_, aqDiff_, aqMap_, aqRawField_;
     gpu::ComputeKernel                  gaborishInverse_, dct_, cflTile_, quantize_;
-    gpu::ComputeKernel                  acItems_, dcItems_, metaItems_, clusterContexts_, acSections_;
+    gpu::ComputeKernel                  acItems_, dcItems_, metaItems_, clusterContexts_, accumulateClusters_, acSections_;
     gpu::ComputeKernel                  rctYCoCg_, modHist_, modGroupSections_, modularGlobalBlob_;
     gpu::ComputeKernel                  dcGroupBlobs_, globalBlobs_, layout_, blobEmit_;
     gpu::PrefixSum                      prefixSum_;

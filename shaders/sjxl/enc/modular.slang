@@ -1,7 +1,8 @@
 // Copyright (c) 2026 jesus luque.
 //
 // The lossless Modular encoder's per-pixel and per-group kernels: the RCT
-// (YCoCg, type 6) from sRGB8, the residual token histograms per context, and
+// (YCoCg, type 6) from 8- or 16-bit RGB (an alpha channel is carried as the
+// fourth channel), the residual token histograms per context, and
 // the group sections as ANS streams (GroupHeader with the global tree and no
 // transforms, then the three channels' rectangles), one thread per group,
 // measured in mode 1 and placed backwards in mode 2 as ac_sections.slang does.
@@ -19,14 +20,18 @@ struct ModParams {
     uint numGroups;
     uint numLeaves;
     uint mode;        // modGroupSections: 1 count, 2 emit
+    uint numChannels; // 3, or 4 with alpha
+    uint bitDepth;    // 8 or 16
     uint pad0;
+    uint pad1;
+    uint pad2;
 };
 
-StructuredBuffer<uint>     rgb8;          // width * height * 3 bytes
-RWStructuredBuffer<int>    planes;        // 3 * width * height: Y, Co, Cg (written by rctYCoCg)
+StructuredBuffer<uint>     rgb8;          // width * height * numChannels samples of bitDepth / 8 bytes, little-endian
+RWStructuredBuffer<int>    planes;        // numChannels * width * height: Y, Co, Cg[, alpha] (written by rctYCoCg)
 StructuredBuffer<int>      planesIn;      // the same buffer, read by the token kernels
 StructuredBuffer<uint>     treeNodes;     // kModTreeWords per node
-RWStructuredBuffer<uint>   ctxHist;       // numLeaves * kAcAlphabet(64)
+RWStructuredBuffer<uint>   ctxHist;       // numLeaves * kHistBins
 StructuredBuffer<uint>     ctxMap;        // leaf -> cluster
 StructuredBuffer<uint>     ansInfo;
 StructuredBuffer<uint>     ansReverse;
@@ -35,10 +40,16 @@ RWStructuredBuffer<uint>   groupBits;     // mode 1 output
 RWStructuredBuffer<uint>   body;          // mode 2 output
 ConstantBuffer<ModParams>  params;
 
-static const uint kModAlphabet = 64;
+static const uint kHistBins = 128;
 
 uint byteAt(uint index) {
     return (rgb8[index >> 2] >> ((index & 3) * 8)) & 0xFFu;
+}
+
+/// Sample `index` of the input as an integer.
+int sampleAt(uint index) {
+    if (params.bitDepth == 8) return int(byteAt(index));
+    return int(byteAt(2 * index) | (byteAt(2 * index + 1) << 8));
 }
 
 [shader("compute")]
@@ -46,9 +57,10 @@ uint byteAt(uint index) {
 void rctYCoCg(uint3 tid: SV_DispatchThreadID) {
     if (tid.x >= params.width || tid.y >= params.height) return;
     const uint i = tid.y * params.width + tid.x;
-    const int r = int(byteAt(i * 3 + 0));
-    const int g = int(byteAt(i * 3 + 1));
-    const int b = int(byteAt(i * 3 + 2));
+    const uint nc = params.numChannels;
+    const int r = sampleAt(i * nc + 0);
+    const int g = sampleAt(i * nc + 1);
+    const int b = sampleAt(i * nc + 2);
     // enc_rct.cc FwdRctRow<6>
     const int co = r - b;
     const int tmp = b + (co >> 1);
@@ -57,6 +69,7 @@ void rctYCoCg(uint3 tid: SV_DispatchThreadID) {
     planes[0 * plane + i] = tmp + (cg >> 1);
     planes[1 * plane + i] = co;
     planes[2 * plane + i] = cg;
+    if (nc > 3) planes[3 * plane + i] = sampleAt(i * nc + 3);
 }
 
 /// One thread per pixel and channel: the token counted in its leaf's context,
@@ -65,7 +78,7 @@ void rctYCoCg(uint3 tid: SV_DispatchThreadID) {
 [numthreads(64, 1, 1)]
 void modHist(uint3 tid: SV_DispatchThreadID) {
     const uint n = params.width * params.height;
-    if (tid.x >= 3 * n) return;
+    if (tid.x >= params.numChannels * n) return;
     const uint c = tid.x / n;
     const uint i = tid.x % n;
     const uint x = i % params.width, y = i / params.width;
@@ -76,7 +89,7 @@ void modHist(uint3 tid: SV_DispatchThreadID) {
     uint tok, nbits, raw;
     hybridEncode(value, tok, nbits, raw);
     uint before;
-    InterlockedAdd(ctxHist[ctx * kModAlphabet + min(tok, kModAlphabet - 1)], 1u, before);
+    InterlockedAdd(ctxHist[ctx * kHistBins + min(tok, kHistBins - 1)], 1u, before);
 }
 
 struct AnsWriter {
@@ -120,7 +133,7 @@ void modGroupSections(uint3 tid: SV_DispatchThreadID) {
     aw.state = kAnsSignature << 16;
     aw.bits = kGroupHeaderBits + 32;
     aw.pos = aw.mode == 2 ? groupStart[g] + groupBits[g] : 0;
-    for (int c = 2; c >= 0; --c) {
+    for (int c = int(params.numChannels) - 1; c >= 0; --c) {
         for (int y = int(h) - 1; y >= 0; --y) {
             for (int x = int(w) - 1; x >= 0; --x) {
                 uint ctx, value;

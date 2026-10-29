@@ -148,8 +148,8 @@ void ansBuildTables(RWStructuredBuffer<uint> info, RWStructuredBuffer<uint> reve
     const uint tableSize = 1u << logAlpha;
     const uint logEntrySize = kAnsLogTabSize - logAlpha;
     const uint entrySize = 1u << logEntrySize;
-    uint cutoffs[64], under[64], over[64], rightv[64], offs1[64];
-    for (uint i = 0; i < 64; ++i) {
+    uint cutoffs[256], under[256], over[256], rightv[256], offs1[256];
+    for (uint i = 0; i < 256; ++i) {
         cutoffs[i] = 0;
         rightv[i] = i;
         offs1[i] = 0;

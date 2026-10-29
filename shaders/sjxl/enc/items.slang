@@ -31,6 +31,7 @@ static const uint kMetaBlocks = 256 * 256;
 static const uint kMetaItemsPerGroup = 2 * kMetaTiles + 2 * kMetaBlocks;
 static const uint kCodeStride = 256;
 static const uint kAcClusters = 32;   // code regions 0..31 are the AC clusters
+static const uint kHistBins = 128;    // bins per context histogram
 
 struct ItemParams {
     uint nblocks;
@@ -54,7 +55,7 @@ StructuredBuffer<int>      cmapX;         // [tile]: YtoX
 StructuredBuffer<int>      cmapB;         // [tile]: YtoB
 StructuredBuffer<uint>     codes;         // depth << 16 | bits; region r at r * 256
 RWStructuredBuffer<uint>   hist;          // same regions as codes
-RWStructuredBuffer<uint>   ctxHist;       // mode 0: AC context histograms, kNumAcContexts * kAcAlphabet
+RWStructuredBuffer<uint>   ctxHist;       // mode 0: AC context histograms, kNumAcContexts * kHistBins
 StructuredBuffer<uint>     ctxMap;        // AC context -> cluster (code region)
 RWStructuredBuffer<uint>   itemBits;      // mode 1 output
 StructuredBuffer<uint>     prefix;        // mode 2: exclusive prefix of itemBits
@@ -102,7 +103,7 @@ void acToken(inout Cursor cur, uint ctx, uint value) {
     uint tok, nbits, raw;
     hybridEncode(value, tok, nbits, raw);
     uint before;
-    InterlockedAdd(ctxHist[ctx * kAcAlphabet + min(tok, kAcAlphabet - 1)], 1u, before);
+    InterlockedAdd(ctxHist[ctx * kHistBins + min(tok, kHistBins - 1)], 1u, before);
 }
 
 uint physicalChannel(uint ci) { return ci == 0 ? 1 : (ci == 1 ? 0 : 2); }

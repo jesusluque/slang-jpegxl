@@ -112,7 +112,8 @@ int encode(int argc, char** argv) {
             return usage();
         }
     }
-    auto image = sjxl::image::readRgb8(argv[2]);
+    // Lossless keeps alpha and 16-bit samples; lossy takes 8-bit RGB.
+    auto image = options.lossless ? sjxl::image::readImage(argv[2]) : sjxl::image::readRgb8(argv[2]);
     if (!image) return fail(image.error());
     auto device = sjxl::gpu::Device::create();
     if (!device) return fail(device.error());

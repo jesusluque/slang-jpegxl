@@ -21,12 +21,14 @@ constexpr uint32_t kColorTileDimBlocks = 8;   ///< chroma-from-luma tile: 64 px
 /// Signature + SizeHeader + ImageMetadata (all_default: 8-bit sRGB, xyb) +
 /// transform_data (all_default). Byte-aligned on exit.
 void writeCodestreamHeaders(BitWriter& w, uint32_t xsize, uint32_t ysize);
-/// Signature, SizeHeader and the ImageMetadata of an 8-bit sRGB image that is
-/// not XYB encoded (a lossless Modular frame), byte-aligned on exit.
-void writeCodestreamHeadersRgb(BitWriter& w, uint32_t xsize, uint32_t ysize);
+/// Signature, SizeHeader and the ImageMetadata of an 8- or 16-bit sRGB image
+/// that is not XYB encoded (a lossless Modular frame), with an unassociated
+/// alpha channel of the same depth when `alpha`. Byte-aligned on exit.
+void writeCodestreamHeadersRgb(BitWriter& w, uint32_t xsize, uint32_t ysize, uint32_t bitDepth, bool alpha);
 /// A single-pass, full-frame, last Modular frame in RGB (no colour transform,
-/// group_size_shift 1, LoopFilter off). Not byte-aligned on exit.
-void writeModularFrameHeader(BitWriter& w);
+/// group_size_shift 1, LoopFilter off) with `numExtraChannels` unsampled extra
+/// channels. Not byte-aligned on exit.
+void writeModularFrameHeader(BitWriter& w, uint32_t numExtraChannels);
 
 struct FrameParams {
     bool     gaborish = true;      ///< LoopFilter.gab

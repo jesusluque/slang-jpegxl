@@ -44,9 +44,9 @@ struct CodeParams {
     uint groupDim;
     uint numTreeNodes;
     uint numLeaves;
+    uint numChannels;
+    uint bitDepth;
     uint pad0;
-    uint pad1;
-    uint pad2;
 };
 
 StructuredBuffer<uint4>    dcGroups;   // bx0, by0, w, h in blocks
@@ -643,7 +643,8 @@ void buildGlobalBlobs(uint3 gid: SV_GroupID) {
 
 // --- Modular (lossless) frames -------------------------------------------------------
 
-static const uint kModLogAlpha = 6;   // 8-bit residual tokens stay below 64
+/// The modular alphabet: 8-bit residual tokens stay below 64, 16-bit ones below 128.
+uint modLogAlpha() { return params.bitDepth > 8 ? 7 : 6; }
 static const uint kMaxModTreeTokens = 1024;
 groupshared uint gTreeTokens[kMaxModTreeTokens];
 
@@ -691,7 +692,7 @@ void writeModularImageStream(RWStructuredBuffer<uint> buf, inout SerialWriter w)
     for (uint pass = 1; pass <= 2; ++pass) {
         uint state = kAnsSignature << 16;
         uint pos = w.pos + total;
-        for (int c = 2; c >= 0; --c) {
+        for (int c = int(params.numChannels) - 1; c >= 0; --c) {
             for (int y = int(params.height) - 1; y >= 0; --y) {
                 for (int x = int(params.width) - 1; x >= 0; --x) {
                     uint ctx, value;
@@ -722,8 +723,8 @@ void writeModularImageStream(RWStructuredBuffer<uint> buf, inout SerialWriter w)
 
 /// DcGlobal of a lossless Modular frame: the DC dequant defaults, the global
 /// tree with its clustered ANS histograms, the global stream's GroupHeader
-/// (the YCoCg RCT over channels 0..2) and, when the image fits a group, the
-/// channels themselves.
+/// (the YCoCg RCT over channels 0..2; an alpha channel follows untouched) and,
+/// when the image fits a group, the channels themselves.
 [shader("compute")]
 [numthreads(1, 1, 1)]
 void buildModularGlobalBlob(uint3 gid: SV_GroupID) {
@@ -734,7 +735,7 @@ void buildModularGlobalBlob(uint3 gid: SV_GroupID) {
     serialWrite(blobs, dc, 1, 1);        // DequantMatrices DC all_default
     serialWrite(blobs, dc, 1, 1);        // has_tree
     writeTreeFromNodes(blobs, dc);
-    writeHistogramSet(blobs, dc, params.numLeaves, clusterInfo[0], kModLogAlpha);
+    writeHistogramSet(blobs, dc, params.numLeaves, clusterInfo[0], modLogAlpha());
     // GroupHeader of the global stream.
     serialWrite(blobs, dc, 1, 1);        // use_global_tree
     serialWrite(blobs, dc, 1, 1);        // weighted::Header all_default

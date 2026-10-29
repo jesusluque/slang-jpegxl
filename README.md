@@ -18,8 +18,9 @@ record. The encoder is VarDCT with DCT8, libjxl's adaptive quant field,
 chroma-from-luma, Gaborish + EPF, and ANS with clustered coefficient
 contexts for the AC groups: at the file size `cjxl -e 5` produces it scores
 within about one SSIMULACRA2 point of it. `--lossless` writes a Modular frame
-(YCoCg, Gradient predictor, fixed tree, ANS) 8–13 % larger than `cjxl -d 0`.
-M3 continues with alpha and 16-bit input, larger transforms and DC coding.
+(YCoCg, Gradient predictor, fixed tree, ANS; RGB or RGBA, 8 or 16 bits)
+8–26 % larger than `cjxl -d 0`. M3 continues with larger transforms, DC
+coding and better lossless trees.
 `docs/decisions.md`
 holds the design, what each milestone measured and the roadmap; `CLAUDE.md`
 the short version a build needs.
