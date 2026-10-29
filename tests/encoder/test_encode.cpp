@@ -6,6 +6,7 @@
 #include <catch2/generators/catch_generators.hpp>
 
 #include <algorithm>
+#include <cstdlib>
 #include <format>
 #include <string>
 
@@ -206,4 +207,28 @@ TEST_CASE("encoding is deterministic", "[encoder]") {
     REQUIRE(first);
     REQUIRE(second);
     CHECK(*first == *second);
+}
+
+TEST_CASE("the CPU entropy chains write the same file as the GPU kernels", "[encoder][enc-cpu]") {
+    // DC tokens through the weighted predictor and every ANS section (EntropyCpu.cpp)
+    // against the kernels: single-section, several groups, progressive passes, a DC frame.
+    struct Case { std::string name; uint32_t progressive; bool dcFrame; float distance; };
+    const Case c = GENERATE(Case{"berlin_7x5.png", 0, false, 1.0f}, Case{"berlin_200.png", 0, false, 1.0f}, Case{"sveti_stefan_320.png", 0, false, 0.5f},
+                            Case{"sveti_stefan_320.png", 1, false, 1.0f}, Case{"sveti_stefan_320.png", 2, true, 1.0f});
+    CAPTURE(c.name, c.progressive, c.dcFrame);
+    auto source = image::readRgb8(test::testData(c.name));
+    REQUIRE(source);
+    enc::Options options;
+    options.distance = c.distance;
+    options.progressive = c.progressive;
+    options.progressiveDc = c.dcFrame;
+    setenv("SJXL_ENC_CPU", "0", 1);
+    auto gpu = encoder()->encode(*source, options);
+    setenv("SJXL_ENC_CPU", "1", 1);
+    auto cpu = encoder()->encode(*source, options);
+    unsetenv("SJXL_ENC_CPU");
+    REQUIRE(gpu);
+    REQUIRE(cpu);
+    CHECK(gpu->size() == cpu->size());
+    CHECK(*gpu == *cpu);
 }

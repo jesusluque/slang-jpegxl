@@ -146,6 +146,23 @@ void dcTokenize(uint3 tid: SV_DispatchThreadID) {
     }
 }
 
+/// The DC tokens' histogram when the CPU produced them (EntropyCpu.cpp dcTokenize):
+/// one thread per (channel, block), kNoToken at the positions a subsampled channel
+/// does not code.
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void dcTokenCount(uint3 tid: SV_DispatchThreadID) {
+    const uint i = tid.x;
+    if (i >= 3 * params.nblocks) return;
+    const uint t = dcTokens[i];
+    if (t == kNoToken) return;
+    const uint block = i % params.nblocks;
+    const uint bx = block % params.blocksX, by = block / params.blocksX;
+    const uint dcGroupsX = (params.blocksX + 255) / 256;
+    const uint g = (by / 256) * dcGroupsX + bx / 256;
+    countToken(dcSet(g), t >> 18, t & 0x3FFFFu);
+}
+
 /// The strategy or qf value of the first block at or before `block` in raster
 /// order within the group rectangle: the left neighbour in the ACS/QF channel.
 bool previousVarblock(uint4 rect, uint bx, uint by, out uint prevBlock) {

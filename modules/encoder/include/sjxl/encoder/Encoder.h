@@ -137,7 +137,7 @@ private:
     gpu::ComputeKernel                  rgbToXyb_, aqDiff_, aqMap_, aqRawField_;
     gpu::ComputeKernel                  gaborishInverse_, cflTile_, quantize_;
     gpu::ComputeKernel                  tables_, buildOrders_, selectStrategies_, largeQf_, largeRows_, largeCols_, mergeLarge_, adjustQuantField_, dctRows_, dctCols_, dcFromLlf_, specialTransform_, passNonZeroCount_, acTokenize_;
-    gpu::ComputeKernel                  dcTokenize_, metaTokenize_, dcGroupSections_, clusterContexts_, accumulateClusters_, acSections_;
+    gpu::ComputeKernel                  dcTokenize_, dcTokenCount_, metaTokenize_, dcGroupSections_, clusterContexts_, accumulateClusters_, acSections_;
     gpu::ComputeKernel                  propStats_, propThresholds_, treeHistograms_, treeSplit_, treeAssign_, modSamples_, modTokenizeTree_;
     gpu::ComputeKernel                  unpackPlanes_, rctCost_, rctApply_, dcFramePlanes_, modTokenize_;
     gpu::ComputeKernel                  paletteCount_, paletteBuild_, paletteIndex_, paletteVerify_, compactStats_, compactBuild_, compactApply_;

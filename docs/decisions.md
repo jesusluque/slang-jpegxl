@@ -1620,3 +1620,49 @@ djxl decodes the 1080p file in 90 ms. What is left serial: the AcGlobal decode
 when the frame codes custom orders for the large transforms (bike: the Lehmer
 decode of up to 65k-entry permutations and the AC histograms on one thread),
 the CPU DC chain itself (one core per group), and the encoder's chains.
+
+## M5: the encoder's serial chains (2026-10-29)
+
+The 1920x1080 lossy encode took 540 ms, and `SJXL_TIMING=1` with marks inside
+the entropy stages put 395 of them in three single-thread chains: `dcTokenize`
+(the quantised DC through the weighted predictor and the kWPFixedDC tree, one
+GPU thread per DC group: 149 ms), the ANS count pass (one thread per AC group
+and per DC group walking every token through the alias tables to measure the
+sections: 74 + 45 ms) and the ANS emit pass (the same chains again, placing the
+bits with atomics: 78 + 49 ms). A GPU thread spends 1-1.5 µs per token on an
+ANS chain; a CPU core 10-20 ns. The format gives one stream per section, so the
+chains cannot be split; with the user's decision to use the CPU where the GPU
+cannot be fast, they moved there (`modules/encoder/src/EntropyCpu.cpp`):
+
+- `cpu::dcTokenize`: after the quantisation stage the quantised DC is read
+  back and every DC group's three channels go through the weighted predictor
+  (`codestream/WeightedPredictor.h`, shared with the decoder's CPU path) and
+  the tree, one task per group; the tokens are uploaded into the same
+  `dcTokens` buffer the kernel wrote and a parallel kernel (`dcTokenCount`)
+  adds them to the context histograms. Clustering, the ANS tables and the
+  header blobs stay on the GPU exactly as before.
+- `cpu::emitSections`: after the blobs are built, the tokens (AC per
+  coefficient slot, DC, AcMetadata), the context maps, the ANS tables
+  (`ansInfo`, `ansReverse`) and the blobs are read back; every section's chain
+  runs as a task (the AC groups per pass, the DC groups with their pre blob,
+  DC stream, mid blob and AcMetadata stream); the body is assembled in
+  codestream order, byte-aligned (or bit-packed for a single-section frame),
+  and the TOC sizes come from it. The layout kernel, the count pass, the emit
+  pass and `blobEmit` do not run.
+
+The chain is written as the kernels do it: tokens fed in reverse stream
+order through the rANS state, the final state first and then per token the
+renormalisation bits and the raw hybrid-uint bits, so the files are
+byte-identical to the GPU path's. `SJXL_ENC_CPU=0` keeps the kernels (the
+reference); the `[enc-cpu]` test encodes five configurations both ways
+(single section, several groups, two progressive modes, a DC frame) and the
+same was checked by hand on JPEG recompression (4:4:4, 4:2:0, grey) and a
+partial-frame animation. Frames with an alpha channel keep the GPU path (the
+alpha modular group that follows the AC stream is not ported).
+
+1920x1080 lossy encode (M5 Pro, debug build): 544 → 187 ms. Left: the blob
+writers (43 ms, single-thread ANS histogram, context map and tree writers:
+small data, pure latency), the AC token readback (24 ms for the 25 MB
+per-slot token buffer; a compacted token list would cut it), the two
+strategy passes (50 ms) and the CPU chains themselves (18 + 19 ms, of which a
+part is waiting for the GPU work before each readback). cjxl -e 5: 90 ms.

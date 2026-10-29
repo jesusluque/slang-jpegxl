@@ -39,7 +39,7 @@ cjxl in.png ref.jxl -d 1 -e 5 ; djxl out.jxl check.png      # Homebrew oracle (/
   They SKIP when no device opens and never fall back. `tests/support/TestDevice.h`
   gives one device and shader library per process.
 - **Environment**: `SJXL_TIMING=1` (per-stage times, encoder and decoder),
-  `SJXL_PERF_SKIP=bits` (decoder timing experiments), `SJXL_DC_CPU=0` (DC groups on the GPU thread, the reference path), `SJXL_BACKEND=metal,cuda,vulkan` (order to try),
+  `SJXL_PERF_SKIP=bits` (decoder timing experiments), `SJXL_DC_CPU=0` / `SJXL_ENC_CPU=0` (the decoder's DC groups / the encoder's DC tokens and ANS sections on the GPU threads, the reference paths), `SJXL_BACKEND=metal,cuda,vulkan` (order to try),
   `SJXL_GPU_VALIDATION=1` (debug layers), `SJXL_SHADER_DIR`, `SJXL_SHADER_CACHE`
   (default `~/Library/Caches/sjxl/shaders`).
 - **Toolchain**: Slang 2026.14.1 at `~/tools/slang` (`SLANG_ROOT`), slang-rhi
@@ -61,9 +61,14 @@ cjxl in.png ref.jxl -d 1 -e 5 ; djxl out.jxl check.png      # Homebrew oracle (/
   and the `[dc-cpu]` test requires both to be bit-identical. The CPU also runs
   the strategy raster walk of those groups (validation + one triplet per
   varblock); DequantDC, buckets, CfL tiles and the acs/qf grids are the
-  `hostDc*` kernels in `sections.slang`. Any further CPU step needs the same
-  justification (a serial chain the GPU cannot split), the same fallback and
-  the same test. Tests check results with kernels too (mismatch
+  `hostDc*` kernels in `sections.slang`. The encoder's counterpart
+  (`modules/encoder/src/EntropyCpu.cpp`, docs "M5: the encoder's serial
+  chains"): the DC tokens through the weighted predictor and the ANS emission
+  of every section run on CPU cores from the GPU's tokens, tables and blobs,
+  writing byte-identical files (`SJXL_ENC_CPU=0` keeps the kernels, the
+  `[enc-cpu]` test compares; alpha frames stay on the GPU). Any further CPU
+  step needs the same justification (a serial chain the GPU cannot split),
+  the same fallback and the same test. Tests check results with kernels too (mismatch
   counters, PSNR/max-diff metrics) and read back only counters, section
   sizes or the final bytes/pixels to write a file.
 - **Shader parameters are bound by name** through reflection
@@ -171,6 +176,9 @@ layout (section bit offsets and byte sizes) → bit emission by
 `InterlockedOr` into a zeroed body buffer (every chain placed backwards by
 its thread) → readback of sizes and body; CPU writes headers (LoopFilter:
 Gaborish above d 0.5, EPF iterations by distance) + TOC and appends the body.
+By default the DC tokens and the ANS chains run on CPU cores instead
+(`EntropyCpu.cpp`: the kernels' tokens, tables and blobs are read back, each
+section is one task, the body is assembled on the CPU; same bytes).
 `sjxl encode --no-aq --no-cfl --no-filters --no-acs --lambda x --clusters n`
 switch the stages off or tune them for A/B runs (`--no-specials` drops the 8×8
 special transforms, `SJXL_ACS_MASK` limits the families); `SJXL_DEBUG=1`

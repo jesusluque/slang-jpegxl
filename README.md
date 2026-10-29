@@ -8,8 +8,10 @@ histograms, code tables, bit emission and symbol decoding run on the GPU,
 entropy coding included. One exception, taken deliberately: the decoder's DC
 group streams (one serial ANS chain per 2048-pixel group, which a lone GPU
 thread walks at 1 µs a sample) are decoded on the CPU when the frame allows
-it; the GPU path stays and the two are tested bit-identical
-(`docs/decisions.md`, "The DC groups on the CPU").
+it, and the encoder's DC tokens and ANS section chains run on CPU cores from
+the GPU's tokens and tables; the GPU paths stay and the two are tested
+bit-identical (`docs/decisions.md`, "The DC groups on the CPU" and "M5: the
+encoder's serial chains"). 1080p on an M5 Pro: encode 0.19 s, decode 0.09 s.
 
 Status: the decoder reproduces djxl's output on everything `cjxl` emits on
 the test images, lossy and lossless: VarDCT with every transform size, Modular

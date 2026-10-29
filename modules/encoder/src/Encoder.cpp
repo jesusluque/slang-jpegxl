@@ -1,6 +1,8 @@
 // Copyright (c) 2026 jesus luque.
 #include "sjxl/encoder/Encoder.h"
 
+#include "sjxl/encoder/EntropyCpu.h"
+
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -149,6 +151,7 @@ Result<std::unique_ptr<Encoder>> Encoder::create(std::shared_ptr<gpu::ShaderLibr
     SJXL_ASSIGN(enc->cflTile_, gpu::ComputeKernel::create(lib, "sjxl/enc/cfl", "cflTile"));
     SJXL_ASSIGN(enc->quantize_, gpu::ComputeKernel::create(lib, "sjxl/enc/quantize", "quantize"));
     SJXL_ASSIGN(enc->dcTokenize_, gpu::ComputeKernel::create(lib, "sjxl/enc/dc_tokens", "dcTokenize"));
+    SJXL_ASSIGN(enc->dcTokenCount_, gpu::ComputeKernel::create(lib, "sjxl/enc/dc_tokens", "dcTokenCount"));
     SJXL_ASSIGN(enc->metaTokenize_, gpu::ComputeKernel::create(lib, "sjxl/enc/dc_tokens", "metaTokenize"));
     SJXL_ASSIGN(enc->dcGroupSections_, gpu::ComputeKernel::create(lib, "sjxl/enc/dc_tokens", "dcGroupSections"));
     SJXL_ASSIGN(enc->clusterContexts_, gpu::ComputeKernel::create(lib, "sjxl/enc/cluster", "clusterContexts"));
@@ -539,6 +542,12 @@ Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, cons
     // DC group g, P + 1 + 2g its AcMetadata, then the alpha channel's modular stream
     // when there is one.
     const bool hasAlpha = image.channels == 4;
+    // The serial entropy chains on the CPU (EntropyCpu.h): DC tokens and the ANS
+    // sections; the GPU path stays the reference (SJXL_ENC_CPU=0). Alpha frames
+    // append a modular group to every AC section, which the port leaves out.
+    const bool cpuEntropy = !hasAlpha && platform::env("SJXL_ENC_CPU") != "0";
+    cpu::FrameGeom cpuGeom;
+    std::vector<cpu::Rect> cpuAcRects, cpuDcRects;
     const bool ecFits = image.width <= dim.groupDim && image.height <= dim.groupDim;
     const uint32_t numEcSets = hasAlpha ? 1 : 0;
     const uint32_t ecSet = numPasses + 2 * numDcGroups;
@@ -1058,7 +1067,35 @@ Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, cons
         c["params"]["vshift"].setData(vshift);
     };
     timer.mark("quantize + ac tokens");
-    if (!frame.useDcFrame) dcTokenize_.dispatch(batch, {numDcGroups, 1, 1}, [&](rhi::ShaderCursor c) { bindDc(c, 0, dummy_); });
+    std::vector<uint32_t> cpuDcTokens;
+    if (cpuEntropy) {
+        for (const Uint4& r : acRects) cpuAcRects.push_back({r.x, r.y, r.z, r.w});
+        for (const Uint4& r : dcRects) cpuDcRects.push_back({r.x, r.y, r.z, r.w});
+        cpuGeom.nblocks = nblocks;
+        cpuGeom.blocksX = dim.xsizeBlocks;
+        cpuGeom.blocksY = dim.ysizeBlocks;
+        cpuGeom.numGroups = numGroups;
+        cpuGeom.numDcGroups = numDcGroups;
+        cpuGeom.numPasses = numPasses;
+        cpuGeom.useDcFrame = frame.useDcFrame;
+        cpuGeom.packed = singleSection;
+        for (size_t c = 0; c < 3; ++c) { cpuGeom.hshift[c] = hshift[c]; cpuGeom.vshift[c] = vshift[c]; }
+        cpuGeom.acRects = cpuAcRects;
+        cpuGeom.dcRects = cpuDcRects;
+    }
+    if (!frame.useDcFrame) {
+        if (cpuEntropy) {
+            SJXL_TRY(batch.submit(true));
+            SJXL_ASSIGN(const std::vector<int32_t> dcQuantHost, dcQuant.readAll<int32_t>(dev));
+            cpu::dcTokenize(cpuGeom, dcQuantHost, dcTreeWords, cpuDcTokens);
+            SJXL_ASSIGN(dcTokens, gpu::Buffer::fromSpan<uint32_t>(dev, cpuDcTokens, "enc.dcTokens"));
+            dcTokenCount_.dispatch(batch, {3 * nblocks, 1, 1}, [&](rhi::ShaderCursor c) { bindDc(c, 0, dummy_); });
+            timer.mark("dc tokens (cpu)");
+        } else {
+            dcTokenize_.dispatch(batch, {numDcGroups, 1, 1}, [&](rhi::ShaderCursor c) { bindDc(c, 0, dummy_); });
+            timer.mark("dc tokens (wp)");
+        }
+    }
     metaTokenize_.dispatch(batch, {metaItems, 1, 1}, [&](rhi::ShaderCursor c) { bindDc(c, 0, dummy_); });
     if (hasAlpha) {
         // The alpha channel: both predictor passes, the choice (bookkeeping on two
@@ -1207,7 +1244,9 @@ Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, cons
     // The ANS sections (one thread per AC group, one per DC group) measured in mode 1 and emitted in mode 2.
     const auto sectionPasses = [&](uint32_t mode, const gpu::Buffer& body) {
         acSections_.dispatch(batch, {numGroups * numPasses, 1, 1}, [&](rhi::ShaderCursor c) { bindSections(c, mode, body); });
+        timer.mark(mode == 1 ? "ac sections count" : "ac sections emit");
         dcGroupSections_.dispatch(batch, {numDcGroups, 1, 1}, [&](rhi::ShaderCursor c) { bindDc(c, mode, body); });
+        timer.mark(mode == 1 ? "dc sections count" : "dc sections emit");
     };
 
     // Every histogram set's contexts clustered into its codes' histograms.
@@ -1308,8 +1347,9 @@ Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, cons
     dcGroupMid_.dispatchGroups(batch, {numDcGroups, 1, 1}, bindCodes);
     globalBlobs_.dispatchGroups(batch, {1, 1, 1}, bindCodes);
     if (jpeg != nullptr) quantTableBlob_.dispatchGroups(batch, {1, 1, 1}, bindCodes);
+    timer.mark("blobs");
 
-    sectionPasses(1, dummy_);   // bit counts
+    if (!cpuEntropy) sectionPasses(1, dummy_);   // bit counts
 
     const auto bindLayout = [&](rhi::ShaderCursor c, const gpu::Buffer& body) {
         c["blobBits"].setBinding(blobBits.rhi());
@@ -1331,9 +1371,68 @@ Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, cons
         c["params"]["acPostRegion"].setData(acPostRegion);
         c["params"]["numBlobRegions"].setData(numBlobRegions);
     };
-    timer.mark("codes");
-    layout_.dispatch(batch, {1, 1, 1}, [&](rhi::ShaderCursor c) { bindLayout(c, dummy_); });
-    SJXL_TRY(batch.submit(true));
+    // The sections: on the CPU (readback of tokens, tables and blobs, every chain in
+    // parallel, the body assembled) or by the layout + emit kernels.
+    std::vector<uint32_t> sizes, partsHost, acOnlyHost;
+    std::vector<uint8_t> bodyOut;
+    if (cpuEntropy) {
+        SJXL_TRY(batch.submit(true));
+        SJXL_ASSIGN(const auto acsHost, acs.readAll<uint32_t>(dev));
+        SJXL_ASSIGN(const auto nzHost, passNonZeros.readAll<uint32_t>(dev));
+        SJXL_ASSIGN(const auto acTokensHost, acTokens.readAll<uint32_t>(dev));
+        SJXL_ASSIGN(const auto numTokensHost, numTokens.readAll<uint32_t>(dev));
+        SJXL_ASSIGN(const auto nzCtxHost, nzCtx.readAll<uint32_t>(dev));
+        SJXL_ASSIGN(const auto metaTokensHost, metaTokens.readAll<uint32_t>(dev));
+        SJXL_ASSIGN(const auto ctxMapHost, ctxMap.readAll<uint32_t>(dev));
+        SJXL_ASSIGN(const auto ansInfoHost, ansInfo.readAll<uint32_t>(dev));
+        SJXL_ASSIGN(const auto ansReverseHost, ansReverse.readAll<uint32_t>(dev));
+        SJXL_ASSIGN(const auto blobsHost, blobs.readAll<uint32_t>(dev));
+        SJXL_ASSIGN(const auto blobBitsHost, blobBits.readAll<uint32_t>(dev));
+        if (frame.useDcFrame) cpuDcTokens.assign(size_t{3} * nblocks, cpu::kNoToken);
+        timer.mark("readback for sections");
+        cpu::SectionsInput in;
+        in.geom = cpuGeom;
+        in.acs = acsHost;
+        in.nonZeros = nzHost;
+        in.acTokens = acTokensHost;
+        in.numTokens = numTokensHost;
+        in.nzCtx = nzCtxHost;
+        in.dcTokens = cpuDcTokens;
+        in.metaTokens = metaTokensHost;
+        in.ctxMap = ctxMapHost;
+        in.ansInfo = ansInfoHost;
+        in.ansReverse = ansReverseHost;
+        in.blobs = blobsHost;
+        in.blobBits = blobBitsHost;
+        in.qtBlobRegion = qtBlobRegion;
+        in.acPostRegion = acPostRegion;
+        SJXL_ASSIGN(cpu::SectionsOutput sec, cpu::emitSections(in));
+        sizes = std::move(sec.sectionBytes);
+        partsHost = std::move(sec.dcPartStart);
+        acOnlyHost = std::move(sec.acOnlyBits);
+        bodyOut = std::move(sec.body);
+        timer.mark("sections (cpu)");
+    } else {
+        layout_.dispatch(batch, {1, 1, 1}, [&](rhi::ShaderCursor c) { bindLayout(c, dummy_); });
+        SJXL_TRY(batch.submit(true));
+        SJXL_ASSIGN(sizes, sectionBytes.readAll<uint32_t>(dev));
+        SJXL_ASSIGN(partsHost, dcPartStart.readAll<uint32_t>(dev));
+        SJXL_ASSIGN(acOnlyHost, acOnlyBits.readAll<uint32_t>(dev));
+        SJXL_ASSIGN(const std::vector<uint32_t> totalsHost, totals.readAll<uint32_t>(dev));
+        const uint32_t bodyWordsCount = totalsHost[0];
+        if (bodyWordsCount == 0) return Error(ErrorCode::InternalError, "the layout produced an empty body");
+        // The body: zero, then every section and blob ORs its bits in.
+        SJXL_ASSIGN(auto body, gpu::Buffer::ofType<uint32_t>(dev, (bodyWordsCount + 3) / 4 + 1, "enc.body"));
+        sectionPasses(2, body);
+        timer.mark("layout + size readback");
+        blobEmit_.dispatch(batch, {numBlobRegions, 1, 1}, [&](rhi::ShaderCursor c) { bindLayout(c, body); });
+        SJXL_TRY(batch.submit(true));
+        SJXL_ASSIGN(const std::vector<uint32_t> bodyWords, body.readAll<uint32_t>(dev));
+        bodyOut.assign(reinterpret_cast<const uint8_t*>(bodyWords.data()), reinterpret_cast<const uint8_t*>(bodyWords.data()) + bodyWordsCount);
+        timer.mark("emit + body readback");
+    }
+    const uint32_t bodyBytes = static_cast<uint32_t>(bodyOut.size());
+    if (bodyBytes == 0) return Error(ErrorCode::InternalError, "the layout produced an empty body");
     SJXL_ASSIGN(const std::vector<uint32_t> clusterInfoHost, clusterInfo.readAll<uint32_t>(dev));
     stats_.numAcClusters = clusterInfoHost[0];
     stats_.globalScale = qp.globalScale;
@@ -1368,14 +1467,12 @@ Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, cons
             log::info("enc debug: acs row {:3} {}", by, row);
         }
         SJXL_ASSIGN(const auto blobBitsHost, blobBits.readAll<uint32_t>(dev));
-        SJXL_ASSIGN(const auto sizesHost, sectionBytes.readAll<uint32_t>(dev));
         std::string sections;
-        for (uint32_t b : sizesHost) sections += std::format("{} ", b);
+        for (uint32_t b : sizes) sections += std::format("{} ", b);
         log::info("enc debug: blob bits DcGlobal {} AcGlobal {}; section bytes {}", blobBitsHost[0],
                   blobBitsHost[1] + blobBitsHost[qtBlobRegion] + blobBitsHost[acPostRegion], sections);
         SJXL_ASSIGN(const auto passNzHost, passNonZeros.readAll<uint32_t>(dev));
         SJXL_ASSIGN(const auto numTokensHost, numTokens.readAll<uint32_t>(dev));
-        SJXL_ASSIGN(const auto acOnlyHost, acOnlyBits.readAll<uint32_t>(dev));
         for (uint32_t p = 0; p < numPasses; ++p) {
             uint64_t nzSum = 0, tokSum = 0;
             for (uint32_t i = 0; i < 3 * nblocks; ++i) { nzSum += passNzHost[p * 3 * nblocks + i]; tokSum += numTokensHost[p * 3 * nblocks + i]; }
@@ -1403,32 +1500,16 @@ Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, cons
             for (uint32_t b = 0; b < 6; ++b) rev += std::format("{} ", ansReverseHost[(uint64_t{p} * kAcClusters) * 4096 + b]);
             log::info("enc debug: pass {} ctxMap census {}; ansInfo {}; reverse {}", p, census, info, rev);
         }
-        SJXL_ASSIGN(const auto partsHost, dcPartStart.readAll<uint32_t>(dev));
         uint64_t dcTokenBits = 0, metaTokenBits = 0, headBits = 0;
         for (uint32_t g = 0; g < numDcGroups; ++g) {
             const uint32_t pre = partsHost[g * 4], dcs = partsHost[g * 4 + 1], mid = partsHost[g * 4 + 2], meta = partsHost[g * 4 + 3];
             headBits += (dcs - pre) + (meta - mid);
             dcTokenBits += mid - dcs;
-            metaTokenBits += sizesHost[1 + g] * 8 - (meta - pre);
+            metaTokenBits += sizes[1 + g] * 8 - (meta - pre);
         }
         log::info("enc debug: DC groups: headers {} B, DC tokens {} B, AcMetadata tokens {} B", headBits / 8, dcTokenBits / 8, metaTokenBits / 8);
     }
 
-    SJXL_ASSIGN(const std::vector<uint32_t> totalsHost, totals.readAll<uint32_t>(dev));
-    SJXL_ASSIGN(std::vector<uint32_t> sizes, sectionBytes.readAll<uint32_t>(dev));
-    const uint32_t bodyBytes = totalsHost[0];
-    if (bodyBytes == 0) {
-        return Error(ErrorCode::InternalError, "the layout produced an empty body");
-    }
-
-    // The body: zero, then every section and blob ORs its bits in.
-    SJXL_ASSIGN(auto body, gpu::Buffer::ofType<uint32_t>(dev, (bodyBytes + 3) / 4 + 1, "enc.body"));
-    sectionPasses(2, body);
-    timer.mark("layout + size readback");
-    blobEmit_.dispatch(batch, {numBlobRegions, 1, 1}, [&](rhi::ShaderCursor c) { bindLayout(c, body); });
-    SJXL_TRY(batch.submit(true));
-    SJXL_ASSIGN(const std::vector<uint32_t> bodyWords, body.readAll<uint32_t>(dev));
-    timer.mark("emit + body readback");
     timer.report();
 
     // The frame header and TOC on the CPU, then the body.
@@ -1442,8 +1523,7 @@ Result<std::vector<uint8_t>> Encoder::encodeFrame(const image::Rgb8& image, cons
     stats_.headBytes = static_cast<uint32_t>(out.size());
     stats_.bodyBytes = bodyBytes;
     stats_.sectionBytes = sizes;
-    const auto* bodyBytesPtr = reinterpret_cast<const uint8_t*>(bodyWords.data());
-    out.insert(out.end(), bodyBytesPtr, bodyBytesPtr + bodyBytes);
+    out.insert(out.end(), bodyOut.begin(), bodyOut.end());
     if (!dcFrameBytes.empty()) out.insert(out.begin(), dcFrameBytes.begin(), dcFrameBytes.end());
     return out;
 }
