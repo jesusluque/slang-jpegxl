@@ -40,12 +40,18 @@ public:
 
     [[nodiscard]] const std::array<uint32_t, 3>& threadGroup() const noexcept { return program_->threadGroup; }
     [[nodiscard]] const std::string& name() const noexcept { return name_; }
-    [[nodiscard]] bool valid() const noexcept { return pipeline_ != nullptr; }
+    [[nodiscard]] bool valid() const noexcept { return program_ != nullptr; }
+
+    /// Builds the pipeline now (the first dispatch does it otherwise): the backend
+    /// compile of a big kernel takes seconds, so it is paid only by kernels used.
+    [[nodiscard]] Result<void> prepare() const;
 
 private:
-    std::string                        name_;
-    std::shared_ptr<const Program>     program_;
-    rhi::ComPtr<rhi::IComputePipeline> pipeline_;
+    std::string                                name_;
+    std::shared_ptr<const Program>             program_;
+    rhi::IDevice*                              device_ = nullptr;
+    mutable rhi::ComPtr<rhi::IComputePipeline> pipeline_;
+    mutable bool                               failed_ = false;
 };
 
 [[nodiscard]] constexpr uint32_t groupsFor(uint32_t threads, uint32_t perGroup) noexcept {

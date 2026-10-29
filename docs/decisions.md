@@ -1604,9 +1604,10 @@ Two follow-ups the same day took the decode to 90 ms:
   because the same thread goes on to decode the AC group).
 
 The first-run compile of `decodeGlobals` was 88 s on Metal (the kernel inlines
-the whole DC-global, DC-group, AC-global and AC-group decoders); `[noinline]` on
-those entry functions, `decodeModularStream` and `decodeHistograms` brought it
-to 1.8 s, with no pipeline over 500 ms.
+the whole DC-global, DC-group, AC-global and AC-group decoders). `[noinline]`
+appeared to bring it to 1.8 s; that was Metal's own compile cache (the source
+had not changed) and the attribute does not reach the Metal source Slang
+emits. The real fix is below ("First-run shader compiles").
 
 Timings (M5 Pro, debug build, SJXL_TIMING=1):
 
@@ -1752,3 +1753,35 @@ the CPU port's diagnostics) are visible; before, nothing ever raised it.
 
 1920x1080 lossless decode: 638 → 215 ms (the CPU groups 167 ms on 40 tasks,
 the copy kernels 26 ms, the globals thread 18 ms). djxl: 100 ms.
+
+## First-run shader compiles (2026-10-29)
+
+With a fresh shader cache a lossy 1080p decode spent about 170 s building
+pipelines: `decodeGlobals` 90 s, `decodeModularGlobals` 32 s, `decodeDcGroups`
+17 s, `decodeAcGroups` 8 s, the modular group kernels 6 s each. Metal's backend
+inlines everything a kernel reaches, so a kernel's compile time is its reachable
+code: Slang's `[noinline]` does not survive into the Metal source (the generated
+`.metal` has no such attribute), and the 1.8 s measured after adding it was
+Metal's system-level compile cache serving an unchanged kernel. slangc plus
+`xcrun metal -c` on the generated source take 1.4 s: the cost is the GPU
+backend at `newComputePipelineState`.
+
+Two changes:
+
+- **The single-section path has its own kernel.** A frame with one TOC entry
+  (one group, one pass) decodes DcGlobal, DC group 0, AcGlobal and AC group 0
+  in one thread; that path inlined the DC and AC group decoders into
+  `decodeGlobals`. `decodeSingleSection` holds it now; `decodeGlobals` compiles
+  in 23 s instead of 90 and only small images pay the 92 s of the other.
+- **Pipelines are built at first dispatch** (`ComputeKernel::prepare`), not at
+  `Decoder::create`: a decode builds only the kernels it dispatches. A
+  multi-section lossy decode with the CPU DC groups builds none of the
+  single-thread group kernels.
+
+A fresh-cache first decode is now about 25 s for a multi-section lossy file
+(`decodeGlobals`), about 40 s for a lossless one (`decodeModularGlobals` 32 s,
+whose modular image decoder with palette and squeeze cannot be split further
+without a second kernel for the global stream), 92 s more for the first
+single-section image. The disk cache (`SJXL_SHADER_CACHE`) makes every later
+run start in under a second. `SJXL_DEBUG=1` still lists the pipelines over
+500 ms.

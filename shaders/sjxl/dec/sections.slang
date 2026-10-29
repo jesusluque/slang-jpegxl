@@ -191,12 +191,16 @@ uint modularAcStream(uint g, uint pass) { return 1 + 3 * params.numDcGroups + 17
 
 // --- VarDCT -------------------------------------------------------------------------------
 
+/// DcGlobal and AcGlobal of a VarDCT frame with several sections. The single-section
+/// frame (one group, one pass: everything in one bit-packed section) has its own entry,
+/// decodeSingleSection, because the AC and DC group decoders it inlines quadruple the
+/// kernel's backend compile time, and the common frame must not pay it.
 [shader("compute")]
 [numthreads(1, 1, 1)]
 void decodeGlobals(uint3 tid: SV_DispatchThreadID) {
     gPerfSkip = params.perfSkip;
     gWideSamples = params.wideSamples;
-    gDeferOrders = params.singleSection == 0 ? 1u : 0u;
+    gDeferOrders = 1;
     if (tid.x != 0) return;
     for (uint i = 0; i < kGsHeaderSize; ++i) arena[i] = 0;
     arena[kGsHeaderSize - 1] = params.blocksX * params.blocksY;   // nblocks, read by the DC group body
@@ -206,21 +210,45 @@ void decodeGlobals(uint3 tid: SV_DispatchThreadID) {
     decodeDcGlobal(d, window, params.frameFlags, params.xsize, params.ysize, params.refW, params.refH, params.numEc);
     if (d.error == kErrNone) decodeModularImage(d, modularGeom(0), window);   // the extra channels
     arena[kGsDcGlobalBits] = d.br.pos - sections[0].x;
-    if (d.error == kErrNone && params.singleSection != 0) {
+    if (d.error == kErrNone) {
+        stage = 3;
+        d.br.pos = sections[1 + params.numDcGroups].x;
+        d.br.end = sections[1 + params.numDcGroups].y;
+        d.br.cacheWord = 0xFFFFFFFFu;
+        decodeAcGlobal(d, params.numGroups, params.numDcGroups, params.numPasses, window);
+        arena[kGsAcGlobalBits] = d.br.pos;
+    }
+    status[0] = d.error | (d.error != kErrNone ? (stage << 8) : 0);
+    arena[kGsError] = d.error;
+    arena[kGsArenaTop] = d.top;
+}
+
+/// A VarDCT frame in one TOC entry: DcGlobal, DC group 0, AcGlobal and AC group 0 in one thread.
+[shader("compute")]
+[numthreads(1, 1, 1)]
+void decodeSingleSection(uint3 tid: SV_DispatchThreadID) {
+    gPerfSkip = params.perfSkip;
+    gWideSamples = params.wideSamples;
+    gDeferOrders = 0;
+    if (tid.x != 0) return;
+    for (uint i = 0; i < kGsHeaderSize; ++i) arena[i] = 0;
+    arena[kGsHeaderSize - 1] = params.blocksX * params.blocksY;
+    Dec d = makeDec(0, kGsHeaderSize, params.globalsCap);
+    const uint window = windowFor(0);
+    uint stage = 1;
+    decodeDcGlobal(d, window, params.frameFlags, params.xsize, params.ysize, params.refW, params.refH, params.numEc);
+    if (d.error == kErrNone) decodeModularImage(d, modularGeom(0), window);
+    arena[kGsDcGlobalBits] = d.br.pos - sections[0].x;
+    if (d.error == kErrNone) {
         stage = 2;
         decodeDcGroup(d, dcGeom(0), window);
     }
     if (d.error == kErrNone) {
         stage = 3;
-        if (params.singleSection == 0) {
-            d.br.pos = sections[1 + params.numDcGroups].x;
-            d.br.end = sections[1 + params.numDcGroups].y;
-            d.br.cacheWord = 0xFFFFFFFFu;
-        }
         decodeAcGlobal(d, params.numGroups, params.numDcGroups, params.numPasses, window);
         arena[kGsAcGlobalBits] = d.br.pos;
     }
-    if (d.error == kErrNone && params.singleSection != 0) {
+    if (d.error == kErrNone) {
         stage = 4;
         decodeAcGroup(d, acGeom(0), 0, passShift(0), window);
         if (d.error == kErrNone) decodeModularGroup(d, 0, 0, params.groupDim, params.groupDim, passMinShift(0), passMaxShift(0), modularAcStream(0, 0), window);
@@ -503,6 +531,8 @@ void decodeModularGlobals(uint3 tid: SV_DispatchThreadID) {
     arena[kGsDcGlobalBits] = d.br.pos - sections[0].x;
     if (d.error == kErrNone && params.singleSection != 0) {
         // One section: DC group 0, (an empty AcGlobal), AC group 0 follow in the same bits.
+        // (The group decoder is already inlined here for the global stream, so this entry
+        // keeps the single-section case.)
         uint x0, y0, w, h;
         stage = 2;
         groupRect(0, true, x0, y0, w, h);

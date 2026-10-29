@@ -66,6 +66,7 @@ Result<std::unique_ptr<Decoder>> Decoder::create(std::shared_ptr<gpu::ShaderLibr
     dec->device_ = &dec->library_->device();
     gpu::ShaderLibrary& lib = *dec->library_;
     SJXL_ASSIGN(dec->globals_, gpu::ComputeKernel::create(lib, "sjxl/dec/sections", "decodeGlobals"));
+    SJXL_ASSIGN(dec->singleSection_, gpu::ComputeKernel::create(lib, "sjxl/dec/sections", "decodeSingleSection"));
     SJXL_ASSIGN(dec->dcGroups_, gpu::ComputeKernel::create(lib, "sjxl/dec/sections", "decodeDcGroups"));
     SJXL_ASSIGN(dec->acGroups_, gpu::ComputeKernel::create(lib, "sjxl/dec/sections", "decodeAcGroups"));
     SJXL_ASSIGN(dec->buildNaturalOrders_, gpu::ComputeKernel::create(lib, "sjxl/dec/sections", "buildNaturalOrders"));
@@ -560,7 +561,7 @@ Result<Decoder::FrameOutput> Decoder::run(const codestream::Parsed& parsed, cons
         SJXL_ASSIGN(naturalOrders_, gpu::Buffer::ofType<uint32_t>(dev, uint64_t{kCoeffOrderLimit} * 64, "dec.naturalOrders"));
         buildNaturalOrders_.dispatch(batch, {39, 1, 1}, bindSections);
     }
-    globals_.dispatch(batch, {1, 1, 1}, bindSections);
+    (frame.singleSection ? singleSection_ : globals_).dispatch(batch, {1, 1, 1}, bindSections);
     if (!frame.singleSection) finishOrders_.dispatch(batch, {kCoeffOrderLimit * 64, frame.header.numPasses, 1}, bindSections);
     timer.mark("globals");
     if (!useDcFrame && numEc == 0 && !frame.singleSection && cpuAllowed) {

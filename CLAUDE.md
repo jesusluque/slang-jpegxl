@@ -110,13 +110,14 @@ cjxl in.png ref.jxl -d 1 -e 5 ; djxl out.jxl check.png      # Homebrew oracle (/
   run-length coded widths); single-thread kernels keep 256-entry scratch in
   groupshared arrays, never private ones (Metal's compiler hangs). Context maps over many
   contexts are MTF + ANS streams; the headers' MA trees use prefix codes.
-- **Big single-thread kernels compile slowly on Metal** (seconds to never in
-  `newComputePipelineState`) when they inline several copies of a large
-  function: mark such functions `[noinline]` (the ANS histogram writers,
-  context map and tree writers are, and the decoder's decodeDcGlobal /
-  decodeAcGlobal / decodeDcGroup / decodeAcGroup / decodeModularStream /
-  decodeHistograms: the globals kernel went from 88 s to 1.8 s), keep one copy
-  per kernel, and check with
+- **Big single-thread kernels compile slowly on Metal** (tens of seconds in
+  `newComputePipelineState`): the backend inlines everything a kernel reaches,
+  and Slang's `[noinline]` does not reach the Metal source, so the only lever
+  is reachable code per entry point. Keep rarely used paths in their own
+  entries (`decodeSingleSection`), one copy of a big function per kernel;
+  pipelines are built at first dispatch (`ComputeKernel::prepare`), so unused
+  kernels cost nothing. Metal's own compile cache hides the cost for unchanged
+  kernels: measure with a fresh `SJXL_SHADER_CACHE` *and* a source change. Check with
   `SJXL_DEBUG=1`, which logs every pipeline that takes over 500 ms to build
   (`SJXL_DEBUG_DISPATCH=1` traces dispatches).
 - **Metal buffers have no bounds checks**: a kernel writing past a buffer
