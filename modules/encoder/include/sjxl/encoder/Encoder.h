@@ -39,6 +39,8 @@ struct Options {
     bool acStrategy = true;
     /// The selection's distortion weight: bits per squared quant step of rounding error.
     float acsLambda = 8.0f;
+    /// The 8x8 special transforms (IDENTITY, DCT2x2, DCT4x4, DCT4x8, DCT8x4, AFV) compete with DCT8.
+    bool acsSpecials = true;
 };
 
 /// What the last encode measured, for tests and the CLI.
@@ -68,7 +70,7 @@ private:
     gpu::Device*                        device_ = nullptr;
     gpu::ComputeKernel                  rgbToXyb_, aqDiff_, aqMap_, aqRawField_;
     gpu::ComputeKernel                  gaborishInverse_, cflTile_, quantize_;
-    gpu::ComputeKernel                  tables_, buildOrders_, selectStrategies_, adjustQuantField_, dctRows_, dctCols_, dcFromLlf_, acTokenize_;
+    gpu::ComputeKernel                  tables_, buildOrders_, selectStrategies_, adjustQuantField_, dctRows_, dctCols_, dcFromLlf_, specialTransform_, acTokenize_;
     gpu::ComputeKernel                  dcItems_, metaItems_, clusterContexts_, accumulateClusters_, acSections_;
     gpu::ComputeKernel                  rctYCoCg_, modHist_, modGroupSections_, modularGlobalBlob_;
     gpu::ComputeKernel                  dcGroupBlobs_, globalBlobs_, layout_, blobEmit_;

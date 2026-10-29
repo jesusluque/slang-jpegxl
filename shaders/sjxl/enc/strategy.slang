@@ -16,6 +16,7 @@
 module enc_strategy;
 
 #include "sjxl/common/transform_basis.slangh"
+#include "sjxl/enc/special.slangh"
 
 static const uint kThreads = 256;
 static const uint kNumCandidates = 41;
@@ -32,7 +33,8 @@ struct StrategyParams {
     float distance;    // AdjustQuantField's mean/max mix
     uint  enabled;     // 0: every block DCT8
     uint  familyMask;  // bit f: family f (0 32x32, 1 32x16, 2 16x32, 3 16x16, 4 16x8, 5 8x16, 6 8x8) may be chosen
-    uint  pad0, pad1, pad2;
+    uint  specials;    // 1: the 8x8 special transforms compete with DCT8
+    uint  pad1, pad2;
 };
 
 StructuredBuffer<float>    xyb;          // 3 planes; only Y is read
@@ -52,6 +54,8 @@ groupshared uint  gBits[kNumCandidates];
 groupshared uint  gDist[kNumCandidates];
 groupshared float gQf[kNumCandidates];
 groupshared uint  gValid[kNumCandidates];
+groupshared uint  gBest8[16];          // the 8x8 strategy of every block (DCT8 or a special one)
+groupshared float gBest8Cost[16];
 
 // Families: strategy, varblock pixels, varblocks across and down, first candidate.
 static const uint kFamStrategy[7] = {5, 10, 11, 4, 6, 7, 0};
@@ -184,6 +188,42 @@ void selectStrategies(uint3 gid: SV_GroupID, uint3 gtid: SV_GroupThreadID) {
         GroupMemoryBarrierWithGroupSync();
     }
 
+    // The 8x8 special transforms: one thread per block tries every special
+    // strategy (the whole transform and its cost) and keeps the cheapest.
+    if (tid < 16) {
+        const uint b = tid;
+        gBest8[b] = 0;
+        gBest8Cost[b] = gValid[25 + b] != 0 ? (float(gBits[25 + b]) + params.lambda * float(gDist[25 + b])) / kCostScale : 0.0f;
+        if (params.specials != 0 && gValid[25 + b] != 0) {
+            const uint kSpecials[9] = {1, 2, 3, 12, 13, 14, 15, 16, 17};
+            const uint x0 = (b % 4) * 8, y0 = (b / 4) * 8;
+            float pix[64];
+            for (uint y = 0; y < 8; ++y) for (uint x = 0; x < 8; ++x) pix[y * 8 + x] = gY[(y0 + y) * 32 + x0 + x];
+            const float quantMul = gsf * gQf[25 + b];
+            for (uint si = 0; si < 9; ++si) {
+                const uint strategy = kSpecials[si];
+                float coef[64];
+                forwardSpecial(strategy, pix, coef);
+                const uint tableBase = kTableBase[kStrategyToTable[strategy]];
+                float bits = 0.0f, dist = 0.0f;
+                for (uint m = 1; m < 64; ++m) {
+                    const float val = coef[m] * quantMul / dequant[tableBase + 1 * 64 + m];
+                    const float threshold = ((m / 8) < 4 && (m % 8) < 4) ? 0.56f : 0.62f;
+                    const float q = abs(val) < threshold ? 0.0f : round(val);
+                    const float err = val - q;
+                    bits += bitsOf(q);
+                    dist += min(err * err, 64.0f);
+                }
+                const float cost = bits + params.lambda * dist;
+                if (cost < gBest8Cost[b]) {
+                    gBest8Cost[b] = cost;
+                    gBest8[b] = strategy;
+                }
+            }
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+
     if (tid != 0) return;
     // An invalid candidate never wins; a block beyond the grid costs nothing (it
     // is not coded), so the four-DCT8 option of every quadrant stays finite.
@@ -191,6 +231,9 @@ void selectStrategies(uint3 gid: SV_GroupID, uint3 gtid: SV_GroupThreadID) {
     float cost[kNumCandidates];
     for (uint c = 0; c < kNumCandidates; ++c) {
         cost[c] = gValid[c] != 0 ? (float(gBits[c]) + params.lambda * float(gDist[c])) / kCostScale : (c >= 25 ? 0.0f : kInvalid);
+    }
+    for (uint b = 0; b < 16; ++b) {
+        if (gValid[25 + b] != 0) cost[25 + b] = gBest8Cost[b];   // the block's best 8x8 transform
     }
     // Per quadrant: 16x16, two 16x8 (vertical pairs), two 8x16 (horizontal pairs), or four 8x8.
     uint quadChoice[4];
@@ -233,7 +276,7 @@ void selectStrategies(uint3 gid: SV_GroupID, uint3 gtid: SV_GroupThreadID) {
             const uint q = (ly / 2) * 2 + lx / 2;
             const uint choice = quadChoice[q];
             s = strategies[choice];
-            if (choice == 0) { fbx = bx; fby = by; }
+            if (choice == 0) { s = gBest8[i]; fbx = bx; fby = by; }
             else if (choice == 1) { fbx = bx0 + (lx / 2) * 2; fby = by0 + (ly / 2) * 2; }
             else if (choice == 2) { fbx = bx; fby = by0 + (ly / 2) * 2; }           // 8 wide, 16 tall
             else { fbx = bx0 + (lx / 2) * 2; fby = by; }                           // 16 wide, 8 tall

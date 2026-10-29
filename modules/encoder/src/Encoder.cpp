@@ -86,6 +86,7 @@ Result<std::unique_ptr<Encoder>> Encoder::create(std::shared_ptr<gpu::ShaderLibr
     SJXL_ASSIGN(enc->dctRows_, gpu::ComputeKernel::create(lib, "sjxl/enc/transform", "dctRows"));
     SJXL_ASSIGN(enc->dctCols_, gpu::ComputeKernel::create(lib, "sjxl/enc/transform", "dctCols"));
     SJXL_ASSIGN(enc->dcFromLlf_, gpu::ComputeKernel::create(lib, "sjxl/enc/transform", "dcFromLlf"));
+    SJXL_ASSIGN(enc->specialTransform_, gpu::ComputeKernel::create(lib, "sjxl/enc/transform", "specialTransform"));
     SJXL_ASSIGN(enc->acTokenize_, gpu::ComputeKernel::create(lib, "sjxl/enc/transform", "acTokenize"));
     SJXL_ASSIGN(enc->cflTile_, gpu::ComputeKernel::create(lib, "sjxl/enc/cfl", "cflTile"));
     SJXL_ASSIGN(enc->quantize_, gpu::ComputeKernel::create(lib, "sjxl/enc/quantize", "quantize"));
@@ -253,6 +254,8 @@ Result<std::vector<uint8_t>> Encoder::encode(const image::Rgb8& image, const Opt
         c["params"]["height"].setData(image.height);
         c["params"]["paddedWidth"].setData(dim.xsizePadded);
         c["params"]["paddedHeight"].setData(dim.ysizePadded);
+        c["params"]["transfer"].setData(uint32_t{image.gamma > 0.0f ? 2u : 0u});
+        c["params"]["gammaInv"].setData(image.gamma > 0.0f ? 1.0f / image.gamma : 1.0f);
     });
 
     // The quant field (from the planes before the inverse Gaborish), then the
@@ -312,6 +315,7 @@ Result<std::vector<uint8_t>> Encoder::encode(const image::Rgb8& image, const Opt
         uint32_t familyMask = 0x7F;
         if (const std::string m = platform::env("SJXL_ACS_MASK"); !m.empty()) familyMask = static_cast<uint32_t>(std::strtoul(m.c_str(), nullptr, 0));
         c["params"]["familyMask"].setData(familyMask);
+        c["params"]["specials"].setData(uint32_t{options.acsSpecials ? 1u : 0u});
     });
     const auto bindTransform = [&](rhi::ShaderCursor c) {
         c["xyb"].setBinding(planes.rhi());
@@ -335,8 +339,35 @@ Result<std::vector<uint8_t>> Encoder::encode(const image::Rgb8& image, const Opt
         c["params"]["distance"].setData(options.distance);
     };
     adjustQuantField_.dispatch(batch, {nblocks, 1, 1}, bindTransform);
+    // Oracle experiment: another encoder's quant field and strategy map (as the
+    // decoder's SJXL_DEBUG_MAPS dumps them) replace ours.
+    const std::string oracleMaps = platform::env("SJXL_ENC_MAPS");
+    gpu::Buffer oracleQf, oracleAcs, oracleFirst;
+    if (!oracleMaps.empty()) {
+        SJXL_ASSIGN(const auto bytes, image::readFile(oracleMaps));
+        if (bytes.size() != size_t{nblocks} * 8) return Error(ErrorCode::InvalidArgument, "SJXL_ENC_MAPS: wrong size");
+        std::vector<uint32_t> qfMap(nblocks), acsMap(nblocks), firstMap(nblocks);
+        std::memcpy(qfMap.data(), bytes.data(), nblocks * 4);
+        std::memcpy(acsMap.data(), bytes.data() + nblocks * 4, nblocks * 4);
+        for (uint32_t b = 0; b < nblocks; ++b) {
+            if (acsMap[b] & 1) {
+                const uint32_t st = acsMap[b] >> 1;
+                static constexpr uint32_t kCx[27] = {1, 1, 1, 1, 2, 4, 1, 2, 1, 4, 2, 4, 1, 1, 1, 1, 1, 1, 8, 4, 8, 16, 8, 16, 32, 16, 32};
+                static constexpr uint32_t kCy[27] = {1, 1, 1, 1, 2, 4, 2, 1, 4, 1, 4, 2, 1, 1, 1, 1, 1, 1, 8, 8, 4, 16, 16, 8, 32, 32, 16};
+                for (uint32_t y = 0; y < kCy[st]; ++y)
+                    for (uint32_t x = 0; x < kCx[st]; ++x) firstMap[b + y * dim.xsizeBlocks + x] = b;
+            }
+        }
+        SJXL_ASSIGN(oracleQf, gpu::Buffer::fromSpan<uint32_t>(dev, qfMap, "enc.oracleQf"));
+        SJXL_ASSIGN(oracleAcs, gpu::Buffer::fromSpan<uint32_t>(dev, acsMap, "enc.oracleAcs"));
+        SJXL_ASSIGN(oracleFirst, gpu::Buffer::fromSpan<uint32_t>(dev, firstMap, "enc.oracleFirst"));
+        batch.copy(oracleQf, 0, rawQf, 0, uint64_t{nblocks} * 4);
+        batch.copy(oracleAcs, 0, acs, 0, uint64_t{nblocks} * 4);
+        batch.copy(oracleFirst, 0, firstBlock, 0, uint64_t{nblocks} * 4);
+    }
     dctRows_.dispatch(batch, {static_cast<uint32_t>(3 * planePixels), 1, 1}, bindTransform);
     dctCols_.dispatch(batch, {static_cast<uint32_t>(3 * planePixels), 1, 1}, bindTransform);
+    specialTransform_.dispatch(batch, {3 * nblocks, 1, 1}, bindTransform);
     dcFromLlf_.dispatch(batch, {3 * nblocks, 1, 1}, bindTransform);
     if (options.chromaFromLuma) {
         cflTile_.dispatch(batch, {tilesX * tilesY, 1, 1}, [&](rhi::ShaderCursor c) {
@@ -372,6 +403,7 @@ Result<std::vector<uint8_t>> Encoder::encode(const image::Rgb8& image, const Opt
         c["params"]["tilesX"].setData(tilesX);
         c["params"]["xQmMultiplier"].setData(static_cast<float>(std::pow(1.25, static_cast<int>(frame.xQmScale) - 2)));
         c["params"]["bQmMultiplier"].setData(static_cast<float>(std::pow(1.25, static_cast<int>(frame.bQmScale) - 2)));
+        c["params"]["noAdjust"].setData(uint32_t{platform::env("SJXL_ENC_NO_ADJUST").empty() ? 0u : 1u});
     });
     acTokenize_.dispatch(batch, {3 * nblocks, 1, 1}, bindTransform);
 
@@ -549,7 +581,7 @@ Result<std::vector<uint8_t>> Encoder::encode(const image::Rgb8& image, const Opt
 
     // Headers and TOC on the CPU, then the body.
     codestream::BitWriter head;
-    codestream::writeCodestreamHeaders(head, image.width, image.height);
+    codestream::writeCodestreamHeaders(head, image.width, image.height, image.gamma);
     codestream::writeFrameHeader(head, frame);
     if (dim.singleSection()) {
         sizes.assign(1, bodyBytes);
@@ -775,7 +807,7 @@ Result<std::vector<uint8_t>> Encoder::encodeLossless(const image::Rgb8& image, c
     SJXL_ASSIGN(const std::vector<uint32_t> clusterInfoHost, clusterInfo.readAll<uint32_t>(dev));
 
     codestream::BitWriter head;
-    codestream::writeCodestreamHeadersRgb(head, image.width, image.height, image.bitDepth, channels == 4);
+    codestream::writeCodestreamHeadersRgb(head, image.width, image.height, image.bitDepth, channels == 4, image.gamma);
     codestream::writeModularFrameHeader(head, channels == 4 ? 1 : 0);
     codestream::writeToc(head, sizes);
     std::vector<uint8_t> out = head.take();

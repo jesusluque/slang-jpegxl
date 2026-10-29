@@ -1,6 +1,8 @@
 // Copyright (c) 2026 jesus luque.
 #include "sjxl/codestream/Headers.h"
 
+#include <cmath>
+
 #include <cstring>
 
 namespace sjxl::codestream {
@@ -105,17 +107,52 @@ void writeF16(BitWriter& w, float value) {
     w.write(16, half);
 }
 
-void writeCodestreamHeaders(BitWriter& w, uint32_t xsize, uint32_t ysize) {
+namespace {
+
+const U32Enc kEnumEnc{{Val(0), Val(1), BitsOffset(4, 2), BitsOffset(6, 18)}};
+
+/// ColorEncoding: all_default (sRGB), or RGB with D65, sRGB primaries, a gamma
+/// transfer (color_encoding_cms.h kGammaMul) and the relative rendering intent.
+void writeColorEncoding(BitWriter& w, float gamma) {
+    if (gamma <= 0.0f) {
+        w.writeBool(true);
+        return;
+    }
+    w.writeBool(false);          // all_default
+    w.writeBool(false);          // want_icc
+    writeU32(w, kEnumEnc, 0);    // color_space RGB
+    writeU32(w, kEnumEnc, 1);    // white_point D65
+    writeU32(w, kEnumEnc, 1);    // primaries sRGB
+    w.writeBool(true);           // have_gamma
+    w.write(24, static_cast<uint32_t>(std::lround(static_cast<double>(gamma) * 10000000.0)));
+    writeU32(w, kEnumEnc, 1);    // rendering_intent relative
+}
+
+}   // namespace
+
+void writeCodestreamHeaders(BitWriter& w, uint32_t xsize, uint32_t ysize, float gamma) {
     w.write(8, 0xFF);
     w.write(8, 0x0A);
     writeSizeHeader(w, xsize, ysize);
-    w.writeBool(true);   // ImageMetadata all_default: 8-bit, xyb_encoded, sRGB
+    if (gamma <= 0.0f) {
+        w.writeBool(true);   // ImageMetadata all_default: 8-bit, xyb_encoded, sRGB
+    } else {
+        w.writeBool(false);   // ImageMetadata all_default
+        w.writeBool(false);   // extra_fields
+        w.writeBool(false);   // bit_depth.floating_point_sample
+        writeU32(w, U32Enc{{Val(8), Val(10), Val(12), BitsOffset(6, 1)}}, 8);
+        w.writeBool(true);    // modular_16_bit_buffer_sufficient
+        writeU32(w, U32Enc{{Val(0), Val(1), BitsOffset(4, 2), BitsOffset(12, 1)}}, 0);   // num_extra_channels
+        w.writeBool(true);    // xyb_encoded
+        writeColorEncoding(w, gamma);
+        writeU64(w, 0);       // extensions
+    }
     w.writeBool(true);   // transform_data all_default
     // The decoder jumps to a byte boundary before the frame header.
     w.zeroPadToByte();
 }
 
-void writeCodestreamHeadersRgb(BitWriter& w, uint32_t xsize, uint32_t ysize, uint32_t bitDepth, bool alpha) {
+void writeCodestreamHeadersRgb(BitWriter& w, uint32_t xsize, uint32_t ysize, uint32_t bitDepth, bool alpha, float gamma) {
     const U32Enc kBitsEnc{{Val(8), Val(10), Val(12), BitsOffset(6, 1)}};
     w.write(8, 0xFF);
     w.write(8, 0x0A);
@@ -141,7 +178,7 @@ void writeCodestreamHeadersRgb(BitWriter& w, uint32_t xsize, uint32_t ysize, uin
         }
     }
     w.writeBool(false);   // xyb_encoded
-    w.writeBool(true);    // ColorEncoding all_default: sRGB
+    writeColorEncoding(w, gamma);
     writeU64(w, 0);       // extensions
     w.writeBool(true);    // transform_data all_default
     w.zeroPadToByte();

@@ -2,6 +2,8 @@
 #include "sjxl/image/Image.h"
 
 #include <algorithm>
+#include <cmath>
+#include <string>
 #include <cstdio>
 #include <fstream>
 #include <span>
@@ -22,6 +24,53 @@ Result<void> writeFile(const std::filesystem::path& path, std::span<const uint8_
 
 namespace {
 
+uint32_t be32(const uint8_t* p) { return (uint32_t{p[0]} << 24) | (uint32_t{p[1]} << 16) | (uint32_t{p[2]} << 8) | p[3]; }
+
+/// The colour chunks of a PNG before its image data (libjxl's precedence: cICP,
+/// iCCP, sRGB, then gAMA with cHRM). Only a gAMA transfer over sRGB primaries is
+/// carried; an ICC profile or other primaries fall back to sRGB with a note.
+void scanPngColor(const std::filesystem::path& path, Rgb8& image) {
+    std::ifstream in(path, std::ios::binary);
+    std::vector<uint8_t> head(1 << 16);
+    in.read(reinterpret_cast<char*>(head.data()), static_cast<std::streamsize>(head.size()));
+    const size_t n = static_cast<size_t>(in.gcount());
+    static constexpr uint8_t kSig[8] = {0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A};
+    if (n < 8 || !std::equal(kSig, kSig + 8, head.data())) return;
+    float gamma = 0.0f;
+    bool srgb = false, icc = false, cicp = false, chrmOk = true;
+    for (size_t pos = 8; pos + 12 <= n;) {
+        const uint32_t len = be32(&head[pos]);
+        const std::string type(reinterpret_cast<const char*>(&head[pos + 4]), 4);
+        if (type == "IDAT" || type == "IEND" || pos + 12 + len > n) break;
+        const uint8_t* data = &head[pos + 8];
+        if (type == "gAMA" && len == 4) gamma = static_cast<float>(be32(data)) / 100000.0f;
+        if (type == "sRGB") srgb = true;
+        if (type == "iCCP") icc = true;
+        if (type == "cICP") cicp = true;
+        if (type == "cHRM" && len == 32) {
+            // sRGB primaries and D65 within the chunk's precision.
+            static constexpr uint32_t kSrgb[8] = {31270, 32900, 64000, 33000, 30000, 60000, 15000, 6000};
+            for (int i = 0; i < 8; ++i) {
+                const int32_t v = static_cast<int32_t>(be32(data + 4 * i));
+                if (std::abs(v - static_cast<int32_t>(kSrgb[i])) > 100) chrmOk = false;
+            }
+        }
+        pos += 12 + len;
+    }
+    if (cicp || icc || srgb) {
+        if (icc || cicp) std::fprintf(stderr, "sjxl: %s: an ICC profile or cICP chunk is not honoured; treating the samples as sRGB\n", path.string().c_str());
+        return;
+    }
+    if (!chrmOk) {
+        std::fprintf(stderr, "sjxl: %s: cHRM primaries differ from sRGB; treating them as sRGB\n", path.string().c_str());
+    }
+    if (gamma > 0.0f && std::abs(gamma - 1.0f / 2.2f) < 1e-6f + 0.002f) {
+        image.gamma = gamma;   // a plain gamma 2.2 transfer, not the sRGB curve, as libjxl reads it
+    } else if (gamma > 0.0f) {
+        image.gamma = gamma;
+    }
+}
+
 Result<Rgb8> readWithChannels(const std::filesystem::path& path, bool keepAlpha, bool keepDepth) {
     int w = 0, h = 0, channels = 0;
     if (!stbi_info(path.string().c_str(), &w, &h, &channels)) {
@@ -33,6 +82,7 @@ Result<Rgb8> readWithChannels(const std::filesystem::path& path, bool keepAlpha,
     image.width = static_cast<uint32_t>(w);
     image.height = static_cast<uint32_t>(h);
     image.channels = static_cast<uint32_t>(want);
+    scanPngColor(path, image);
     const size_t samples = static_cast<size_t>(w) * static_cast<size_t>(h) * static_cast<size_t>(want);
     if (sixteen) {
         stbi_us* data = stbi_load_16(path.string().c_str(), &w, &h, &channels, want);

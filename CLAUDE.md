@@ -116,8 +116,9 @@ Encoder stages (each a kernel, one `CommandBatch` per stage): sRGB8→XYB per
 pixel → adaptive quant field (libjxl's masking model per 4×4 cell and block,
 `aq.slang`; the quantizer's global scale is 0.39/distance as libjxl's hare
 tier) → inverse Gaborish → transform selection per 32×32 superblock
-(`strategy.slang`: DCT8, 8×16, 16×8, 16×16, 16×32, 32×16, 32×32 by a
-rate-distortion proxy, λ = 8) → separable forward DCT of every varblock
+(`strategy.slang`: DCT8 and the 8×8 specials IDENTITY/DCT2x2/DCT4x4/DCT4x8/
+DCT8x4/AFV, 8×16, 16×8, 16×16, 16×32, 32×16, 32×32 by a rate-distortion
+proxy, λ = 8) → separable forward DCT of every varblock
 (`transform.slang`, libjxl's coefficient memory; `common/transform_basis.slangh`
 holds the bases and strategy tables) → DC from the lowest frequencies →
 chroma-from-luma per 64 px tile (least squares on the scaled coefficients) →
@@ -136,9 +137,13 @@ backwards by their thread) → readback of sizes and body; CPU writes headers
 (LoopFilter: Gaborish above d 0.5, EPF iterations by distance) + TOC and
 appends the body.
 `sjxl encode --no-aq --no-cfl --no-filters --no-acs --lambda x --clusters n`
-switch the stages off or tune them for A/B runs (`SJXL_ACS_MASK` limits the
-transform families); `SJXL_DEBUG=1` prints the quantizer, cluster count,
-strategy census and map, blob bits and section bytes.
+switch the stages off or tune them for A/B runs (`--no-specials` drops the 8×8
+special transforms, `SJXL_ACS_MASK` limits the families); `SJXL_DEBUG=1`
+prints the quantizer, cluster count, strategy census and map, blob bits and
+section bytes. Oracle runs: `SJXL_DEBUG=1 SJXL_DEBUG_MAPS=f sjxl decode x.jxl`
+dumps a file's quant field and strategy map, `SJXL_ENC_MAPS=f` (plus
+`SJXL_ENC_NO_ADJUST=1`) encodes with them. PNG gAMA/cHRM/sRGB chunks are
+honoured as libjxl does (`image::Rgb8::gamma`; ICC profiles are not).
 
 Lossless (`--lossless`, RGB or RGBA at 8 or 16 bits; the lossy path takes
 8-bit RGB): a Modular frame, YCoCg RCT over the colour channels (alpha is the

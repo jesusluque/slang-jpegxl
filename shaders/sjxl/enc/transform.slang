@@ -18,6 +18,7 @@ module enc_transform;
 
 #include "sjxl/common/hybrid_uint.slangh"
 #include "sjxl/enc/ac_tokens.slangh"
+#include "sjxl/enc/special.slangh"
 
 struct TransformParams {
     uint  paddedWidth;
@@ -130,6 +131,25 @@ void dctCols(uint3 tid: SV_DispatchThreadID) {
         sum += rowPass[c * n + (y0 + y) * params.paddedWidth + px] * fdctBasis(v, y, vb.ny);
     }
     coeffs[coeffSlot(vb, c, nblocks(), params.blocksX, memIndex(v, u, vb.ny, vb.nx))] = sum;
+}
+
+/// One thread per block and channel with a special 8x8 strategy: its forward
+/// transform replaces the DCT the separable passes wrote.
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void specialTransform(uint3 tid: SV_DispatchThreadID) {
+    const uint nb = nblocks();
+    if (tid.x >= 3 * nb) return;
+    const uint c = tid.x / nb;
+    const uint block = tid.x % nb;
+    const uint strategy = acs[block] >> 1;
+    if ((acs[block] & 1) == 0 || !isSpecialStrategy(strategy)) return;
+    const uint px = (block % params.blocksX) * 8, py = (block / params.blocksX) * 8;
+    float pix[64];
+    for (uint y = 0; y < 8; ++y) for (uint x = 0; x < 8; ++x) pix[y * 8 + x] = xyb[c * plane() + (py + y) * params.paddedWidth + px + x];
+    float coef[64];
+    forwardSpecial(strategy, pix, coef);
+    for (uint k = 0; k < 64; ++k) coeffs[(c * nb + block) * 64 + k] = coef[k];
 }
 
 [shader("compute")]

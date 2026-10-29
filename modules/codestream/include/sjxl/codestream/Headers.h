@@ -20,11 +20,13 @@ constexpr uint32_t kColorTileDimBlocks = 8;   ///< chroma-from-luma tile: 64 px
 
 /// Signature + SizeHeader + ImageMetadata (all_default: 8-bit sRGB, xyb) +
 /// transform_data (all_default). Byte-aligned on exit.
-void writeCodestreamHeaders(BitWriter& w, uint32_t xsize, uint32_t ysize);
+/// `gamma` 0: the all_default sRGB encoding; else a gamma transfer (e.g. 0.45455)
+/// over sRGB primaries and D65.
+void writeCodestreamHeaders(BitWriter& w, uint32_t xsize, uint32_t ysize, float gamma = 0.0f);
 /// Signature, SizeHeader and the ImageMetadata of an 8- or 16-bit sRGB image
 /// that is not XYB encoded (a lossless Modular frame), with an unassociated
 /// alpha channel of the same depth when `alpha`. Byte-aligned on exit.
-void writeCodestreamHeadersRgb(BitWriter& w, uint32_t xsize, uint32_t ysize, uint32_t bitDepth, bool alpha);
+void writeCodestreamHeadersRgb(BitWriter& w, uint32_t xsize, uint32_t ysize, uint32_t bitDepth, bool alpha, float gamma = 0.0f);
 /// A single-pass, full-frame, last Modular frame in RGB (no colour transform,
 /// group_size_shift 1, LoopFilter off) with `numExtraChannels` unsampled extra
 /// channels. Not byte-aligned on exit.

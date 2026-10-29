@@ -20,6 +20,10 @@ struct Rgb8 {
     uint32_t             height = 0;
     uint32_t             channels = 3;
     uint32_t             bitDepth = 8;   ///< 8 or 16
+    /// The transfer function the samples are encoded with: 0 for sRGB, else the
+    /// encoding gamma of a PNG gAMA chunk (e.g. 0.45455), honoured as libjxl does
+    /// (an sRGB or iCCP chunk takes precedence and means sRGB here).
+    float                gamma = 0.0f;
     std::vector<uint8_t> pixels;        ///< width * height * channels * (bitDepth / 8)
 
     [[nodiscard]] size_t bytes() const { return pixels.size(); }

@@ -1,15 +1,18 @@
 // Copyright (c) 2026 jesus luque.
 //
-// sRGB 8-bit to XYB, one thread per padded pixel. The image is padded to whole
+// 8-bit RGB (sRGB, or a gamma transfer) to XYB, one thread per padded pixel. The image is padded to whole
 // 8x8 blocks by replicating its last row and column (libjxl pads the same way
 // before the DCT). libjxl enc_xyb.cc: opsin absorbance, cube root with bias.
 module enc_xyb;
 
 struct XybParams {
-    uint width;         // source
-    uint height;
-    uint paddedWidth;   // multiples of 8
-    uint paddedHeight;
+    uint  width;         // source
+    uint  height;
+    uint  paddedWidth;   // multiples of 8
+    uint  paddedHeight;
+    uint  transfer;      // 0 sRGB, 2 power (gamma)
+    float gammaInv;      // linear = v ^ gammaInv for transfer 2
+    uint  pad0, pad1;
 };
 
 StructuredBuffer<uint>     rgb8;    // width*height*3 bytes, packed little-endian
@@ -18,6 +21,10 @@ ConstantBuffer<XybParams>  params;
 
 float srgbToLinear(float v) {
     return v <= 0.04045f ? v * (1.0f / 12.92f) : pow((v + 0.055f) * (1.0f / 1.055f), 2.4f);
+}
+
+float toLinear(float v) {
+    return params.transfer == 2 ? pow(v, params.gammaInv) : srgbToLinear(v);
 }
 
 uint byteAt(uint index) {
@@ -41,9 +48,9 @@ void rgbToXyb(uint3 tid: SV_DispatchThreadID) {
     const uint sx = min(x, params.width - 1);
     const uint sy = min(y, params.height - 1);
     const uint p = (sy * params.width + sx) * 3;
-    const float r = srgbToLinear(float(byteAt(p + 0)) * (1.0f / 255.0f));
-    const float g = srgbToLinear(float(byteAt(p + 1)) * (1.0f / 255.0f));
-    const float b = srgbToLinear(float(byteAt(p + 2)) * (1.0f / 255.0f));
+    const float r = toLinear(float(byteAt(p + 0)) * (1.0f / 255.0f));
+    const float g = toLinear(float(byteAt(p + 1)) * (1.0f / 255.0f));
+    const float b = toLinear(float(byteAt(p + 2)) * (1.0f / 255.0f));
 
     float m0 = max(kM00 * r + kM01 * g + kM02 * b + kBias, 0.0f);
     float m1 = max(kM10 * r + kM11 * g + kM12 * b + kBias, 0.0f);

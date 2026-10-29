@@ -26,7 +26,7 @@ struct QuantizeParams {
     uint  tilesX;
     float xQmMultiplier;   // 1.25 ^ (x_qm_scale - 2): the decoder's X steps are that much finer
     float bQmMultiplier;
-    uint  pad0;
+    uint  noAdjust;        // 1: skip AdjustQuantBlockAC (oracle experiments with an imported field)
     uint  pad1;
     uint  pad2;
 };
@@ -230,7 +230,7 @@ void quantize(uint3 tid: SV_DispatchThreadID) {
     const int quantOrig = int(rawQf[block]);
     int quant = quantOrig;
     float thresholdsY[4] = kInitialThresholds;
-    {
+    if (params.noAdjust == 0) {
         const uint channels[3] = {1, 0, 2};
         const float multipliers[3] = {1.0f, params.xQmMultiplier, params.bQmMultiplier};
         for (uint i = 0; i < 3; ++i) {

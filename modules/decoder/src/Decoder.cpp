@@ -1,6 +1,8 @@
 // Copyright (c) 2026 jesus luque.
 #include "sjxl/decoder/Decoder.h"
 
+#include "sjxl/image/Image.h"
+
 #include "sjxl/codestream/UpsamplingWeights.h"
 
 #include <cmath>
@@ -868,6 +870,13 @@ Result<Decoder::FrameOutput> Decoder::run(const codestream::Parsed& parsed, cons
                 }
                 log::info("dec debug: acs row {:3} {}", by, row);
             }
+        }
+        if (const auto mapsPath = platform::env("SJXL_DEBUG_MAPS"); !mapsPath.empty()) {
+            // The quant field and strategy map, nblocks uint32 each, for the encoder's oracle experiments.
+            std::vector<uint8_t> bytes(nblocks * 8);
+            std::memcpy(bytes.data(), qfHost.data(), nblocks * 4);
+            std::memcpy(bytes.data() + nblocks * 4, acsHost.data(), nblocks * 4);
+            if (auto w = image::writeFile(mapsPath, bytes); !w) log::warn("decoder: cannot write {}", mapsPath);
         }
         if (!platform::env("SJXL_DEBUG_QF").empty()) {
             // quant field: one number per 8x8 block

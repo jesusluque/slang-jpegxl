@@ -345,6 +345,63 @@ prefers the rectangular shapes and rarely picks 16×16 or 32×32 on the small
 images; cjxl's maps use them in smooth areas), together with checking our
 quant field and strategy maps against cjxl's on the same image.
 
+## Colour chunks, the 8x8 special transforms and the oracle maps (2026-10-29)
+
+**Where the gap really was.** An oracle experiment settles what the
+heuristics are worth: `SJXL_DEBUG=1 SJXL_DEBUG_MAPS=f sjxl decode` dumps any
+file's quant field and strategy map, and `SJXL_ENC_MAPS=f` makes the encoder
+use them instead of its own (`SJXL_ENC_NO_ADJUST=1` also skips
+AdjustQuantBlockAC, since an imported field already went through cjxl's).
+With cjxl's own maps our encoder of sveti_stefan_320 at d = 1 reached 85.07
+SSIMULACRA2 at 16 448 bytes against cjxl's 86.79 at 16 527; our own maps give
+the same quality at matched size, so the quant field and transform
+selection were not the gap. Comparing the quantised coefficients of the same
+blocks showed ours a few percent smaller at low frequencies and the DC values
+off by up to 7 % in X: the *input* differed. The sveti test images carry a
+PNG gAMA chunk (gamma 1/2.2) and cHRM, which cjxl honours (a gamma transfer,
+sRGB primaries after its chromaticity match) while we read every PNG as sRGB
+and wrote sRGB; SSIMULACRA2 then compared our output under the wrong transfer.
+On a copy with the chunks stripped the same bytes scored 85.77 instead of
+83.61. berlin_200, which has no chunks, was the image where we matched or beat
+cjxl all along.
+
+**Colour chunks** (`image::Rgb8::gamma`, `Image.cpp scanPngColor`): the
+PNG's chunks before IDAT are read with libjxl's precedence (cICP, iCCP, sRGB,
+then gAMA with cHRM): an ICC profile or cICP is not honoured (a note on
+stderr, sRGB assumed), sRGB means sRGB, gAMA gives the encoding gamma and
+cHRM is checked against sRGB primaries and D65 (a mismatch is noted and
+ignored). The XYB kernel linearises with `v ^ (1 / gamma)` for a gamma
+transfer, and both header writers emit the ColorEncoding (RGB, D65, sRGB
+primaries, have_gamma with the 24-bit gamma × 10^7, relative intent) for
+lossy and lossless frames alike, so `djxl` writes the matching profile. The
+decoder already rendered gamma transfers (that is how cjxl's files of these
+images decoded bit-exactly).
+
+**Special 8x8 transforms** (`enc/special.slangh`): the forward IDENTITY,
+DCT2X2, DCT4X4, DCT4X8, DCT8X4 and AFV0..3 as `TransformFromPixels` computes
+them (the small DCTs in direct form with the decoder's coefficient memory, the
+AFV basis transposed from the decoder's inverse, the 2×2 or 2×1 combination
+of the sub-blocks' DCs into positions 0, 1, 8, 9). `specialTransform`
+replaces the separable DCT for those blocks; `dcFromLlf`, the orders (bucket
+1), the quant tables (kinds 1, 2, 3, 9, 10) and AdjustQuantBlockAC's
+exclusion of partial kinds were already generic. In `selectStrategies` one
+thread per 8×8 block scores the nine specials against DCT8 with the same
+proxy and the quadrant search uses the block's best (`--no-specials` turns
+them off). cjxl's map for the 320×180 image uses DCT2X2 on 13 % of the
+blocks; ours picks DCT4X8/8X4 and a few IDENTITY and AFV.
+
+At matched size against cjxl -e 5 (Δ SSIMULACRA2), the small images now
+average −0.37 (was −0.79): berlin_200 −0.33 / −1.94, sveti_crop +0.56 /
++0.94, sveti_stefan_320 −0.83 / −0.62 at d = 1 / 3. The 4K photos (sRGB
+chunk, so no colour effect) stay at −1.5 / −3.1 (berlin_central) and −1.9 /
+−2.6 (sveti_stefan) at d = 1 / 3. The oracle on berlin_central at d = 3
+explains them: cjxl's map is 38 % DCT64X64, 17 % DCT32X32 and only 13 % DCT8;
+with that map our encoder reaches cjxl's quality (66.80 vs 66.69) at 7 %
+more bytes, and the same size at −1.4 without the quant adjustment, while
+our own selection (capped at 32×32) gives 64.58 at +3 %. So the next levers
+are the 64-pixel families in the selection and the remaining coding
+overhead (DC and AcMetadata streams).
+
 ## Lossless Modular encoder (2026-10-29)
 
 `sjxl encode --lossless` writes a Modular frame: ImageMetadata not XYB
